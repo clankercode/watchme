@@ -8,6 +8,8 @@ use watchme::client::ResolvedRegistration;
 use watchme::daemon;
 use watchme::ipc::protocol::{Request, Response};
 use watchme::ipc::{read_response, write_request};
+use watchme::mux::Multiplexer;
+use watchme::mux::tmux::Tmux;
 use watchme::paths::WatchmePaths;
 use watchme::process::{CandidateHints, ProcessInspector, ProcessResolver};
 
@@ -413,6 +415,41 @@ impl RegistrationContextDetector for ProductionContextDetector {
         let resolved = ProcessResolver::default()
             .resolve(&inspector, current_pid, &hints)
             .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+
+        if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some() {
+            let tmux = Tmux::from_environment(Duration::from_secs(2))
+                .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+            let pane = tmux
+                .current_target()
+                .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+            let resolved_tty = resolved.identity.tty.as_deref().unwrap_or_default();
+            if normalize_tty(resolved_tty) != normalize_tty(&pane.tty) {
+                return Err(WatchmeError::UnsupportedContext(
+                    "agent process and tmux pane TTY identities do not match".into(),
+                ));
+            }
+            let watcher_id = format!(
+                "tmux-{}-{}-{}",
+                pane.pane_id.trim_start_matches('%'),
+                resolved.identity.pid,
+                resolved.identity.start_time
+            );
+            return Ok(ResolvedRegistration {
+                watcher: watchme::model::WatcherState::new(
+                    watcher_id,
+                    watchme::model::TargetIdentity::multiplexer(
+                        "tmux".into(),
+                        pane.server,
+                        pane.pane_id,
+                        resolved.identity,
+                        Some(pane.session_id),
+                    ),
+                    watchme::model::WatcherLifecycle::Registered,
+                    0,
+                    unix_time_ms(),
+                ),
+            });
+        }
         let watcher_id = format!(
             "process-{}-{}",
             resolved.identity.pid, resolved.identity.start_time
@@ -427,6 +464,10 @@ impl RegistrationContextDetector for ProductionContextDetector {
             ),
         })
     }
+}
+
+fn normalize_tty(tty: &str) -> &str {
+    tty.strip_prefix("/dev/").unwrap_or(tty)
 }
 
 fn unix_time_ms() -> u64 {
