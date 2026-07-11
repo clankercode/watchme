@@ -15,6 +15,7 @@ use tempfile::TempDir;
 use watchme::daemon::registry::{RegistrationOutcome, Registry};
 use watchme::daemon::scheduler::{Scheduler, SchedulerEvent};
 use watchme::daemon::{DaemonLock, MAX_CONNECTIONS, ProcessProbe};
+use watchme::daemon::{Observer, SystemPeerCredentialProvider};
 use watchme::ipc::protocol::{MAX_FRAME_BYTES, Request, Response, decode_frame, encode_frame};
 use watchme::ipc::{bind_owner_only, validate_peer_uid};
 use watchme::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
@@ -691,6 +692,169 @@ async fn daemon_bounds_simultaneous_connections() {
     drop(held);
     assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_wake_observation_socket_acknowledges_dedupes_consumes_and_validates() {
+    let temp = TempDir::new().unwrap();
+    let paths =
+        WatchmePaths::resolve(temp.path(), None, None, Some(&temp.path().join("run"))).unwrap();
+    let daemon_paths = paths.clone();
+    let task = tokio::spawn(async move {
+        watchme::daemon::run(&daemon_paths, Duration::from_secs(5), true).await
+    });
+    let socket = paths.runtime_dir().join("daemon.sock");
+    while !socket.exists() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let watcher = WatcherState::new(
+        "wake-live".into(),
+        TargetIdentity::process(ProcessIdentity::new(
+            std::process::id(),
+            watchme::daemon::current_process_start_time().unwrap(),
+        )),
+        WatcherLifecycle::Observing,
+        0,
+        0,
+    );
+    assert!(matches!(
+        ipc(
+            &socket,
+            Request::Register {
+                watcher: Box::new(watcher)
+            }
+        )
+        .await,
+        Response::Registered { .. }
+    ));
+    let wake = Request::WakeObservation {
+        id: "wake-live".into(),
+        event_fingerprint: "0123456789abcdef".into(),
+    };
+    assert_eq!(ipc(&socket, wake.clone()).await, Response::Acknowledged);
+    assert_eq!(ipc(&socket, wake).await, Response::Acknowledged);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let Response::Status { watchers, .. } = ipc(
+        &socket,
+        Request::Status {
+            id: Some("wake-live".into()),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    let saved = &watchers[0];
+    assert!(!saved.observation_schedule.event_wake_pending);
+    assert!(saved.last_observation.is_some());
+    assert_eq!(
+        saved.observation_schedule.last_wake_fingerprint.as_deref(),
+        Some("0123456789abcdef")
+    );
+    let malformed = ipc(
+        &socket,
+        Request::WakeObservation {
+            id: "wake-live".into(),
+            event_fingerprint: "bad".into(),
+        },
+    )
+    .await;
+    assert!(matches!(malformed, Response::Error { code, message }
+        if code == "daemon_error" && message == "corrupt watcher registry quarantined at invalid wake fingerprint"));
+    assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
+    task.await.unwrap().unwrap();
+}
+
+struct AlwaysFailObserver;
+impl Observer for AlwaysFailObserver {
+    fn observe<'a>(
+        &'a self,
+        _: WatcherState,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<watchme::model::Event>, String>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Err("isolated failure".into()) })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pending_socket_wake_survives_daemon_restart_and_is_then_consumed() {
+    let temp = TempDir::new().unwrap();
+    let paths =
+        WatchmePaths::resolve(temp.path(), None, None, Some(&temp.path().join("run"))).unwrap();
+    let first_paths = paths.clone();
+    let first = tokio::spawn(async move {
+        watchme::daemon::run_with_components(
+            &first_paths,
+            Duration::from_secs(5),
+            true,
+            SystemPeerCredentialProvider,
+            Arc::new(AlwaysFailObserver),
+        )
+        .await
+    });
+    let socket = paths.runtime_dir().join("daemon.sock");
+    while !socket.exists() {
+        tokio::task::yield_now().await;
+    }
+    let watcher = WatcherState::new(
+        "restart-wake".into(),
+        TargetIdentity::process(ProcessIdentity::new(
+            std::process::id(),
+            watchme::daemon::current_process_start_time().unwrap(),
+        )),
+        WatcherLifecycle::Observing,
+        0,
+        0,
+    );
+    let _ = ipc(
+        &socket,
+        Request::Register {
+            watcher: Box::new(watcher),
+        },
+    )
+    .await;
+    assert_eq!(
+        ipc(
+            &socket,
+            Request::WakeObservation {
+                id: "restart-wake".into(),
+                event_fingerprint: "abcdef0123456789".into()
+            }
+        )
+        .await,
+        Response::Acknowledged
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
+    first.await.unwrap().unwrap();
+    fs::remove_file(paths.runtime_dir().join("daemon.lock")).unwrap();
+    let second_paths = paths.clone();
+    let second = tokio::spawn(async move {
+        watchme::daemon::run(&second_paths, Duration::from_secs(5), true).await
+    });
+    while !socket.exists() {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let Response::Status { watchers, .. } = ipc(
+        &socket,
+        Request::Status {
+            id: Some("restart-wake".into()),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(!watchers[0].observation_schedule.event_wake_pending);
+    assert!(watchers[0].last_observation.is_some());
+    assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
+    second.await.unwrap().unwrap();
 }
 
 #[derive(Clone)]

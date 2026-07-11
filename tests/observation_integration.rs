@@ -1,6 +1,13 @@
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use watchme::daemon::classify_herdr_state;
 use watchme::daemon::registry::Registry;
+use watchme::daemon::{GenericObserver, Observer};
 use watchme::model::{Event, EventCategory, EventSource, PolicyHint, SourceKind};
 use watchme::model::{ProcessIdentity, TARGET_IDENTITY_SCHEMA_VERSION, TargetIdentity};
 use watchme::model::{WatcherLifecycle, WatcherState};
@@ -341,4 +348,163 @@ fn screen_event() -> Event {
         PolicyHint::ObserveOnly,
     )
     .unwrap()
+}
+
+#[test]
+fn recovery_coordinator_begin_action_store_failure_rolls_back() {
+    coordinator_store_failure("begin");
+}
+
+#[test]
+fn recovery_coordinator_action_failed_store_failure_rolls_back() {
+    coordinator_store_failure("failed");
+}
+
+#[test]
+fn recovery_coordinator_action_succeeded_store_failure_rolls_back() {
+    coordinator_store_failure("succeeded");
+}
+
+#[test]
+fn recovery_coordinator_planner_consulted_store_failure_rolls_back() {
+    coordinator_store_failure("planner");
+}
+
+fn coordinator_store_failure(operation: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("state");
+    std::fs::create_dir(&parent).unwrap();
+    let mut registry = Registry::load(JsonStore::new(parent.join("watchers.json"))).unwrap();
+    let mut watcher = WatcherState::new(
+        "w".into(),
+        TargetIdentity::process(ProcessIdentity::new(42, 99)),
+        WatcherLifecycle::Observing,
+        0,
+        0,
+    );
+    watcher.recovery = Some(RecoveryMachine::new(Budget {
+        max_attempts: 3,
+        max_cumulative_wait: Duration::from_secs(60),
+        planner_calls: 2,
+        cooldown: Duration::ZERO,
+    }));
+    registry.register(watcher).unwrap();
+    registry
+        .apply_recovery_transition("w", RecoveryCommand::Revalidated, 1)
+        .unwrap();
+    registry
+        .apply_recovery_transition(
+            "w",
+            RecoveryCommand::Confirm {
+                fingerprint: "fp".into(),
+            },
+            2,
+        )
+        .unwrap();
+    if matches!(operation, "failed" | "succeeded") {
+        registry
+            .apply_recovery_transition(
+                "w",
+                RecoveryCommand::BeginAction {
+                    fingerprint: "fp".into(),
+                    clock: ClockSnapshot::new(1, 1),
+                },
+                3,
+            )
+            .unwrap();
+    }
+    let before = registry.get("w").unwrap().clone();
+    std::fs::rename(&parent, temp.path().join("moved")).unwrap();
+    std::fs::write(&parent, b"not-directory").unwrap();
+    let mut coordinator = RecoveryCoordinator::new(&mut registry);
+    let result = match operation {
+        "begin" => coordinator.begin_action("w", "fp", ClockSnapshot::new(1, 1), 4),
+        "failed" => coordinator.action_failed(
+            "w",
+            "fp",
+            Duration::from_secs(1),
+            ClockSnapshot::new(2, 2),
+            4,
+        ),
+        "succeeded" => coordinator.action_succeeded("w", "fp", 4),
+        "planner" => coordinator.planner_consulted("w", 4),
+        _ => unreachable!(),
+    };
+    assert!(result.is_err());
+    assert_eq!(registry.get("w").unwrap(), &before);
+}
+
+#[tokio::test]
+async fn generic_observer_herdr_socket_maps_typed_working_and_uses_persisted_cursor() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let recorded = requests.clone();
+    let server = thread::spawn(move || {
+        for connection in listener.incoming().take(3) {
+            let mut connection = connection.unwrap();
+            let mut line = String::new();
+            BufReader::new(connection.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            recorded.lock().unwrap().push(request.clone());
+            let result = if request["method"] == "pane_info" {
+                herdr_pane()
+            } else {
+                json!({"state":"working","events":[{"sequence":8,"kind":"turn"}]})
+            };
+            let response = json!({"schema_version":1,"protocol":"watchme.herdr",
+                "request_id":request["request_id"],"method":request["method"],
+                "ok":true,"result":result});
+            connection
+                .write_all(&serde_json::to_vec(&response).unwrap())
+                .unwrap();
+            connection.write_all(b"\n").unwrap();
+        }
+    });
+    let schedule = watchme::model::ObservationSchedule {
+        herdr_after_sequence: 7,
+        ..Default::default()
+    };
+    let mut watcher = WatcherState::new(
+        "h".into(),
+        TargetIdentity::herdr(
+            socket.to_string_lossy().into_owned(),
+            "server-1".into(),
+            "ws".into(),
+            "tab".into(),
+            "pane".into(),
+            "/dev/pts/8".into(),
+            herdr_process(),
+        ),
+        WatcherLifecycle::Observing,
+        0,
+        0,
+    );
+    watcher.observation_schedule = schedule;
+    let event = GenericObserver.observe(watcher).await.unwrap().unwrap();
+    assert_eq!(event.category, EventCategory::Working);
+    assert_eq!(event.monotonic_sequence, Some(8));
+    server.join().unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[2]["params"]["after"], 7);
+}
+
+fn herdr_process() -> ProcessIdentity {
+    let mut process = ProcessIdentity::new(4242, 99);
+    process.tty = Some("/dev/pts/8".into());
+    process
+}
+
+fn herdr_pane() -> Value {
+    json!({"server_id":"server-1","workspace_id":"ws","workspace_name":"work",
+        "tab_id":"tab","tab_title":"tab","tab_index":0,"pane_id":"pane",
+        "pane_index":0,"pane_title":"agent","tty":"/dev/pts/8",
+        "current_command":"codex","current_path":"/tmp","process":{
+            "pid":4242,"start_time":99,"executable":null,"argv_digest":null,"uid":null,
+            "process_group_id":null,"session_leader_id":null,"tty":"/dev/pts/8",
+            "parent_digest":null}})
 }

@@ -493,6 +493,23 @@ pub async fn run_with_peer_provider(
     stay_resident: bool,
     peer_credentials: impl PeerCredentialProvider,
 ) -> io::Result<()> {
+    run_with_components(
+        paths,
+        idle_grace,
+        stay_resident,
+        peer_credentials,
+        std::sync::Arc::new(GenericObserver),
+    )
+    .await
+}
+
+pub async fn run_with_components(
+    paths: &WatchmePaths,
+    idle_grace: Duration,
+    stay_resident: bool,
+    peer_credentials: impl PeerCredentialProvider,
+    observer: std::sync::Arc<dyn Observer>,
+) -> io::Result<()> {
     paths.create_owner_only()?;
     let lock_path = paths.runtime_dir().join("daemon.lock");
     let _lock = DaemonLock::acquire(
@@ -519,10 +536,7 @@ pub async fn run_with_peer_provider(
     let mut connection_tasks = tokio::task::JoinSet::new();
     let mut scheduler_task = tokio::spawn(runner.run());
     let lifecycle_task = tokio::spawn(run_lifecycle_monitor(registry.clone(), scheduler.clone()));
-    let observation_task = tokio::spawn(run_observation_monitor(
-        registry.clone(),
-        std::sync::Arc::new(GenericObserver),
-    ));
+    let observation_task = tokio::spawn(run_observation_monitor(registry.clone(), observer));
     let timeout = Duration::from_secs(2);
     let result = loop {
         let accepted = tokio::select! {
