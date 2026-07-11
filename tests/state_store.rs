@@ -11,7 +11,7 @@ use watchme::model::{
     TargetIdentity, WATCHER_STATE_SCHEMA_VERSION, WatcherLifecycle, WatcherState,
 };
 use watchme::paths::WatchmePaths;
-use watchme::store::{JsonStore, LoadOutcome};
+use watchme::store::{JsonStore, LoadOutcome, StoreError};
 
 fn process() -> ProcessIdentity {
     let mut identity = ProcessIdentity::new(42, 1_234_567);
@@ -307,6 +307,36 @@ fn store_refuses_to_read_or_replace_symlinks() {
     assert!(store.write(&state()).is_err());
     assert!(store.load::<WatcherState>().is_err());
     assert_eq!(fs::read(victim).unwrap(), b"untouched");
+}
+
+#[test]
+fn store_rejects_directory_and_fifo_leaves_without_blocking() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let temp = TempDir::new().unwrap();
+    let directory_store = JsonStore::new(temp.path().join("directory"));
+    fs::create_dir(temp.path().join("directory")).unwrap();
+    assert!(matches!(
+        directory_store.load::<WatcherState>(),
+        Err(StoreError::UnsafePath(_))
+    ));
+
+    let fifo = temp.path().join("state.fifo");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+    )
+    .unwrap();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = JsonStore::new(fifo).load::<WatcherState>();
+        sender
+            .send(matches!(result, Err(StoreError::UnsafePath(_))))
+            .unwrap();
+    });
+    assert!(receiver.recv_timeout(Duration::from_millis(500)).unwrap());
 }
 
 #[test]

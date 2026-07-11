@@ -135,14 +135,23 @@ impl JsonStore {
         let fd = match rustix::fs::openat(
             parent.fd(),
             parent.name(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT) => return Ok(LoadOutcome::Missing),
             Err(error) => return Err(rx::<OwnedFd>(Err(error)).unwrap_err().into()),
         };
-        let size = file_size(&fd)?;
+        let stat = rx(rustix::fs::fstat(&fd))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(StoreError::UnsafePath(self.path.display().to_string()));
+        }
+        if stat.st_size < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "negative state size").into());
+        }
+        let flags = rx(rustix::fs::fcntl_getfl(&fd))?;
+        rx(rustix::fs::fcntl_setfl(&fd, flags - OFlags::NONBLOCK))?;
+        let size = stat.st_size as u64;
         let file = File::from(fd);
         let mut bytes = Vec::with_capacity(size.min(self.max_bytes) as usize);
         file.take(self.max_bytes + 1).read_to_end(&mut bytes)?;
@@ -237,17 +246,6 @@ impl TrustedParent {
     fn path(&self) -> &Path {
         &self.path
     }
-}
-
-fn file_size(fd: &OwnedFd) -> io::Result<u64> {
-    let stat = rx(rustix::fs::fstat(fd))?;
-    if stat.st_size < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "negative state size",
-        ));
-    }
-    Ok(stat.st_size as u64)
 }
 
 fn verify_directory(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
