@@ -129,6 +129,7 @@ fn parse_target_id(value: &str) -> Result<String, String> {
 
 pub struct CliFailure {
     error: WatchmeError,
+    daemon_error: Option<(String, String)>,
     json: bool,
 }
 
@@ -141,7 +142,7 @@ struct ErrorEnvelope {
 
 #[derive(Serialize)]
 struct ErrorBody {
-    code: &'static str,
+    code: String,
     message: String,
 }
 
@@ -149,6 +150,8 @@ impl CliFailure {
     pub fn render(&self) {
         if self.json {
             println!("{}", self.json_line());
+        } else if let Some((code, message)) = &self.daemon_error {
+            eprintln!("watchme: {code}: {message}");
         } else {
             eprintln!("watchme: {}", self.error);
         }
@@ -159,8 +162,14 @@ impl CliFailure {
             schema_version: SCHEMA_VERSION,
             ok: false,
             error: ErrorBody {
-                code: self.error.code(),
-                message: self.error.message().to_owned(),
+                code: self
+                    .daemon_error
+                    .as_ref()
+                    .map_or_else(|| self.error.code().to_owned(), |error| error.0.clone()),
+                message: self
+                    .daemon_error
+                    .as_ref()
+                    .map_or_else(|| self.error.message().to_owned(), |error| error.1.clone()),
             },
         };
         serde_json::to_string(&envelope).expect("error envelope is serializable")
@@ -169,7 +178,11 @@ impl CliFailure {
 
 impl From<WatchmeError> for CliFailure {
     fn from(error: WatchmeError) -> Self {
-        Self { error, json: false }
+        Self {
+            error,
+            daemon_error: None,
+            json: false,
+        }
     }
 }
 
@@ -181,6 +194,7 @@ pub fn run() -> Result<(), CliFailure> {
         Some(Command::List(options)) => admin(Request::List, options.json),
         Some(Command::Stop(options)) if options.id.is_none() && !options.all => Err(CliFailure {
             error: WatchmeError::Configuration("stop requires a watcher ID or --all".into()),
+            daemon_error: None,
             json: options.json,
         }),
         Some(Command::Stop(options)) => admin(
@@ -250,12 +264,20 @@ fn admin(request: Request, json: bool) -> Result<(), CliFailure> {
         })
         .map_err(|error| CliFailure {
             error: WatchmeError::RetryableIntegration(format!("daemon unavailable: {error}")),
+            daemon_error: None,
             json,
         })?;
     render_response(response, json)
 }
 
 fn render_response(response: Response, json: bool) -> Result<(), CliFailure> {
+    if let Response::Error { code, message } = &response {
+        return Err(CliFailure {
+            error: WatchmeError::RetryableIntegration(message.clone()),
+            daemon_error: Some((code.clone(), message.clone())),
+            json,
+        });
+    }
     if json {
         #[derive(Serialize)]
         struct SuccessEnvelope<'a> {
@@ -312,12 +334,7 @@ fn render_response(response: Response, json: bool) -> Result<(), CliFailure> {
             watcher.watcher_id,
             lifecycle_name(&watcher.lifecycle)
         ),
-        Response::Error { code, message } => {
-            return Err(CliFailure {
-                error: WatchmeError::RetryableIntegration(format!("{code}: {message}")),
-                json,
-            });
-        }
+        Response::Error { .. } => unreachable!("daemon errors return before success rendering"),
     }
     Ok(())
 }
@@ -430,6 +447,7 @@ fn unavailable(command: Command) -> CliFailure {
         error: WatchmeError::CapabilityUnavailable(
             "this administrative capability is not implemented yet".to_owned(),
         ),
+        daemon_error: None,
         json,
     }
 }
@@ -483,7 +501,12 @@ mod tests {
 
         for error in errors {
             let expected_code = error.code();
-            let rendered = CliFailure { error, json: true }.json_line();
+            let rendered = CliFailure {
+                error,
+                daemon_error: None,
+                json: true,
+            }
+            .json_line();
             let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
             assert_eq!(value["schema_version"], "1.0");
             assert_eq!(value["ok"], false);

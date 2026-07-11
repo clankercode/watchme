@@ -248,6 +248,27 @@ fn concurrent_daemon_startup_converges_and_shutdown_is_clean() {
         String::from_utf8(output.stdout).unwrap(),
         "daemon: running\nwatchers: 0\n"
     );
+    let mut missing_json = Command::new(binary);
+    configure(&mut missing_json);
+    let output = missing_json
+        .args(["pause", "missing", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "{\"schema_version\":\"1.0\",\"ok\":false,\"error\":{\"code\":\"daemon_error\",\"message\":\"unknown watcher missing\"}}\n"
+    );
+    assert!(output.stderr.is_empty());
+    let mut missing_human = Command::new(binary);
+    configure(&mut missing_human);
+    let output = missing_human.args(["pause", "missing"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "watchme: daemon_error: unknown watcher missing\n"
+    );
     assert!(matches!(
         sync_ipc(
             &socket,
@@ -420,6 +441,20 @@ async fn live_ipc_dedupes_scopes_pause_resume_and_survives_disconnect() {
         ipc(&socket, Request::Status { id: Some(String::new()) }).await,
         Response::Error { code, .. } if code == "invalid_target"
     ));
+    assert_eq!(
+        ipc(
+            &socket,
+            Request::Stop {
+                id: None,
+                all: false,
+            },
+        )
+        .await,
+        Response::Error {
+            code: "invalid_request".into(),
+            message: "stop requires a watcher ID or --all".into(),
+        }
+    );
     assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
     task.await.unwrap().unwrap();
 }

@@ -283,6 +283,24 @@ pub async fn run_with_peer_provider(
             .await;
             continue;
         }
+        if matches!(
+            request,
+            Request::Stop {
+                id: None,
+                all: false
+            }
+        ) {
+            let _ = write_response(
+                &mut stream,
+                &Response::Error {
+                    code: "invalid_request".into(),
+                    message: "stop requires a watcher ID or --all".into(),
+                },
+                timeout,
+            )
+            .await;
+            continue;
+        }
         let (response, shutdown) = handle_request(&mut registry, &scheduler, request);
         let response = response.unwrap_or_else(|error| Response::Error {
             code: "daemon_error".into(),
