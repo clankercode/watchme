@@ -131,6 +131,17 @@ fn managed_paths_reject_relative_traversal_and_symlinks() {
     let link = paths.state_dir().join("linked");
     symlink(&target, &link).unwrap();
     assert!(paths.validate_managed_path(&link).is_err());
+
+    let regular = paths.state_dir().join("regular.json");
+    fs::write(&regular, b"{}").unwrap();
+    paths.validate_managed_path(&regular).unwrap();
+    paths
+        .validate_managed_path(&paths.state_dir().join("not-created.json"))
+        .unwrap();
+
+    let leaf_link = paths.state_dir().join("leaf-link.json");
+    symlink(&regular, &leaf_link).unwrap();
+    assert!(paths.validate_managed_path(&leaf_link).is_err());
 }
 
 #[test]
@@ -275,7 +286,7 @@ fn corrupt_and_oversized_state_fails_closed_and_preserves_evidence() {
         LoadOutcome::Corrupt { quarantine } => quarantine,
         outcome => panic!("expected corrupt state, got {outcome:?}"),
     };
-    assert!(!path.exists());
+    assert!(path.exists());
     assert_eq!(fs::read(quarantine).unwrap(), b"{not-json");
 
     fs::write(&path, vec![b'x'; 65]).unwrap();

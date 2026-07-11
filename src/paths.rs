@@ -2,7 +2,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -78,7 +78,22 @@ impl WatchmePaths {
     }
 
     pub fn validate_managed_path(&self, path: &Path) -> io::Result<()> {
-        open_directory_chain(path, false).map(drop)
+        require_absolute_clean(path)?;
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "managed path has no parent")
+        })?;
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "managed path has no leaf")
+        })?;
+        let directory = open_directory_chain(parent, false)?;
+        match rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode).is_symlink() => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed path leaf is a symlink",
+            )),
+            Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(error) => Err(errno(error)),
+        }
     }
 }
 

@@ -20,8 +20,6 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
 pub enum StoreError {
     #[error("state path is unsafe: {0}")]
     UnsafePath(String),
-    #[error("state changed while corrupt data was being quarantined")]
-    ConcurrentReplacement,
     #[error("state I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("state serialization failed: {0}")]
@@ -109,7 +107,7 @@ impl JsonStore {
     }
 
     pub fn load<V: DeserializeOwned>(&self) -> Result<LoadOutcome<V>, StoreError> {
-        self.load_impl(|| {})
+        self.load_impl(|| {}, None)
     }
 
     #[cfg(test)]
@@ -117,12 +115,21 @@ impl JsonStore {
         &self,
         before_quarantine: F,
     ) -> Result<LoadOutcome<V>, StoreError> {
-        self.load_impl(before_quarantine)
+        self.load_impl(before_quarantine, None)
+    }
+
+    #[cfg(test)]
+    fn load_with_quarantine_name<V: DeserializeOwned>(
+        &self,
+        name: &str,
+    ) -> Result<LoadOutcome<V>, StoreError> {
+        self.load_impl(|| {}, Some(OsStr::new(name)))
     }
 
     fn load_impl<V: DeserializeOwned, F: FnOnce()>(
         &self,
         before_quarantine: F,
+        fixed_quarantine_name: Option<&OsStr>,
     ) -> Result<LoadOutcome<V>, StoreError> {
         let parent = TrustedParent::open(&self.path)?;
         let fd = match rustix::fs::openat(
@@ -135,9 +142,9 @@ impl JsonStore {
             Err(rustix::io::Errno::NOENT) => return Ok(LoadOutcome::Missing),
             Err(error) => return Err(rx::<OwnedFd>(Err(error)).unwrap_err().into()),
         };
-        let identity = FileIdentity::from_fd(&fd)?;
+        let size = file_size(&fd)?;
         let file = File::from(fd);
-        let mut bytes = Vec::with_capacity(identity.size.min(self.max_bytes) as usize);
+        let mut bytes = Vec::with_capacity(size.min(self.max_bytes) as usize);
         file.take(self.max_bytes + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 <= self.max_bytes {
             if let Ok(value) = serde_json::from_slice(&bytes) {
@@ -145,30 +152,35 @@ impl JsonStore {
             }
         }
         before_quarantine();
-        self.quarantine(&parent, identity)
+        self.quarantine(&parent, &bytes, fixed_quarantine_name)
     }
 
     fn quarantine<V>(
         &self,
         parent: &TrustedParent,
-        identity: FileIdentity,
+        evidence: &[u8],
+        fixed_name: Option<&OsStr>,
     ) -> Result<LoadOutcome<V>, StoreError> {
-        let current = rx(rustix::fs::statat(
-            parent.fd(),
-            parent.name(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        ))?;
-        if current.st_dev as u64 != identity.device || current.st_ino as u64 != identity.inode {
-            return Err(StoreError::ConcurrentReplacement);
-        }
-        let quarantine_name = quarantine_name(parent.name());
-        rx(rustix::fs::renameat(
-            parent.fd(),
-            parent.name(),
+        let quarantine_name = fixed_name
+            .map(OsStr::to_os_string)
+            .unwrap_or_else(|| quarantine_name(parent.name()));
+        let fd = rx(rustix::fs::openat(
             parent.fd(),
             &quarantine_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
         ))?;
-        sync_directory(parent.fd())?;
+        let mut file = File::from(fd);
+        let result = (|| {
+            file.write_all(evidence)?;
+            file.flush()?;
+            file.sync_all()?;
+            sync_directory(parent.fd())
+        })();
+        if let Err(error) = result {
+            let _ = rustix::fs::unlinkat(parent.fd(), &quarantine_name, AtFlags::empty());
+            return Err(error.into());
+        }
         Ok(LoadOutcome::Corrupt {
             quarantine: parent.path().join(quarantine_name),
         })
@@ -227,28 +239,15 @@ impl TrustedParent {
     }
 }
 
-#[derive(Clone, Copy)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    size: u64,
-}
-
-impl FileIdentity {
-    fn from_fd(fd: &OwnedFd) -> io::Result<Self> {
-        let stat = rx(rustix::fs::fstat(fd))?;
-        if stat.st_size < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "negative state size",
-            ));
-        }
-        Ok(Self {
-            device: stat.st_dev as u64,
-            inode: stat.st_ino as u64,
-            size: stat.st_size as u64,
-        })
+fn file_size(fd: &OwnedFd) -> io::Result<u64> {
+    let stat = rx(rustix::fs::fstat(fd))?;
+    if stat.st_size < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negative state size",
+        ));
     }
+    Ok(stat.st_size as u64)
 }
 
 fn verify_directory(fd: &OwnedFd, path: &Path) -> Result<(), StoreError> {
@@ -352,20 +351,42 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_refuses_to_move_a_replacement_inode() {
+    fn quarantine_copies_inspected_evidence_without_moving_replacement_inode() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("state.json");
         std::fs::write(&path, b"broken").unwrap();
         let store = JsonStore::new(path.clone());
-        let error = store
+        let outcome = store
             .load_with_before_quarantine::<serde_json::Value, _>(|| {
                 let replacement = temp.path().join("replacement");
                 std::fs::write(&replacement, br#"{"valid":true}"#).unwrap();
                 std::fs::rename(replacement, &path).unwrap();
             })
-            .unwrap_err();
-        assert!(matches!(error, StoreError::ConcurrentReplacement));
+            .unwrap();
+        let quarantine = match outcome {
+            super::LoadOutcome::Corrupt { quarantine } => quarantine,
+            other => panic!("expected quarantine, got {other:?}"),
+        };
         assert_eq!(std::fs::read(path).unwrap(), br#"{"valid":true}"#);
+        assert_eq!(std::fs::read(quarantine).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn quarantine_destination_is_exclusive_and_never_clobbered() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("state.json");
+        std::fs::write(&path, b"broken").unwrap();
+        let existing = temp.path().join("reserved-evidence");
+        std::fs::write(&existing, b"keep-me").unwrap();
+        let store = JsonStore::new(path.clone());
+        let error = store
+            .load_with_quarantine_name::<serde_json::Value>("reserved-evidence")
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Io(ref source) if source.kind() == io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(existing).unwrap(), b"keep-me");
+        assert_eq!(std::fs::read(path).unwrap(), b"broken");
     }
 
     #[test]
