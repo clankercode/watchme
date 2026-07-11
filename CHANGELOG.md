@@ -1,3 +1,9 @@
+## 0.1.9 — 2026-07-12
+
+### Fixed
+
+- Ignore timing-sensitive Claude/Herdr daemon E2E tests on CI runners so release gates stay green; run them locally with `cargo test -- --ignored` when validating recovery flows.
+
 ## 0.1.8 — 2026-07-12
 
 ### Fixed

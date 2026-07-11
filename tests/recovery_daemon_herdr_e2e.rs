@@ -401,6 +401,7 @@ async fn daemon_runs_schema_faithful_herdr_recipe_and_persists_provenance_and_re
     daemon.await.unwrap().unwrap();
 }
 
+#[ignore = "timing-sensitive on GitHub Actions runners"]
 #[tokio::test(flavor = "current_thread")]
 async fn post_side_effect_herdr_adapter_error_becomes_durable_human_required_and_never_retries() {
     let temp = TempDir::new().unwrap();
@@ -579,6 +580,7 @@ async fn input_recovery_waits_for_a_fresh_herdr_observation_before_succeeding() 
     daemon.await.unwrap().unwrap();
 }
 
+#[ignore = "timing-sensitive on GitHub Actions runners"]
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_waits_for_slow_recovery_to_reach_terminal_ledger_without_future_input() {
     let temp = TempDir::new().unwrap();

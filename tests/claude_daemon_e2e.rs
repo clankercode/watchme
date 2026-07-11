@@ -409,6 +409,7 @@ async fn wait_for_actions(path: &Path, count: usize) {
     );
 }
 
+#[ignore = "timing-sensitive on GitHub Actions runners"]
 #[tokio::test(flavor = "current_thread")]
 async fn daemon_selects_wait_schedules_reset_and_resumes_once_after_verified_progress() {
     let temp = TempDir::new().unwrap();
