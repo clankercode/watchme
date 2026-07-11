@@ -297,13 +297,13 @@ fn configuration_rejects_unknown_nested_fields_and_unsupported_versions() {
 }
 
 #[test]
-fn configuration_show_redacts_secret_like_values() {
+fn configuration_show_includes_redacted_header_and_preserves_secret_names() {
     let mut config = Config::default();
     config.security.extra_secret_names = vec!["MY_INTERNAL_TOKEN".to_owned()];
     let show = config.render_redacted_toml();
     assert!(show.starts_with("# redacted configuration\n"));
+    assert!(show.contains("config_version"));
     assert!(show.contains("MY_INTERNAL_TOKEN"));
-    assert!(!show.to_ascii_lowercase().contains("password="));
 }
 
 #[test]

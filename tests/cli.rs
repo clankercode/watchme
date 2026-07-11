@@ -174,9 +174,9 @@ fn config_show_prints_redacted_configuration() {
         .args(["config", "show"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("# redacted configuration"))
         .stdout(predicate::str::contains("config_version"))
         .stdout(predicate::str::contains("MY_INTERNAL_TOKEN"))
-        .stdout(predicate::str::contains("redacted").or(predicate::str::contains("observation")))
         .stderr(predicate::str::is_empty());
 }
 
