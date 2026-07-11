@@ -10,6 +10,12 @@ use crate::recovery::transaction::{
 pub trait RecipeProvider: Send + Sync {
     fn action_for(&self, watcher: &WatcherState) -> Option<Action>;
 }
+
+impl RecipeProvider for std::sync::Arc<dyn RecipeProvider> {
+    fn action_for(&self, watcher: &WatcherState) -> Option<Action> {
+        self.as_ref().action_for(watcher)
+    }
+}
 /// Provider-independent recipes are intentionally limited to scheduling a
 /// future observation. Input recovery belongs to the provider adapters, which
 /// have the structured evidence needed to justify it.

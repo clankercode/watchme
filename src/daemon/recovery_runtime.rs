@@ -298,12 +298,7 @@ fn capture_herdr_structured_state(
 
 pub(super) fn execute_recovery_action(
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-    engine: std::sync::Arc<
-        crate::recovery::engine::RecoveryEngine<
-            crate::recovery::action_store::JsonActionStore,
-            crate::recovery::engine::BuiltinRecipes,
-        >,
-    >,
+    engine: std::sync::Arc<super::DaemonRecoveryEngine>,
     watcher: crate::model::WatcherState,
     owner: OwnerIdentity,
 ) {
@@ -370,10 +365,173 @@ mod tests {
     use super::*;
     use crate::daemon::registry::Registry;
     use crate::model::{
-        Event, EventCategory, EventSource, PolicyHint, ProcessIdentity, SourceKind, TargetIdentity,
-        WatcherState,
+        Action, ActionKind, Event, EventCategory, EventSource, PolicyHint, ProcessIdentity,
+        SourceKind, TargetIdentity, WatcherState,
     };
+    use crate::mux::{
+        Multiplexer,
+        tmux::{Tmux, TmuxSelector},
+    };
+    use crate::recovery::action_store::JsonActionStore;
+    use crate::recovery::engine::{RecipeProvider, RecoveryEngine};
+    use crate::recovery::state_machine::{Budget, RecoveryCommand, RecoveryMachine};
+    use crate::recovery::transaction::{ActionPhase, ActionStore, OwnerIdentity};
     use crate::store::JsonStore;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    struct CaptureRecipe;
+    impl RecipeProvider for CaptureRecipe {
+        fn action_for(&self, watcher: &WatcherState) -> Option<Action> {
+            let event = watcher.last_observation.as_ref()?;
+            Some(Action::new(
+                "test.capture",
+                ActionKind::Capture {
+                    source: "screen_recent".into(),
+                    max_lines: 8,
+                },
+                "test concrete mux recovery",
+                event.evidence_fingerprint.clone(),
+                5,
+            ))
+        }
+    }
+
+    struct TmuxServerGuard(String);
+    impl Drop for TmuxServerGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", &self.0, "kill-server"])
+                .output();
+        }
+    }
+
+    #[test]
+    fn injected_recipe_executes_a_real_tmux_capture_and_persists_its_receipt() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            return;
+        }
+        let socket = format!("watchme-recovery-{}", std::process::id());
+        let _server = TmuxServerGuard(socket.clone());
+        let status = Command::new("tmux")
+            .args([
+                "-f",
+                "/dev/null",
+                "-L",
+                &socket,
+                "new-session",
+                "-d",
+                "-s",
+                "recovery",
+                "sh",
+                "-c",
+                "printf 'recovery-ready\\n'; while IFS= read -r _; do :; done",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let tmux = Tmux::for_socket_name(socket, Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let identity = loop {
+            let candidate = tmux
+                .resolve_selector(&TmuxSelector::parse("recovery").unwrap())
+                .unwrap();
+            if tmux
+                .capture_tail(&candidate, 8, 1_024)
+                .is_ok_and(|capture| capture.text.contains("recovery-ready"))
+            {
+                break candidate;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test tmux pane did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let target = TargetIdentity::tmux(
+            identity.server,
+            identity.server_instance,
+            identity.session_id,
+            identity.window_id,
+            identity.pane_id,
+            identity.tty,
+            identity.process,
+            None,
+        );
+        let fingerprint = "c".repeat(64);
+        let mut machine = RecoveryMachine::new(Budget {
+            max_attempts: 2,
+            max_cumulative_wait: Duration::from_secs(60),
+            planner_calls: 0,
+            cooldown: Duration::ZERO,
+        });
+        machine.apply(RecoveryCommand::Revalidated).unwrap();
+        machine
+            .apply(RecoveryCommand::Confirm {
+                fingerprint: fingerprint.clone(),
+            })
+            .unwrap();
+        let mut watcher = WatcherState::new(
+            "real-tmux-recovery".into(),
+            target.clone(),
+            WatcherLifecycle::Observing,
+            0,
+            1,
+        );
+        watcher.recovery = Some(machine);
+        watcher.last_observation = Some(
+            Event::new(
+                "event",
+                "2026-07-11T00:00:00Z",
+                "real-tmux-recovery",
+                target_identity_hash(&target),
+                EventSource::new(SourceKind::ScreenDetection, "tmux", "generic_tail"),
+                EventCategory::BlockedGoal,
+                0.9,
+                false,
+                fingerprint,
+                "blocked",
+                PolicyHint::DeterministicActionAllowed,
+            )
+            .unwrap(),
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let mut registry =
+            Registry::load(JsonStore::new(temporary.path().join("watchers.json"))).unwrap();
+        registry.register(watcher.clone()).unwrap();
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+        let store = JsonActionStore::load(temporary.path().join("actions.json")).unwrap();
+        let engine = std::sync::Arc::new(RecoveryEngine::new(
+            store,
+            std::sync::Arc::new(CaptureRecipe) as std::sync::Arc<dyn RecipeProvider>,
+        ));
+
+        execute_recovery_action(
+            registry.clone(),
+            engine.clone(),
+            watcher,
+            OwnerIdentity {
+                pid: std::process::id(),
+                process_start_time: 0,
+                nonce: "test".into(),
+            },
+        );
+
+        let audit = engine.store().audit("real-tmux-recovery").unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.phase == ActionPhase::Succeeded)
+        );
+        assert!(
+            audit
+                .last()
+                .unwrap()
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("captured"))
+        );
+    }
 
     #[test]
     fn capture_source_must_be_bound_to_the_current_adapter_observation() {

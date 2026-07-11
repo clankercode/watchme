@@ -30,6 +30,11 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
+type DaemonRecoveryEngine = crate::recovery::engine::RecoveryEngine<
+    crate::recovery::action_store::JsonActionStore,
+    std::sync::Arc<dyn crate::recovery::engine::RecipeProvider>,
+>;
+
 pub const MAX_CONNECTIONS: usize = 32;
 const PROCESS_REEXEC_GRACE_MS: u64 = 2_000;
 pub trait Observer: Send + Sync + 'static {
@@ -479,6 +484,7 @@ pub async fn run_with_peer_provider(
         stay_resident,
         peer_credentials,
         std::sync::Arc::new(GenericObserver),
+        std::sync::Arc::new(crate::recovery::engine::BuiltinRecipes),
     )
     .await
 }
@@ -489,6 +495,7 @@ pub async fn run_with_components(
     stay_resident: bool,
     peer_credentials: impl PeerCredentialProvider,
     observer: std::sync::Arc<dyn Observer>,
+    recipes: std::sync::Arc<dyn crate::recovery::engine::RecipeProvider>,
 ) -> io::Result<()> {
     paths.create_owner_only()?;
     let lock_path = paths.runtime_dir().join("daemon.lock");
@@ -519,10 +526,7 @@ pub async fn run_with_components(
     let action_store =
         crate::recovery::action_store::JsonActionStore::load(paths.state_file("actions.json")?)
             .map_err(io::Error::other)?;
-    let recovery_engine = std::sync::Arc::new(crate::recovery::engine::RecoveryEngine::new(
-        action_store,
-        crate::recovery::engine::BuiltinRecipes,
-    ));
+    let recovery_engine = std::sync::Arc::new(DaemonRecoveryEngine::new(action_store, recipes));
     let recovery_owner = crate::recovery::transaction::OwnerIdentity {
         pid: _lock.identity().pid,
         process_start_time: _lock.identity().start_time,
@@ -619,12 +623,7 @@ pub async fn run_observation_monitor(
 async fn run_observation_monitor_with_recovery(
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
     observer: std::sync::Arc<dyn Observer>,
-    recovery: std::sync::Arc<
-        crate::recovery::engine::RecoveryEngine<
-            crate::recovery::action_store::JsonActionStore,
-            crate::recovery::engine::BuiltinRecipes,
-        >,
-    >,
+    recovery: std::sync::Arc<DaemonRecoveryEngine>,
     owner: crate::recovery::transaction::OwnerIdentity,
 ) {
     run_observation_loop(
@@ -651,14 +650,7 @@ async fn run_observation_loop(
     observer: std::sync::Arc<dyn Observer>,
     clock: std::sync::Arc<dyn ObservationClock>,
     max_iterations: usize,
-    recovery: Option<
-        std::sync::Arc<
-            crate::recovery::engine::RecoveryEngine<
-                crate::recovery::action_store::JsonActionStore,
-                crate::recovery::engine::BuiltinRecipes,
-            >,
-        >,
-    >,
+    recovery: Option<std::sync::Arc<DaemonRecoveryEngine>>,
     owner: Option<crate::recovery::transaction::OwnerIdentity>,
 ) {
     let mut iterations = 0;
@@ -1646,7 +1638,8 @@ mod recovery_runtime_tests {
         let engine = std::sync::Arc::new(crate::recovery::engine::RecoveryEngine::new(
             crate::recovery::action_store::JsonActionStore::load(temp.path().join("actions.json"))
                 .unwrap(),
-            crate::recovery::engine::BuiltinRecipes,
+            std::sync::Arc::new(crate::recovery::engine::BuiltinRecipes)
+                as std::sync::Arc<dyn crate::recovery::engine::RecipeProvider>,
         ));
         let owner = crate::recovery::transaction::OwnerIdentity {
             pid: std::process::id(),
@@ -1731,7 +1724,8 @@ mod recovery_runtime_tests {
         let engine = std::sync::Arc::new(crate::recovery::engine::RecoveryEngine::new(
             crate::recovery::action_store::JsonActionStore::load(temp.path().join("actions.json"))
                 .unwrap(),
-            crate::recovery::engine::BuiltinRecipes,
+            std::sync::Arc::new(crate::recovery::engine::BuiltinRecipes)
+                as std::sync::Arc<dyn crate::recovery::engine::RecipeProvider>,
         ));
         let owner = crate::recovery::transaction::OwnerIdentity {
             pid: std::process::id(),

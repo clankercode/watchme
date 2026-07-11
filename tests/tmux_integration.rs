@@ -71,6 +71,8 @@ async fn generic_tmux_blocked_text_without_adapter_boundary_is_unknown_nonaction
     let _guard = ServerGuard(socket.clone());
     let status = Command::new("tmux")
         .args([
+            "-f",
+            "/dev/null",
             "-L",
             &socket,
             "new-session",
@@ -128,6 +130,8 @@ fn private_tmux_server_captures_sends_and_refuses_stale_identity() {
     cleanup();
     let status = Command::new("tmux")
         .args([
+            "-f",
+            "/dev/null",
             "-L",
             &socket,
             "new-session",
@@ -144,6 +148,8 @@ fn private_tmux_server_captures_sends_and_refuses_stale_identity() {
     assert!(
         Command::new("tmux")
             .args([
+                "-f",
+                "/dev/null",
                 "-L",
                 &socket,
                 "new-window",
@@ -324,6 +330,8 @@ fn bare_watchme_registers_fake_codex_ancestor_in_private_tmux() {
     let home = root.path().join("home");
     let status = Command::new("tmux")
         .args([
+            "-f",
+            "/dev/null",
             "-L",
             &socket,
             "new-session",

@@ -20,6 +20,7 @@ use watchme::ipc::protocol::{MAX_FRAME_BYTES, Request, Response, decode_frame, e
 use watchme::ipc::{bind_owner_only, validate_peer_uid};
 use watchme::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
 use watchme::paths::WatchmePaths;
+use watchme::recovery::engine::BuiltinRecipes;
 use watchme::store::JsonStore;
 
 fn state(id: &str, pid: u32, start: u64) -> WatcherState {
@@ -794,6 +795,7 @@ async fn pending_socket_wake_survives_daemon_restart_and_is_then_consumed() {
             true,
             SystemPeerCredentialProvider,
             Arc::new(AlwaysFailObserver),
+            Arc::new(BuiltinRecipes),
         )
         .await
     });

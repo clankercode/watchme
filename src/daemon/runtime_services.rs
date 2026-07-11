@@ -201,12 +201,7 @@ impl crate::recovery::transaction::ProcessProbe for DaemonOwnerProbe {
     }
 }
 
-pub(super) fn recover_durable_actions_after_restart(
-    engine: &crate::recovery::engine::RecoveryEngine<
-        crate::recovery::action_store::JsonActionStore,
-        crate::recovery::engine::BuiltinRecipes,
-    >,
-) {
+pub(super) fn recover_durable_actions_after_restart(engine: &super::DaemonRecoveryEngine) {
     let evidence = NoEvidence;
     let executor = NoExecutor;
     let clock = SystemRecoveryClock::new();
@@ -217,12 +212,7 @@ pub(super) fn recover_durable_actions_after_restart(
     }
 }
 
-pub(super) fn recover_stale_durable_actions(
-    engine: &crate::recovery::engine::RecoveryEngine<
-        crate::recovery::action_store::JsonActionStore,
-        crate::recovery::engine::BuiltinRecipes,
-    >,
-) {
+pub(super) fn recover_stale_durable_actions(engine: &super::DaemonRecoveryEngine) {
     let evidence = NoEvidence;
     let executor = NoExecutor;
     let clock = SystemRecoveryClock::new();
