@@ -6,6 +6,10 @@ if [[ ! "$current_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; the
   printf 'error: expected a SemVer tag, got %q\n' "$current_tag" >&2
   exit 1
 fi
+git rev-parse --verify --quiet "${current_tag}^{commit}" >/dev/null || {
+  printf 'error: tag does not resolve to a commit: %s\n' "$current_tag" >&2
+  exit 1
+}
 
 previous_tag="$({
   git tag --merged "${current_tag}^{commit}" --list 'v[0-9]*' --sort=-version:refname
@@ -18,32 +22,108 @@ done)"
 
 if [[ -n "$previous_tag" ]]; then
   range="${previous_tag}..${current_tag}"
-  printf '# WatchMe %s\n\nChanges since %s:\n\n' "$current_tag" "$previous_tag"
+  comparison="since ${previous_tag}"
 else
   range="$current_tag"
-  printf '# WatchMe %s\n\nComplete changelog:\n\n' "$current_tag"
+  comparison="across the complete project history"
 fi
 
-git log "$range" --no-merges --pretty='- %s ([`%h`](../../commit/%H))'
+declare -a breaking=() features=() fixes=() documentation=() other=()
+breaking_subject_pattern='^[a-zA-Z]+(\([^)]*\))?!:'
+feature_subject_pattern='^feat(\([^)]*\))?:'
+fix_subject_pattern='^fix(\([^)]*\))?:'
+docs_subject_pattern='^docs?(\([^)]*\))?:'
+while IFS= read -r commit; do
+  subject="$(git show -s --format=%s "$commit")"
+  body="$(git show -s --format=%B "$commit")"
+  subject="${subject//&/&amp;}"
+  subject="${subject//</&lt;}"
+  subject="${subject//>/&gt;}"
+  entry="- ${subject} ([${commit:0:7}](../../commit/${commit}))"
 
-cat <<'EOF'
+  if [[ "$subject" =~ $breaking_subject_pattern ]] ||
+     grep -q '^BREAKING[ -]CHANGE:' <<<"$body"; then
+    breaking+=("$entry")
+  elif [[ "$subject" =~ $feature_subject_pattern ]]; then
+    features+=("$entry")
+  elif [[ "$subject" =~ $fix_subject_pattern ]]; then
+    fixes+=("$entry")
+  elif [[ "$subject" =~ $docs_subject_pattern ]]; then
+    documentation+=("$entry")
+  else
+    other+=("$entry")
+  fi
+done < <(git log "$range" --no-merges --format=%H)
 
-## Installation
+commit_count=$((${#breaking[@]} + ${#features[@]} + ${#fixes[@]} + ${#documentation[@]} + ${#other[@]}))
 
-Download the archive for your platform, verify it with `SHA256SUMS`, extract
-it, and place `watchme` and its `WatchMe` alias on your `PATH`.
+print_group() {
+  local title="$1"
+  shift
+  printf '### %s\n\n' "$title"
+  if (($# == 0)); then
+    printf 'None.\n\n'
+  else
+    printf '%s\n' "$@"
+    printf '\n'
+  fi
+}
 
-## Compatibility
+cat <<EOF
+# WatchMe ${current_tag}
 
-Supported release platforms are Linux and macOS on x86_64 and aarch64.
+## Summary
 
-## Checksums and artifacts
+WatchMe ${current_tag} contains ${commit_count} non-merge changes ${comparison}.
+It provides a local supervisor for long-running coding-agent sessions on Linux
+and macOS.
 
-Verify an archive with `sha256sum -c SHA256SUMS` (Linux) or
-`shasum -a 256 -c SHA256SUMS` (macOS).
+## Changes ${comparison^}
+
+EOF
+print_group 'Breaking changes' "${breaking[@]}"
+print_group 'Features' "${features[@]}"
+print_group 'Fixes' "${fixes[@]}"
+print_group 'Documentation' "${documentation[@]}"
+print_group 'Other changes' "${other[@]}"
+
+cat <<EOF
+## Installation and upgrade
+
+Download the archive matching your platform, then verify it against
+\`SHA256SUMS\` before extraction. Extract the archive and copy \`watchme\` to a
+directory on your \`PATH\`. The included \`WatchMe\` symbolic link is the
+uppercase compatibility alias and must remain beside \`watchme\` if used.
+
+For an upgrade, replace the existing \`watchme\` binary and \`WatchMe\` alias
+with the files from the new archive.
+
+## Artifacts
+
+- \`watchme-${current_tag}-x86_64-unknown-linux-gnu.tar.gz\`
+- \`watchme-${current_tag}-aarch64-unknown-linux-gnu.tar.gz\`
+- \`watchme-${current_tag}-x86_64-apple-darwin.tar.gz\`
+- \`watchme-${current_tag}-aarch64-apple-darwin.tar.gz\`
+- \`SHA256SUMS\`
+
+## Checksums and verification
+
+On Linux, run \`sha256sum --check SHA256SUMS\`. On macOS, run
+\`shasum -a 256 -c SHA256SUMS\`. The release workflow validates the Cargo
+version against the tag, builds and smoke-tests each native binary, verifies
+both executable names in every archive, and rechecks all generated SHA-256
+checksums before publication. CI runs formatting, Clippy, tests, and a release
+build on all four supported system and architecture combinations.
+
+## Compatibility and support
+
+Release binaries support Linux and macOS on x86_64 and aarch64. Windows is not
+supported. See \`docs/compatibility.md\` for provider-specific compatibility.
 
 ## Known limitations
 
-See the compatibility documentation in the repository. Windows is not
-supported.
+- Windows is not supported.
+- Herdr integration follows WatchMe's local bridge contract because an
+  installed upstream Herdr API was unavailable for verification during v1
+  development.
 EOF
