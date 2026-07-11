@@ -216,6 +216,7 @@ fn valid_precondition(condition: &Condition) -> bool {
                 | "GOAL_STATE_IS"
                 | "EVENT_CATEGORY_IS"
                 | "NO_HUMAN_INTERVENTION"
+                | "CLAUDE_RESUME_SESSION"
                 | "CURRENT_TIME_AT_OR_AFTER"
         )
 }
@@ -231,6 +232,7 @@ fn valid_outcome(condition: &Condition) -> bool {
                 | "WAIT_STATE_RECORDED"
                 | "AGENT_STATE_IS"
                 | "PROCESS_TERMINATED"
+                | "CLAUDE_PROGRESS"
                 | "HUMAN_NOTIFIED"
                 | "NO_STATE_CHANGE_EXPECTED"
         )

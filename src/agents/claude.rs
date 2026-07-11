@@ -26,6 +26,7 @@ pub struct WaitMenu {
 }
 
 const WAIT_LABEL: &str = "stop and wait for limit to reset";
+pub const DEFAULT_RESUME: &str = "Continue exactly where you left off.";
 
 pub fn classify_stop_failure(error_type: &str, detail: &str, native_retry: bool) -> ClaudeClass {
     let error = error_type.to_ascii_lowercase();
@@ -113,7 +114,7 @@ pub fn labelled_wait_menu(first: &str, second: &str) -> Option<WaitMenu> {
     if first != second || first.len() > 16_384 || looks_quoted(first) {
         return None;
     }
-    let rows: Vec<_> = first.lines().filter_map(menu_row).collect();
+    let rows = menu_rows(first)?;
     let target = rows.iter().position(|row| is_wait_label(&row.1))?;
     let cursor = rows.iter().position(|row| row.0)?;
     // Account-changing choices may be present but are never selected. Refuse
@@ -127,6 +128,28 @@ pub fn labelled_wait_menu(first: &str, second: &str) -> Option<WaitMenu> {
         .ok()?
         .checked_sub(i8::try_from(cursor).ok()?)
         .map(|moves| WaitMenu { moves })
+}
+
+fn menu_rows(screen: &str) -> Option<Vec<(bool, String)>> {
+    let mut rows = Vec::new();
+    for line in screen.lines() {
+        if let Some(row) = menu_row(line) {
+            rows.push(row);
+            continue;
+        }
+        // Claude can wrap the parenthesized reset hint under its selected row.
+        // It is part of the current menu only when it is an indented, bounded,
+        // benign reset suffix immediately following a numbered option.
+        let suffix = line.trim();
+        if let Some((_, previous)) = rows.last_mut()
+            && line.starts_with(char::is_whitespace)
+            && is_reset_suffix(suffix)
+        {
+            previous.push(' ');
+            previous.push_str(&normalize_label(suffix));
+        }
+    }
+    (!rows.is_empty()).then_some(rows)
 }
 
 fn menu_row(line: &str) -> Option<(bool, String)> {
@@ -145,7 +168,7 @@ fn menu_row(line: &str) -> Option<(bool, String)> {
     if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    let label = label.trim().to_ascii_lowercase();
+    let label = normalize_label(label);
     (!label.is_empty() && label.len() <= 200).then_some((cursor, label))
 }
 fn looks_quoted(text: &str) -> bool {
@@ -155,11 +178,36 @@ fn looks_quoted(text: &str) -> bool {
         || lower.lines().any(|line| line.trim_start().starts_with('"'))
 }
 fn is_wait_label(label: &str) -> bool {
+    let label = normalize_label(label);
     label == WAIT_LABEL
-        || label.strip_prefix(WAIT_LABEL).is_some_and(|suffix| {
-            let suffix = suffix.trim_start();
-            suffix.starts_with('(') || suffix.starts_with('-') || suffix.starts_with('–')
-        })
+        || label
+            .strip_prefix(WAIT_LABEL)
+            .is_some_and(|suffix| is_reset_suffix(suffix.trim()))
+}
+
+fn normalize_label(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_reset_suffix(suffix: &str) -> bool {
+    let suffix = normalize_label(suffix);
+    let wrapped = suffix
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .or_else(|| suffix.strip_prefix('-'))
+        .or_else(|| suffix.strip_prefix('–'));
+    wrapped.is_some_and(|value| {
+        !value.is_empty()
+            && value.len() <= 160
+            && value.contains("reset")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b" :,+-()/".contains(&byte))
+    })
 }
 fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
@@ -330,12 +378,7 @@ pub fn resume_candidate_event(
     event.observed_at = now.to_rfc3339();
     event.category = EventCategory::WaitingForModel;
     event.terminal = false;
-    // A StopFailure marker has hook rank 7.  There is currently no equally
-    // trustworthy Claude "working" proof available after reset, so a generic
-    // lower-ranked liveness observation could never verify an input action.
-    // Keep the elapsed-reset signal observable, but fail closed rather than
-    // sending text whose outcome cannot be proven.
-    event.policy_hint = PolicyHint::ObserveOnly;
+    event.policy_hint = PolicyHint::DeterministicActionAllowed;
     event.evidence_fingerprint = crate::observe::evidence_fingerprint(
         "claude_resume",
         &previous.evidence_fingerprint,
@@ -345,6 +388,10 @@ pub fn resume_candidate_event(
     event
         .metadata
         .insert("claude_resume".into(), serde_json::Value::Bool(true));
+    event.metadata.insert(
+        "claude_resume_session".into(),
+        serde_json::Value::String(event.evidence_fingerprint.clone()),
+    );
     event.metadata.insert(
         "agent_state".into(),
         serde_json::Value::String("WORKING".into()),
@@ -394,6 +441,68 @@ pub fn trusted_menu_event(watcher: &WatcherState, first: &str, second: &str) -> 
         serde_json::Value::Number(i64::from(menu.moves).into()),
     );
     Some(event)
+}
+
+/// Builds the narrow post-send proof used only by the Claude resume
+/// transaction. The caller owns the live-tail boundary; this function refuses
+/// quotes, another visible limit menu, stale timestamps, and vague text.
+pub fn trusted_resume_progress_event(
+    watcher: &WatcherState,
+    baseline: &Event,
+    live_tail: &str,
+    observed_at: &str,
+) -> Option<Event> {
+    if live_tail.len() > 32_768
+        || looks_quoted(live_tail)
+        || menu_rows(live_tail)
+            .is_some_and(|rows| rows.iter().any(|(_, label)| is_wait_label(label)))
+        || !has_working_indicator(live_tail)
+        || chrono::DateTime::parse_from_rfc3339(observed_at).ok()?
+            <= chrono::DateTime::parse_from_rfc3339(&baseline.observed_at).ok()?
+    {
+        return None;
+    }
+    let session = baseline
+        .metadata
+        .get("claude_resume_session")
+        .and_then(serde_json::Value::as_str)?;
+    let mut event = Event::new(
+        format!("claude-progress-{}", watcher.watcher_id),
+        observed_at,
+        watcher.watcher_id.clone(),
+        baseline.target_identity_hash.clone(),
+        EventSource::new(
+            SourceKind::ScreenDetection,
+            "claude",
+            "post_resume_progress",
+        ),
+        EventCategory::Working,
+        0.7,
+        false,
+        crate::observe::evidence_fingerprint("claude_progress", session, live_tail.as_bytes()),
+        "fresh Claude working output after resume",
+        PolicyHint::ObserveOnly,
+    )
+    .ok()?;
+    event.metadata.insert(
+        "claude_resume_session".into(),
+        serde_json::Value::String(session.into()),
+    );
+    event.metadata.insert(
+        "claude_post_resume_progress".into(),
+        serde_json::Value::Bool(true),
+    );
+    Some(event)
+}
+
+fn has_working_indicator(live_tail: &str) -> bool {
+    live_tail.lines().any(|line| {
+        let line = normalize_label(line);
+        matches!(
+            line.as_str(),
+            "working" | "working..." | "working…" | "claude is working"
+        ) || line.starts_with("working ")
+    })
 }
 
 fn process_cwd_matches(pid: u32, expected: &str) -> bool {
@@ -464,6 +573,13 @@ impl RecipeProvider for ClaudeRecipes {
             }
             EventCategory::TransientOverload if event.terminal => {
                 Some(overload_wait(event, watcher.revision))
+            }
+            EventCategory::WaitingForModel
+                if event.policy_hint == PolicyHint::DeterministicActionAllowed
+                    && event.metadata.get("claude_resume")
+                        == Some(&serde_json::Value::Bool(true)) =>
+            {
+                resume_action(event)
             }
             // Internal Claude retry, auth/billing/safety, credit exhaustion,
             // malformed hook data, and unrecognised events require observation
@@ -550,6 +666,39 @@ fn overload_wait(event: &crate::model::Event, revision: u64) -> Action {
         value: None,
     }];
     action
+}
+
+fn resume_action(event: &crate::model::Event) -> Option<Action> {
+    let session = event.metadata.get("claude_resume_session")?.as_str()?;
+    let mut action = Action::send_text(
+        "claude.resume_once",
+        DEFAULT_RESUME,
+        "reset elapsed and live Claude target revalidated",
+        event.evidence_fingerprint.clone(),
+    );
+    action.preconditions.extend([
+        Condition {
+            kind: "PROCESS_ALIVE".into(),
+            value: None,
+        },
+        Condition {
+            kind: "NO_HUMAN_INTERVENTION".into(),
+            value: None,
+        },
+        Condition {
+            kind: "COMPOSER_EMPTY".into(),
+            value: None,
+        },
+        Condition {
+            kind: "CLAUDE_RESUME_SESSION".into(),
+            value: Some(serde_json::Value::String(session.into())),
+        },
+    ]);
+    action.expected_outcomes = vec![Condition {
+        kind: "CLAUDE_PROGRESS".into(),
+        value: Some(serde_json::Value::String(session.into())),
+    }];
+    Some(action)
 }
 
 fn hash64(value: &str) -> u64 {

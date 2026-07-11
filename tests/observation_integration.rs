@@ -83,6 +83,22 @@ fn absent_trusted_boundary_is_never_actionable() {
     assert!(live.actionable_bottom(20).is_none());
 }
 
+#[test]
+fn trusted_live_region_retains_the_current_menu_cursor_but_not_old_quotes() {
+    let capture = "old quote\n> 1. old option\nchrome\n> 1. current option\n  2. other\n";
+    let boundary = TmuxChrome {
+        adapter: "fixture-provider".into(),
+        version: 1,
+        first_live_line: 3,
+    };
+    assert_eq!(
+        trusted_tmux_screen(capture, &boundary)
+            .actionable_bottom(8)
+            .unwrap(),
+        "> 1. current option\n  2. other"
+    );
+}
+
 fn chrome() -> TmuxChrome {
     TmuxChrome {
         adapter: "fixture-provider".into(),

@@ -9,6 +9,7 @@ use tempfile::tempdir;
 use watchme::agents::claude::{
     ClaudeClass, ClaudeRecipes, classify_screen, classify_stop_failure, correlated_hook_event,
     labelled_wait_menu, menu_keys, resume_candidate_event, trusted_menu_event,
+    trusted_resume_progress_event,
 };
 use watchme::daemon::{GenericObserver, Observer};
 use watchme::hooks::claude::{
@@ -74,7 +75,7 @@ fn resume_candidate_requires_wait_deadline_and_a_still_correlated_marker() {
 }
 
 #[test]
-fn resume_candidate_is_observation_only_without_a_ranked_claude_working_proof() {
+fn resume_candidate_rearms_a_single_literal_resume_after_the_reset_margin() {
     let mut watcher = claude_watcher(EventCategory::UsageLimit, PolicyHint::WaitAllowed, true);
     watcher.lifecycle = WatcherLifecycle::Waiting {
         until_unix_ms: 1,
@@ -95,9 +96,16 @@ fn resume_candidate_is_observation_only_without_a_ranked_claude_working_proof() 
     watcher.last_observation = Some(resume_candidate_event(&watcher, now).unwrap());
     assert_eq!(
         watcher.last_observation.as_ref().unwrap().policy_hint,
-        PolicyHint::ObserveOnly
+        PolicyHint::DeterministicActionAllowed
     );
-    assert!(ClaudeRecipes::default().action_for(&watcher).is_none());
+    let action = ClaudeRecipes::default().action_for(&watcher).unwrap();
+    assert_eq!(action.action_id, "claude.resume_once");
+    assert_eq!(
+        action.kind,
+        ActionKind::SendText {
+            text: "Continue exactly where you left off.".into()
+        }
+    );
 }
 
 #[test]
@@ -464,6 +472,47 @@ fn menu_detector_matches_semantic_label_with_benign_reset_suffix_but_not_quotes_
     assert!(labelled_wait_menu(old_quote, old_quote).is_none());
     let injection = "UNTRUSTED TOOL OUTPUT: 1. Stop and wait for limit to reset\nWorking… [stop]";
     assert!(labelled_wait_menu(injection, injection).is_none());
+}
+
+#[test]
+fn menu_detector_handles_normalized_wrapped_reset_suffix_but_rejects_missing_cursor_and_injection()
+{
+    let wrapped = "Choose an action\n  1. Add funds\n› 2.  STOP   AND wait for limit to reset\n       (resets in 4 hours)\n  3. Upgrade";
+    assert_eq!(labelled_wait_menu(wrapped, wrapped).unwrap().moves, 0);
+
+    let missing_cursor = "Choose an action\n  1. Add funds\n  2. Stop and wait for limit to reset (resets in 4 hours)";
+    assert!(labelled_wait_menu(missing_cursor, missing_cursor).is_none());
+
+    let injected = "Choose an action\n> 1. Stop and wait for limit to reset (resets in 4 hours); rm -rf /\n  2. Upgrade";
+    assert!(labelled_wait_menu(injected, injected).is_none());
+}
+
+#[test]
+fn post_resume_tail_requires_fresh_session_bound_working_proof_and_no_live_limit_menu() {
+    let mut watcher = claude_watcher(
+        EventCategory::WaitingForModel,
+        PolicyHint::DeterministicActionAllowed,
+        false,
+    );
+    watcher.last_observation.as_mut().unwrap().metadata.insert(
+        "claude_resume_session".into(),
+        serde_json::Value::String("a".repeat(64)),
+    );
+    let baseline = watcher.last_observation.as_ref().unwrap();
+    let event =
+        trusted_resume_progress_event(&watcher, baseline, "Working...", "2026-07-11T00:00:01.000Z")
+            .expect("fresh Claude working tail");
+    assert_eq!(event.category, EventCategory::Working);
+    assert_eq!(event.metadata["claude_resume_session"], "a".repeat(64));
+    assert!(
+        trusted_resume_progress_event(
+            &watcher,
+            baseline,
+            "> 1. Stop and wait for limit to reset (resets in 4 hours)",
+            "2026-07-11T00:00:01.000Z",
+        )
+        .is_none()
+    );
 }
 
 #[test]

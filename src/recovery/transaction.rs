@@ -113,6 +113,11 @@ pub struct LiveEvidence {
 }
 pub trait EvidenceReader {
     fn read(&self) -> Result<LiveEvidence, String>;
+    /// Input transactions may ask an adapter for a post-send proof. The
+    /// default intentionally preserves ordinary persisted-evidence semantics.
+    fn read_verification(&self, _: &LiveEvidence) -> Result<LiveEvidence, String> {
+        self.read()
+    }
 }
 /// Bridges a registry-persisted current event to a live observer. The first
 /// read is exactly the durable baseline; every later read is fresh evidence.
@@ -409,7 +414,7 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
             .monotonic_ms()
             .saturating_add(action.timeout_seconds.saturating_mul(1000));
         loop {
-            let after = match self.evidence.read() {
+            let after = match self.evidence.read_verification(&baseline) {
                 Ok(after) => after,
                 Err(error) => {
                     return self.uncertain(
@@ -515,6 +520,19 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
                 "evidence fingerprint changed",
             ));
         }
+        if action.preconditions.iter().any(|condition| {
+            condition.kind == "CLAUDE_RESUME_SESSION"
+                && condition.value.as_ref().and_then(serde_json::Value::as_str)
+                    != live
+                        .event
+                        .metadata
+                        .get("claude_resume_session")
+                        .and_then(serde_json::Value::as_str)
+        }) {
+            return Err(TransactionError::Revalidation(
+                "Claude resume session changed",
+            ));
+        }
         if baseline.is_some_and(|old| {
             old.identity != live.identity
                 || old.event.source != live.event.source
@@ -584,6 +602,12 @@ fn policy_context(live: &LiveEvidence, recovery: &RecoveryContext, wall: String)
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     context.wall_time_rfc3339 = Some(wall);
+    context.claude_resume_session = live
+        .event
+        .metadata
+        .get("claude_resume_session")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     context
 }
 fn output_summary(output: &ExecutionOutput) -> String {
@@ -609,9 +633,19 @@ fn receipt_outcomes_hold(output: &ExecutionOutput, outcomes: &[Condition]) -> bo
     })
 }
 fn verified(before: &LiveEvidence, after: &LiveEvidence, outcomes: &[Condition]) -> bool {
+    if after.event.evidence_fingerprint == before.event.evidence_fingerprint {
+        return false;
+    }
+    let claude_progress = outcomes
+        .iter()
+        .any(|outcome| outcome.kind == "CLAUDE_PROGRESS");
+    if claude_progress {
+        return outcomes.iter().any(|outcome| {
+            outcome.kind == "CLAUDE_PROGRESS" && verified_claude_progress(before, after, outcome)
+        });
+    }
     if after.event.source.kind.rank() < before.event.source.kind.rank()
         || after.event.confidence < before.event.confidence
-        || after.event.evidence_fingerprint == before.event.evidence_fingerprint
     {
         return false;
     }
@@ -631,4 +665,31 @@ fn verified(before: &LiveEvidence, after: &LiveEvidence, outcomes: &[Condition])
         "PROCESS_TERMINATED" => after.event.category == EventCategory::Terminated,
         _ => false,
     })
+}
+
+fn verified_claude_progress(
+    before: &LiveEvidence,
+    after: &LiveEvidence,
+    outcome: &Condition,
+) -> bool {
+    let Some(session) = outcome.value.as_ref().and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let baseline_session = before
+        .event
+        .metadata
+        .get("claude_resume_session")
+        .and_then(serde_json::Value::as_str);
+    let progress_session = after
+        .event
+        .metadata
+        .get("claude_resume_session")
+        .and_then(serde_json::Value::as_str);
+    after.event.source.source_id == "claude"
+        && after.event.category == EventCategory::Working
+        && after.event.metadata.get("claude_post_resume_progress")
+            == Some(&serde_json::Value::Bool(true))
+        && baseline_session == Some(session)
+        && progress_session == Some(session)
+        && after.event.observed_at > before.event.observed_at
 }

@@ -503,6 +503,108 @@ fn lower_rank_or_unchanged_working_does_not_verify_but_equal_changed_does() {
 }
 
 #[test]
+fn claude_resume_accepts_only_a_fresh_session_bound_progress_proof() {
+    let session = "c".repeat(64);
+    let mut baseline = live(EventCategory::WaitingForModel, &"b".repeat(64), 1.0);
+    baseline.event.source =
+        EventSource::new(SourceKind::Hook, "claude_stop_failure", "StopFailure");
+    baseline.event.observed_at = "2026-07-11T00:00:00.000Z".into();
+    baseline.event.metadata.insert(
+        "claude_resume_session".into(),
+        serde_json::Value::String(session.clone()),
+    );
+    let mut progress = live(EventCategory::Working, &"d".repeat(64), 0.7);
+    progress.event.source = EventSource::new(
+        SourceKind::ScreenDetection,
+        "claude",
+        "post_resume_progress",
+    );
+    progress.event.observed_at = "2026-07-11T00:00:01.000Z".into();
+    progress.event.metadata.insert(
+        "claude_resume_session".into(),
+        serde_json::Value::String(session.clone()),
+    );
+    progress.event.metadata.insert(
+        "claude_post_resume_progress".into(),
+        serde_json::Value::Bool(true),
+    );
+    let mut action = Action::send_text(
+        "claude.resume_once",
+        "Continue exactly where you left off.",
+        "test Claude resume",
+        "b".repeat(64),
+    );
+    action.preconditions.push(Condition {
+        kind: "CLAUDE_RESUME_SESSION".into(),
+        value: Some(serde_json::Value::String(session.clone())),
+    });
+    action.expected_outcomes = vec![Condition {
+        kind: "CLAUDE_PROGRESS".into(),
+        value: Some(serde_json::Value::String(session)),
+    }];
+    let store = MemoryStore::default();
+    let result = Transaction::new(
+        &store,
+        &evidence(vec![baseline.clone(), baseline.clone(), baseline, progress]),
+        &Executor::default(),
+        &TestClock::default(),
+    )
+    .run("claude", owner(), action, context())
+    .unwrap();
+    assert_eq!(result.phase, ActionPhase::Succeeded);
+}
+
+#[test]
+fn claude_resume_rejects_stale_or_unrelated_lower_rank_progress() {
+    let session = "c".repeat(64);
+    let mut baseline = live(EventCategory::WaitingForModel, &"b".repeat(64), 1.0);
+    baseline.event.source =
+        EventSource::new(SourceKind::Hook, "claude_stop_failure", "StopFailure");
+    baseline.event.observed_at = "2026-07-11T00:00:00.000Z".into();
+    baseline.event.metadata.insert(
+        "claude_resume_session".into(),
+        serde_json::Value::String(session.clone()),
+    );
+    let mut stale = live(EventCategory::Working, &"d".repeat(64), 0.7);
+    stale.event.source = EventSource::new(
+        SourceKind::ScreenDetection,
+        "claude",
+        "post_resume_progress",
+    );
+    stale.event.observed_at = baseline.event.observed_at.clone();
+    stale.event.metadata.insert(
+        "claude_resume_session".into(),
+        serde_json::Value::String("wrong".into()),
+    );
+    stale.event.metadata.insert(
+        "claude_post_resume_progress".into(),
+        serde_json::Value::Bool(true),
+    );
+    let mut action = Action::send_text(
+        "claude.resume_once",
+        "Continue exactly where you left off.",
+        "test Claude resume",
+        "b".repeat(64),
+    );
+    action.preconditions.push(Condition {
+        kind: "CLAUDE_RESUME_SESSION".into(),
+        value: Some(serde_json::Value::String(session.clone())),
+    });
+    action.expected_outcomes = vec![Condition {
+        kind: "CLAUDE_PROGRESS".into(),
+        value: Some(serde_json::Value::String(session)),
+    }];
+    let result = Transaction::new(
+        &MemoryStore::default(),
+        &evidence(vec![baseline.clone(), baseline.clone(), baseline, stale]),
+        &Executor::default(),
+        &TestClock::default(),
+    )
+    .run("claude-stale", owner(), action, context());
+    assert!(matches!(result, Err(TransactionError::Uncertain(_))));
+}
+
+#[test]
 fn stale_lease_uses_pid_and_start_identity() {
     let store = MemoryStore::default();
     let prepared = ActionRecord::prepared(

@@ -218,6 +218,15 @@ impl TargetIdentity {
         }
     }
 
+    pub fn tmux_chrome(&self) -> Option<&crate::observe::screen::TmuxChrome> {
+        match self {
+            Self::Multiplexer {
+                provider, chrome, ..
+            } if provider == "tmux" => chrome.as_ref(),
+            _ => None,
+        }
+    }
+
     pub const fn schema_version(&self) -> u16 {
         TARGET_IDENTITY_SCHEMA_VERSION
     }

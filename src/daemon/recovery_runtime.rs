@@ -109,6 +109,47 @@ impl EvidenceReader for FreshTargetEvidence {
             event,
         })
     }
+
+    fn read_verification(&self, baseline: &LiveEvidence) -> Result<LiveEvidence, String> {
+        let mut evidence = self.read()?;
+        let watcher = self.watcher()?;
+        if let Some(progress) = fresh_claude_progress(&watcher, &baseline.event) {
+            evidence.event = progress;
+        }
+        Ok(evidence)
+    }
+}
+
+/// A lower-ranked terminal proof is only usable for the one Claude resume
+/// action. It is captured after input dispatch from the same revalidated mux
+/// identity and carries the exact action session from the durable baseline.
+fn fresh_claude_progress(
+    watcher: &crate::model::WatcherState,
+    baseline: &crate::model::Event,
+) -> Option<crate::model::Event> {
+    if baseline.metadata.get("claude_resume") != Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    let identity = watcher_mux_identity(watcher).ok()??;
+    validate_mux_target(watcher, &identity).ok()?;
+    let capture = capture_mux_target(watcher, &identity, 40, 16 * 1024).ok()?;
+    let clean = crate::observe::screen::sanitize_terminal(capture.text.as_bytes(), 16 * 1024, 40);
+    let live_tail = match watcher.target.observation_context() {
+        Some(crate::model::MultiplexerContext::Tmux { .. }) => {
+            watcher.target.tmux_chrome().and_then(|chrome| {
+                crate::observe::screen::trusted_tmux_screen(&clean, chrome).actionable_bottom(40)
+            })
+        }
+        Some(crate::model::MultiplexerContext::Herdr { .. }) => Some(clean),
+        _ => None,
+    }?;
+    let observed: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    crate::agents::claude::trusted_resume_progress_event(
+        watcher,
+        baseline,
+        &live_tail,
+        &observed.to_rfc3339(),
+    )
 }
 
 pub(super) struct RuntimeComposerSafety {

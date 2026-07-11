@@ -23,6 +23,7 @@ pub struct PolicyContext {
     pub goal_state: Option<String>,
     pub event_category: Option<String>,
     pub wall_time_rfc3339: Option<String>,
+    pub claude_resume_session: Option<String>,
 }
 impl PolicyContext {
     pub const fn safe() -> Self {
@@ -49,6 +50,7 @@ impl PolicyContext {
             goal_state: None,
             event_category: None,
             wall_time_rfc3339: None,
+            claude_resume_session: None,
         }
     }
 }
@@ -170,6 +172,7 @@ fn precondition_holds(condition: &crate::model::Condition, context: &PolicyConte
         "GOAL_STATE_IS" => text() == context.goal_state.as_deref(),
         "EVENT_CATEGORY_IS" => text() == context.event_category.as_deref(),
         "NO_HUMAN_INTERVENTION" => !context.human_intervened,
+        "CLAUDE_RESUME_SESSION" => text() == context.claude_resume_session.as_deref(),
         "CURRENT_TIME_AT_OR_AFTER" => text()
             .zip(context.wall_time_rfc3339.as_deref())
             .is_some_and(|(required, current)| {

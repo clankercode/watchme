@@ -209,10 +209,12 @@ pub fn trusted_tmux_screen(capture: &str, chrome: &TmuxChrome) -> LiveScreen {
                 LineProvenance::CodeFence
             } else if fenced {
                 LineProvenance::CodeFence
+            } else if boundary.is_some_and(|value| index >= value) {
+                // In a proven current UI region `>` may be the menu cursor;
+                // treating it as a quote would hide the selected option.
+                LineProvenance::LiveOutput
             } else if trimmed.starts_with('>') || trimmed.starts_with('│') {
                 LineProvenance::Quote
-            } else if boundary.is_some_and(|value| index >= value) {
-                LineProvenance::LiveOutput
             } else {
                 LineProvenance::Transcript
             };

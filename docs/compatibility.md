@@ -42,16 +42,22 @@ transcript, marker, resolved agent PID/start-time, and canonical CWD
 environment correlation. If that proof is unavailable WatchMe simply does
 not enable hook recovery for that watcher.
 
-The terminal fallback is observation-only on Claude Code 2.1.207. The local
-`/rate-limit-options` probe did not establish a versioned, out-of-band renderer
-boundary that can distinguish current UI chrome from terminal content, so
-WatchMe does not content-search a pane and will not send menu keys. It also
-does not automatically send a post-reset resume message: the current hook
-evidence has higher provenance than generic working/liveness observations, so
-such a side effect could not be verified honestly. A future adapter may enable
-either action only after supplying a versioned trusted boundary or an equally
-ranked structured Claude working proof. Until then, changed identity, missing
-evidence, or an elapsed reset remains a human hand-off.
+The terminal fallback is observation-only on Claude Code 2.1.207. A second
+isolated probe on 2026-07-12 again stopped at the first-run security screen;
+WatchMe sent only `/rate-limit-options`, selected nothing, and destroyed the
+temporary tmux server and HOME. It therefore did not establish a versioned
+renderer boundary or a real limit menu for this build.
+
+The implementation can act only when a supported adapter provides a bounded,
+immediate live region: it requires two identical captures, one current cursor,
+and the exact normalized `Stop and wait for limit to reset` label with a benign
+reset suffix. It never searches arbitrary pane history. A correlated reset
+can send the fixed resume text only after its margin, identity and composer
+checks, and a new action-session-bound Claude working proof from that same live
+target. Generic liveness and stale/lower-ranked evidence cannot verify it.
+Because this host has not established the renderer boundary, neither menu
+selection nor automatic resume is enabled here; an elapsed reset without that
+proof remains a human hand-off.
 
 ## Herdr
 
