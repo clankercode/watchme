@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Match Cargo version to tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          test -n "$cargo_version"
+          test "$cargo_version" = "$tag_version"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.85 --profile minimal --target ${{ matrix.target }}
+      - name: Select Rust toolchain
+        run: rustup default 1.85
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke-test release binary
+        run: target/${{ matrix.target }}/release/watchme --version
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="watchme-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$archive"
+          cp "target/${{ matrix.target }}/release/watchme" "$archive/watchme"
+          ln -s watchme "$archive/WatchMe"
+          cp LICENSES/UNLICENSE LICENSES/CC0-1.0 "$archive/"
+          tar -czf "$archive.tar.gz" "$archive"
+      - name: Upload immutable build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchme-${{ github.ref_name }}-${{ matrix.target }}
+          path: watchme-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: watchme-${{ github.ref_name }}-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-apple-darwin
+            aarch64-apple-darwin
+          )
+          for target in "${expected[@]}"; do
+            archive="watchme-${GITHUB_REF_NAME}-${target}.tar.gz"
+            test -f "$archive"
+            tar -tzf "$archive" | grep -Fx "watchme-${GITHUB_REF_NAME}-${target}/watchme"
+            tar -tzf "$archive" | grep -Fx "watchme-${GITHUB_REF_NAME}-${target}/WatchMe"
+          done
+          sha256sum -- *.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --fail-on-no-commits --title "WatchMe $GITHUB_REF_NAME"
+      - name: Upload immutable release bundle record
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchme-${{ github.ref_name }}-release-assets
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
