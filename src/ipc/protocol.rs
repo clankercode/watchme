@@ -8,11 +8,19 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Status,
+    Status {
+        id: Option<String>,
+    },
     List,
     Stop {
         id: Option<String>,
         all: bool,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
     },
     Register {
         watcher: Box<crate::model::WatcherState>,
@@ -25,7 +33,7 @@ pub enum Request {
 pub enum Response {
     Status {
         running: bool,
-        watchers: usize,
+        watchers: Vec<crate::model::WatcherState>,
     },
     Watchers {
         watchers: Vec<crate::model::WatcherState>,
@@ -33,6 +41,9 @@ pub enum Response {
     Registered {
         watcher_id: String,
         existing: bool,
+    },
+    Updated {
+        watcher: Box<crate::model::WatcherState>,
     },
     Stopped,
     Error {

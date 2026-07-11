@@ -60,6 +60,8 @@ fn administrative_commands_parse() {
         &["status", "watcher-1"][..],
         &["list"],
         &["stop", "--all"],
+        &["pause", "watcher-1"],
+        &["resume", "watcher-1"],
         &["daemon", "status"],
         &["daemon", "stop"],
     ] {
@@ -69,6 +71,33 @@ fn administrative_commands_parse() {
             .assert()
             .failure()
             .stderr(predicate::str::contains("daemon unavailable"));
+    }
+}
+
+#[test]
+fn stop_requires_a_target() {
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .arg("stop")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires"));
+}
+
+#[test]
+fn administrative_target_ids_must_not_be_empty() {
+    for arguments in [
+        &["status", ""][..],
+        &["stop", ""],
+        &["pause", ""],
+        &["resume", ""],
+    ] {
+        Command::cargo_bin("watchme")
+            .unwrap()
+            .args(arguments)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("target ID must not be empty"));
     }
 }
 

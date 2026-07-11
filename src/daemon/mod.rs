@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::daemon::registry::{RegistrationOutcome, Registry};
+use crate::daemon::scheduler::{Scheduler, SchedulerEvent, SchedulerHandle};
 use crate::ipc::protocol::{Request, Response};
 use crate::ipc::{bind_owner_only, read_request, write_response};
 use crate::model::WatcherLifecycle;
@@ -167,6 +168,33 @@ pub async fn run(
     idle_grace: Duration,
     stay_resident: bool,
 ) -> io::Result<()> {
+    run_with_peer_provider(
+        paths,
+        idle_grace,
+        stay_resident,
+        SystemPeerCredentialProvider,
+    )
+    .await
+}
+
+pub trait PeerCredentialProvider {
+    fn effective_uid(&self, stream: &tokio::net::UnixStream) -> io::Result<u32>;
+}
+
+pub struct SystemPeerCredentialProvider;
+
+impl PeerCredentialProvider for SystemPeerCredentialProvider {
+    fn effective_uid(&self, stream: &tokio::net::UnixStream) -> io::Result<u32> {
+        Ok(stream.peer_cred()?.uid())
+    }
+}
+
+pub async fn run_with_peer_provider(
+    paths: &WatchmePaths,
+    idle_grace: Duration,
+    stay_resident: bool,
+    peer_credentials: impl PeerCredentialProvider,
+) -> io::Result<()> {
     paths.create_owner_only()?;
     let lock_path = paths.runtime_dir().join("daemon.lock");
     let _lock = DaemonLock::acquire(
@@ -185,30 +213,52 @@ pub async fn run(
     let _cleanup = SocketCleanup(socket_path);
     let state_path = paths.state_file("watchers.json")?;
     let mut registry = Registry::load(JsonStore::new(state_path)).map_err(io::Error::other)?;
+    let (scheduler, runner) = Scheduler::new(idle_grace, stay_resident);
+    for watcher in registry.list() {
+        if matches!(
+            watcher.lifecycle,
+            WatcherLifecycle::Stopped { .. } | WatcherLifecycle::TargetTerminated
+        ) {
+            continue;
+        }
+        scheduler
+            .send(SchedulerEvent::Register(watcher.watcher_id.clone()))
+            .map_err(io::Error::other)?;
+        if matches!(
+            watcher.lifecycle,
+            WatcherLifecycle::Paused | WatcherLifecycle::HumanRequired { .. }
+        ) {
+            scheduler
+                .send(SchedulerEvent::Pause(watcher.watcher_id))
+                .map_err(io::Error::other)?;
+        }
+    }
+    let mut scheduler_task = tokio::spawn(runner.run());
     let timeout = Duration::from_secs(2);
     loop {
-        let accepted = if registry.list().iter().all(|watcher| {
-            matches!(
-                watcher.lifecycle,
-                WatcherLifecycle::Stopped { .. } | WatcherLifecycle::TargetTerminated
-            )
-        }) && !stay_resident
-        {
-            match tokio::time::timeout(idle_grace, listener.accept()).await {
-                Ok(result) => result?,
-                Err(_) => return Ok(()),
+        let accepted = tokio::select! {
+            result = &mut scheduler_task => {
+                result.map_err(io::Error::other)?;
+                return Ok(());
             }
-        } else {
-            listener.accept().await?
+            result = listener.accept() => result?,
         };
         let (mut stream, _) = accepted;
-        let credentials = stream.peer_cred()?;
-        if credentials.uid() != rustix::process::geteuid().as_raw() {
-            continue;
+        match peer_credentials.effective_uid(&stream) {
+            Ok(uid) if uid == rustix::process::geteuid().as_raw() => {}
+            Ok(_) => {
+                eprintln!("watchme daemon: denied IPC peer with mismatched effective UID");
+                continue;
+            }
+            Err(error) => {
+                eprintln!("watchme daemon: could not validate IPC peer: {error}");
+                continue;
+            }
         }
         let request = match read_request(&mut stream, timeout).await {
             Ok(request) => request,
             Err(error) => {
+                eprintln!("watchme daemon: rejected IPC request: {error}");
                 let _ = write_response(
                     &mut stream,
                     &Response::Error {
@@ -221,29 +271,56 @@ pub async fn run(
                 continue;
             }
         };
-        let (response, shutdown) = handle_request(&mut registry, request);
+        if request_has_empty_target(&request) {
+            let _ = write_response(
+                &mut stream,
+                &Response::Error {
+                    code: "invalid_target".into(),
+                    message: "target ID must not be empty".into(),
+                },
+                timeout,
+            )
+            .await;
+            continue;
+        }
+        let (response, shutdown) = handle_request(&mut registry, &scheduler, request);
         let response = response.unwrap_or_else(|error| Response::Error {
             code: "daemon_error".into(),
             message: error.to_string(),
         });
-        write_response(&mut stream, &response, timeout)
-            .await
-            .map_err(io::Error::other)?;
+        if let Err(error) = write_response(&mut stream, &response, timeout).await {
+            eprintln!("watchme daemon: IPC response failed: {error}");
+            continue;
+        }
         if shutdown {
             return Ok(());
         }
     }
 }
 
+fn request_has_empty_target(request: &Request) -> bool {
+    match request {
+        Request::Status { id } | Request::Stop { id, .. } => {
+            id.as_ref().is_some_and(String::is_empty)
+        }
+        Request::Pause { id } | Request::Resume { id } => id.is_empty(),
+        Request::List | Request::Register { .. } | Request::Shutdown => false,
+    }
+}
+
 fn handle_request(
     registry: &mut Registry,
+    scheduler: &SchedulerHandle,
     request: Request,
 ) -> (Result<Response, registry::RegistryError>, bool) {
     match request {
-        Request::Status => (
+        Request::Status { id } => (
             Ok(Response::Status {
                 running: true,
-                watchers: registry.list().len(),
+                watchers: id.map_or_else(
+                    || registry.list(),
+                    |id| registry.get(&id).cloned().into_iter().collect(),
+                ),
             }),
             false,
         ),
@@ -255,10 +332,13 @@ fn handle_request(
         ),
         Request::Register { watcher } => (
             registry.register(*watcher).map(|outcome| match outcome {
-                RegistrationOutcome::Added(watcher_id) => Response::Registered {
-                    watcher_id,
-                    existing: false,
-                },
+                RegistrationOutcome::Added(watcher_id) => {
+                    let _ = scheduler.send(SchedulerEvent::Register(watcher_id.clone()));
+                    Response::Registered {
+                        watcher_id,
+                        existing: false,
+                    }
+                }
                 RegistrationOutcome::Existing(watcher_id) => Response::Registered {
                     watcher_id,
                     existing: true,
@@ -288,9 +368,52 @@ fn handle_request(
                     )
                 })
                 .map(|()| Response::Stopped);
+            for id in registry
+                .list()
+                .into_iter()
+                .filter(|watcher| matches!(watcher.lifecycle, WatcherLifecycle::Stopped { .. }))
+                .map(|watcher| watcher.watcher_id)
+            {
+                let _ = scheduler.send(SchedulerEvent::Stop(id));
+            }
             (result, false)
         }
-        Request::Shutdown => (Ok(Response::Stopped), true),
+        Request::Pause { id } => (
+            registry
+                .transition(&id, WatcherLifecycle::Paused, now_ms())
+                .map(|()| {
+                    let _ = scheduler.send(SchedulerEvent::Pause(id.clone()));
+                    Response::Updated {
+                        watcher: Box::new(
+                            registry
+                                .get(&id)
+                                .expect("transitioned watcher exists")
+                                .clone(),
+                        ),
+                    }
+                }),
+            false,
+        ),
+        Request::Resume { id } => (
+            registry
+                .transition(&id, WatcherLifecycle::Observing, now_ms())
+                .map(|()| {
+                    let _ = scheduler.send(SchedulerEvent::Resume(id.clone()));
+                    Response::Updated {
+                        watcher: Box::new(
+                            registry
+                                .get(&id)
+                                .expect("transitioned watcher exists")
+                                .clone(),
+                        ),
+                    }
+                }),
+            false,
+        ),
+        Request::Shutdown => {
+            let _ = scheduler.send(SchedulerEvent::Shutdown);
+            (Ok(Response::Stopped), true)
+        }
     }
 }
 

@@ -10,6 +10,7 @@ pub const WATCHER_STATE_SCHEMA_VERSION: u16 = 1;
 pub enum WatcherLifecycle {
     Registered,
     Observing,
+    Paused,
     Recovering { evidence_fingerprint: String },
     Waiting { until_unix_ms: u64, reason: String },
     HumanRequired { reason: String },

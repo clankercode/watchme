@@ -1,8 +1,10 @@
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
+use watchme::client::ResolvedRegistration;
 use watchme::daemon;
 use watchme::ipc::protocol::{Request, Response};
 use watchme::ipc::{read_response, write_request};
@@ -25,6 +27,8 @@ enum Command {
     Snapshot(SnapshotOptions),
     Logs(LogOptions),
     Stop(StopOptions),
+    Pause(TargetOptions),
+    Resume(TargetOptions),
     Doctor(DoctorOptions),
     Providers(JsonOutput),
     Config {
@@ -39,11 +43,13 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct OptionalId {
+    #[arg(value_parser = parse_target_id)]
     id: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct IdAndJson {
+    #[arg(value_parser = parse_target_id)]
     id: Option<String>,
     #[arg(long)]
     json: bool,
@@ -57,6 +63,7 @@ struct JsonOutput {
 
 #[derive(Debug, Args)]
 struct SnapshotOptions {
+    #[arg(value_parser = parse_target_id)]
     id: Option<String>,
     #[arg(long)]
     redacted: bool,
@@ -64,6 +71,7 @@ struct SnapshotOptions {
 
 #[derive(Debug, Args)]
 struct LogOptions {
+    #[arg(value_parser = parse_target_id)]
     id: Option<String>,
     #[arg(long)]
     follow: bool,
@@ -71,9 +79,20 @@ struct LogOptions {
 
 #[derive(Debug, Args)]
 struct StopOptions {
+    #[arg(value_parser = parse_target_id)]
     id: Option<String>,
     #[arg(long, conflicts_with = "id")]
     all: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct TargetOptions {
+    #[arg(value_parser = parse_target_id)]
+    id: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -99,6 +118,14 @@ enum DaemonCommand {
 }
 
 const SCHEMA_VERSION: &str = "1.0";
+
+fn parse_target_id(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("target ID must not be empty".into())
+    } else {
+        Ok(value.to_owned())
+    }
+}
 
 pub struct CliFailure {
     error: WatchmeError,
@@ -150,21 +177,27 @@ pub fn run() -> Result<(), CliFailure> {
     let cli = Cli::parse();
     match cli.command {
         None => register_current_context().map_err(Into::into),
-        Some(Command::Status(options)) => admin(Request::Status, options.json),
+        Some(Command::Status(options)) => admin(Request::Status { id: options.id }, options.json),
         Some(Command::List(options)) => admin(Request::List, options.json),
+        Some(Command::Stop(options)) if options.id.is_none() && !options.all => Err(CliFailure {
+            error: WatchmeError::Configuration("stop requires a watcher ID or --all".into()),
+            json: options.json,
+        }),
         Some(Command::Stop(options)) => admin(
             Request::Stop {
                 id: options.id,
                 all: options.all,
             },
-            false,
+            options.json,
         ),
+        Some(Command::Pause(options)) => admin(Request::Pause { id: options.id }, options.json),
+        Some(Command::Resume(options)) => admin(Request::Resume { id: options.id }, options.json),
         Some(Command::Daemon {
             command: DaemonCommand::Run,
         }) => run_daemon(),
         Some(Command::Daemon {
             command: DaemonCommand::Status,
-        }) => admin(Request::Status, false),
+        }) => admin(Request::Status { id: None }, false),
         Some(Command::Daemon {
             command: DaemonCommand::Stop,
         }) => admin(Request::Shutdown, false),
@@ -242,14 +275,28 @@ fn render_response(response: Response, json: bool) -> Result<(), CliFailure> {
         return Ok(());
     }
     match response {
-        Response::Status { running, watchers } => println!(
-            "daemon: {}\nwatchers: {watchers}",
-            if running { "running" } else { "stopped" }
-        ),
+        Response::Status { running, watchers } => {
+            println!(
+                "daemon: {}\nwatchers: {}",
+                if running { "running" } else { "stopped" },
+                watchers.len()
+            );
+            for watcher in watchers {
+                println!(
+                    "{}\t{}",
+                    watcher.watcher_id,
+                    lifecycle_name(&watcher.lifecycle)
+                );
+            }
+        }
         Response::Watchers { watchers } if watchers.is_empty() => println!("no watchers"),
         Response::Watchers { watchers } => {
             for watcher in watchers {
-                println!("{}\t{:?}", watcher.watcher_id, watcher.lifecycle);
+                println!(
+                    "{}\t{}",
+                    watcher.watcher_id,
+                    lifecycle_name(&watcher.lifecycle)
+                );
             }
         }
         Response::Registered {
@@ -260,6 +307,11 @@ fn render_response(response: Response, json: bool) -> Result<(), CliFailure> {
             if existing { "existing" } else { "registered" }
         ),
         Response::Stopped => println!("stopped"),
+        Response::Updated { watcher } => println!(
+            "{}\t{}",
+            watcher.watcher_id,
+            lifecycle_name(&watcher.lifecycle)
+        ),
         Response::Error { code, message } => {
             return Err(CliFailure {
                 error: WatchmeError::RetryableIntegration(format!("{code}: {message}")),
@@ -270,13 +322,30 @@ fn render_response(response: Response, json: bool) -> Result<(), CliFailure> {
     Ok(())
 }
 
-fn register_current_context() -> Result<(), WatchmeError> {
-    register_with_detector(&ProductionContextDetector)
+fn lifecycle_name(lifecycle: &watchme::model::WatcherLifecycle) -> &'static str {
+    use watchme::model::WatcherLifecycle;
+    match lifecycle {
+        WatcherLifecycle::Registered => "registered",
+        WatcherLifecycle::Observing => "observing",
+        WatcherLifecycle::Paused => "paused",
+        WatcherLifecycle::Recovering { .. } => "recovering",
+        WatcherLifecycle::Waiting { .. } => "waiting",
+        WatcherLifecycle::HumanRequired { .. } => "human_required",
+        WatcherLifecycle::TargetTerminated => "target_terminated",
+        WatcherLifecycle::Stopped { .. } => "stopped",
+    }
 }
 
-fn register_with_detector(detector: &impl RegistrationContextDetector) -> Result<(), WatchmeError> {
+fn register_current_context() -> Result<(), WatchmeError> {
+    register_with_detector(&ProductionContextDetector, &IpcRegistrationClient)
+}
+
+fn register_with_detector(
+    detector: &impl RegistrationContextDetector,
+    client: &impl RegistrationClient,
+) -> Result<(), WatchmeError> {
     match detector.detect() {
-        Some(context) => attempt_registration(context),
+        Some(registration) => client.register(registration),
         None => Err(WatchmeError::UnsupportedContext(
             "invoke WatchMe normally as !watchme from a supported coding-agent session; run `watchme doctor` for diagnostics"
                 .to_owned(),
@@ -284,26 +353,70 @@ fn register_with_detector(detector: &impl RegistrationContextDetector) -> Result
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct AgentContext;
-
 trait RegistrationContextDetector {
-    fn detect(&self) -> Option<AgentContext>;
+    fn detect(&self) -> Option<ResolvedRegistration>;
+}
+
+trait RegistrationClient {
+    fn register(&self, registration: ResolvedRegistration) -> Result<(), WatchmeError>;
 }
 
 struct ProductionContextDetector;
 
 impl RegistrationContextDetector for ProductionContextDetector {
-    fn detect(&self) -> Option<AgentContext> {
+    fn detect(&self) -> Option<ResolvedRegistration> {
         // Process ancestry verification is introduced in the discovery milestone.
         None
     }
 }
 
-fn attempt_registration(_context: AgentContext) -> Result<(), WatchmeError> {
-    Err(WatchmeError::CapabilityUnavailable(
-        "registration is not implemented yet".to_owned(),
-    ))
+struct IpcRegistrationClient;
+
+impl RegistrationClient for IpcRegistrationClient {
+    fn register(&self, registration: ResolvedRegistration) -> Result<(), WatchmeError> {
+        let paths = runtime_paths().map_err(|failure| failure.error)?;
+        let request = Request::Register {
+            watcher: Box::new(registration.watcher),
+        };
+        match request_daemon(&paths, &request) {
+            Ok(response) => render_response(response, false).map_err(|failure| failure.error),
+            Err(_) => {
+                let executable = std::env::current_exe()
+                    .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()))?;
+                ProcessCommand::new(executable)
+                    .args(["daemon", "run"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()))?;
+                for _ in 0..50 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    if let Ok(response) = request_daemon(&paths, &request) {
+                        return render_response(response, false).map_err(|failure| failure.error);
+                    }
+                }
+                Err(WatchmeError::RetryableIntegration(
+                    "daemon did not become ready".into(),
+                ))
+            }
+        }
+    }
+}
+
+fn request_daemon(paths: &WatchmePaths, request: &Request) -> std::io::Result<Response> {
+    let socket = paths.runtime_dir().join("daemon.sock");
+    local_runtime()
+        .map_err(|failure| std::io::Error::other(failure.error))?
+        .block_on(async {
+            let mut stream = tokio::net::UnixStream::connect(socket).await?;
+            write_request(&mut stream, request, Duration::from_secs(2))
+                .await
+                .map_err(std::io::Error::other)?;
+            read_response(&mut stream, Duration::from_secs(2))
+                .await
+                .map_err(std::io::Error::other)
+        })
 }
 
 fn unavailable(command: Command) -> CliFailure {
@@ -328,21 +441,32 @@ mod tests {
     struct FixedContextDetector;
 
     impl RegistrationContextDetector for FixedContextDetector {
-        fn detect(&self) -> Option<AgentContext> {
-            Some(AgentContext)
+        fn detect(&self) -> Option<ResolvedRegistration> {
+            Some(ResolvedRegistration {
+                watcher: watchme::model::WatcherState::new(
+                    "watcher-1".into(),
+                    watchme::model::TargetIdentity::process(watchme::model::ProcessIdentity::new(
+                        1, 2,
+                    )),
+                    watchme::model::WatcherLifecycle::Registered,
+                    0,
+                    1,
+                ),
+            })
+        }
+    }
+
+    struct FixedRegistrationClient;
+    impl RegistrationClient for FixedRegistrationClient {
+        fn register(&self, registration: ResolvedRegistration) -> Result<(), WatchmeError> {
+            assert_eq!(registration.watcher.watcher_id, "watcher-1");
+            Ok(())
         }
     }
 
     #[test]
     fn detected_context_reaches_registration_attempt_boundary() {
-        let error = register_with_detector(&FixedContextDetector)
-            .expect_err("registration is not implemented in this milestone");
-
-        assert!(matches!(error, WatchmeError::CapabilityUnavailable(_)));
-        assert_eq!(
-            error.to_string(),
-            "capability unavailable: registration is not implemented yet"
-        );
+        register_with_detector(&FixedContextDetector, &FixedRegistrationClient).unwrap();
     }
 
     #[test]
