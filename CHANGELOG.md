@@ -1,3 +1,9 @@
+## 0.1.13 — 2026-07-12
+
+### Fixed
+
+- Expect physicalized Herdr socket paths in contract tests on macOS.
+
 ## 0.1.12 — 2026-07-12
 
 ### Fixed

@@ -162,6 +162,10 @@ fn inherited_context_metadata_reads_and_auxiliary_contract_are_schema_faithful()
     });
     let herdr = Herdr::new(context(socket.clone()), Duration::from_millis(300)).unwrap();
     let identity = herdr.current_target().unwrap();
+    let physical_socket = std::fs::canonicalize(&socket)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(
         (
             identity.server.as_str(),
@@ -169,7 +173,7 @@ fn inherited_context_metadata_reads_and_auxiliary_contract_are_schema_faithful()
             identity.window_id.as_str(),
             identity.pane_id.as_str()
         ),
-        (socket.as_str(), "ws-1", "tab-2", "pane-3")
+        (physical_socket.as_str(), "ws-1", "tab-2", "pane-3")
     );
     assert_eq!(identity.server_instance, "server-a");
     let info = herdr.pane_info(&identity).unwrap();
