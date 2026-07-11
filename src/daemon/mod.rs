@@ -509,7 +509,18 @@ pub async fn run_with_components(
     let mut connection_tasks = tokio::task::JoinSet::new();
     let mut scheduler_task = tokio::spawn(runner.run());
     let lifecycle_task = tokio::spawn(run_lifecycle_monitor(registry.clone(), scheduler.clone()));
-    let observation_task = tokio::spawn(run_observation_monitor(registry.clone(), observer));
+    let action_store =
+        crate::recovery::action_store::JsonActionStore::load(paths.state_file("actions.json")?)
+            .map_err(io::Error::other)?;
+    let recovery_engine = std::sync::Arc::new(crate::recovery::engine::RecoveryEngine::new(
+        action_store,
+        crate::recovery::engine::NoRecipes,
+    ));
+    let observation_task = tokio::spawn(run_observation_monitor_with_recovery(
+        registry.clone(),
+        observer,
+        recovery_engine,
+    ));
     let timeout = Duration::from_secs(2);
     let result = loop {
         let accepted = tokio::select! {
@@ -586,11 +597,48 @@ pub async fn run_observation_monitor(
     )
     .await
 }
+
+async fn run_observation_monitor_with_recovery(
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+    observer: std::sync::Arc<dyn Observer>,
+    recovery: std::sync::Arc<
+        crate::recovery::engine::RecoveryEngine<
+            crate::recovery::action_store::JsonActionStore,
+            crate::recovery::engine::NoRecipes,
+        >,
+    >,
+) {
+    run_observation_loop(
+        registry,
+        observer,
+        std::sync::Arc::new(SystemObservationClock::new()),
+        0,
+        Some(recovery),
+    )
+    .await
+}
 pub async fn run_observation_monitor_with_clock(
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
     observer: std::sync::Arc<dyn Observer>,
     clock: std::sync::Arc<dyn ObservationClock>,
     max_iterations: usize,
+) {
+    run_observation_loop(registry, observer, clock, max_iterations, None).await
+}
+
+async fn run_observation_loop(
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+    observer: std::sync::Arc<dyn Observer>,
+    clock: std::sync::Arc<dyn ObservationClock>,
+    max_iterations: usize,
+    recovery: Option<
+        std::sync::Arc<
+            crate::recovery::engine::RecoveryEngine<
+                crate::recovery::action_store::JsonActionStore,
+                crate::recovery::engine::NoRecipes,
+            >,
+        >,
+    >,
 ) {
     let mut iterations = 0;
     let mut runtime_due = std::collections::BTreeMap::<String, u64>::new();
@@ -675,6 +723,13 @@ pub async fn run_observation_monitor_with_clock(
                     event,
                     clock.wall_now_ms(),
                 );
+                if let Some(engine) = recovery.as_ref()
+                    && let Some(current) = guard.get(&watcher.watcher_id)
+                {
+                    // Recipes are deliberately empty in Task 8. Later provider
+                    // adapters enter the already-wired durable engine here.
+                    let _ = engine.proposed_action(current);
+                }
             }
         }
         iterations += 1;

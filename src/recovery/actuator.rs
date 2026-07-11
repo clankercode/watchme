@@ -24,10 +24,82 @@ pub enum ExecutionError {
     Unsafe(&'static str),
     #[error("multiplexer operation failed: {0}")]
     Integration(String),
+    #[error("operation may have committed a side effect: {0}")]
+    PossibleSideEffect(String),
 }
 
 pub trait ActionExecutor {
     fn execute(&self, action: &Action) -> Result<ExecutionOutput, ExecutionError>;
+}
+
+/// Narrow daemon services used by non-input actions. Implementations persist
+/// scheduling and state transitions before returning success.
+pub trait RuntimeServices: Send + Sync {
+    fn schedule(&self, deadline: &str) -> Result<(), String>;
+    fn capture(&self, source: &str, lines: u16) -> Result<String, String>;
+    fn check(&self, kind: &str, value: Option<&str>) -> Result<bool, String>;
+    fn notify(&self, severity: &str, message: &str) -> Result<(), String>;
+    fn escalate(&self, level: &str) -> Result<(), String>;
+    fn stop_watching(&self) -> Result<(), String>;
+}
+
+pub struct RuntimeActuator<'a> {
+    services: &'a dyn RuntimeServices,
+}
+impl<'a> RuntimeActuator<'a> {
+    pub const fn new(services: &'a dyn RuntimeServices) -> Self {
+        Self { services }
+    }
+}
+impl ActionExecutor for RuntimeActuator<'_> {
+    fn execute(&self, action: &Action) -> Result<ExecutionOutput, ExecutionError> {
+        validate_action(action)?;
+        match &action.kind {
+            ActionKind::WaitUntil { at } => {
+                runtime(self.services.schedule(at))?;
+                Ok(ExecutionOutput::Scheduled(Duration::ZERO))
+            }
+            ActionKind::WaitDuration { duration_seconds } => {
+                runtime(
+                    self.services
+                        .schedule(&format!("monotonic+{duration_seconds}s")),
+                )?;
+                Ok(ExecutionOutput::Scheduled(Duration::from_secs(
+                    *duration_seconds,
+                )))
+            }
+            ActionKind::Capture { source, max_lines } => {
+                runtime(self.services.capture(source, *max_lines)).map(ExecutionOutput::Captured)
+            }
+            ActionKind::CheckStatus { check } => {
+                runtime(self.services.check(&check.kind, check.value.as_deref())).map(|matches| {
+                    ExecutionOutput::Status(
+                        serde_json::json!({"matches":matches,"kind":check.kind}),
+                    )
+                })
+            }
+            ActionKind::Notify { severity, message } => {
+                runtime(self.services.notify(severity, message))?;
+                Ok(ExecutionOutput::Notified)
+            }
+            ActionKind::Escalate { level } => {
+                runtime(self.services.escalate(level))?;
+                Ok(ExecutionOutput::Escalated)
+            }
+            ActionKind::StopWatching => {
+                runtime(self.services.stop_watching())?;
+                Ok(ExecutionOutput::Committed)
+            }
+            ActionKind::Noop => Ok(ExecutionOutput::Committed),
+            ActionKind::SendText { .. } | ActionKind::SendKeys { .. } => Err(
+                ExecutionError::Unsafe("input action requires multiplexer actuator"),
+            ),
+        }
+    }
+}
+
+fn runtime<T>(result: Result<T, String>) -> Result<T, ExecutionError> {
+    result.map_err(ExecutionError::Integration)
 }
 
 pub fn validate_action(action: &Action) -> Result<(), ExecutionError> {
@@ -42,9 +114,7 @@ pub fn validate_action(action: &Action) -> Result<(), ExecutionError> {
         ActionKind::Capture { max_lines, .. } if *max_lines > MAX_CAPTURE_LINES => {
             Err(ExecutionError::Unsafe("capture exceeds bound"))
         }
-        ActionKind::StopWatching | ActionKind::Noop => Err(ExecutionError::Unsafe(
-            "action is not executable by actuator",
-        )),
+        ActionKind::StopWatching | ActionKind::Noop => Ok(()),
         _ => Ok(()),
     }
 }
@@ -97,7 +167,7 @@ impl<M: Multiplexer> ActionExecutor for MuxActuator<'_, M> {
             ActionKind::SendText { text } => {
                 self.mux
                     .send_literal(self.identity, text, self.composer)
-                    .map_err(integration)?;
+                    .map_err(possible_side_effect)?;
                 Ok(ExecutionOutput::Committed)
             }
             ActionKind::SendKeys { keys } => {
@@ -108,7 +178,7 @@ impl<M: Multiplexer> ActionExecutor for MuxActuator<'_, M> {
                             symbolic_key(key).expect("validated"),
                             self.composer,
                         )
-                        .map_err(integration)?;
+                        .map_err(possible_side_effect)?;
                 }
                 Ok(ExecutionOutput::Committed)
             }
@@ -126,11 +196,15 @@ impl<M: Multiplexer> ActionExecutor for MuxActuator<'_, M> {
             )),
             ActionKind::Notify { .. } => Ok(ExecutionOutput::Notified),
             ActionKind::Escalate { .. } => Ok(ExecutionOutput::Escalated),
-            ActionKind::StopWatching | ActionKind::Noop => unreachable!("validated"),
+            ActionKind::StopWatching | ActionKind::Noop => Ok(ExecutionOutput::Committed),
         }
     }
 }
 
 fn integration(error: crate::mux::MuxError) -> ExecutionError {
     ExecutionError::Integration(error.to_string())
+}
+
+fn possible_side_effect(error: crate::mux::MuxError) -> ExecutionError {
+    ExecutionError::PossibleSideEffect(error.to_string())
 }

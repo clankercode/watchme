@@ -113,6 +113,21 @@ impl RecoveryMachine {
     pub const fn state(&self) -> RecoveryState {
         self.state
     }
+    pub const fn budget(&self) -> Budget {
+        self.budget
+    }
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+    pub const fn cumulative_wait(&self) -> Duration {
+        self.cumulative_wait
+    }
+    pub const fn planner_calls(&self) -> u32 {
+        self.planner_calls
+    }
+    pub const fn last_attempt_monotonic_seconds(&self) -> Option<u64> {
+        self.last_attempt_mono
+    }
     pub fn restore_for_restart(mut self) -> Result<Self, &'static str> {
         if self.schema_version != 1 {
             return Err("unsupported recovery schema");
