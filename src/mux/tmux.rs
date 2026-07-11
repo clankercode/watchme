@@ -564,7 +564,7 @@ mod tests {
             assert!(parse_metadata(&malformed).is_err());
         }
         let extra_delimiter =
-            metadata("0", "", "", "").replace("sλ", &format!("s{}λ", FIELD_SEPARATOR));
+            metadata("0", "", "", "").replace("sλ", &format!("s{FIELD_SEPARATOR}λ"));
         assert!(parse_metadata(&extra_delimiter).is_err());
     }
 

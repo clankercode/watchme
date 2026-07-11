@@ -562,8 +562,7 @@ impl Multiplexer for Herdr {
             Ok(())
         } else {
             Err(MuxError::IdentityChanged(format!(
-                "expected {:?}, found {:?}",
-                expected, actual
+                "expected {expected:?}, found {actual:?}"
             )))
         }
     }
