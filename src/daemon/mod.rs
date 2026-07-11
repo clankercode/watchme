@@ -294,7 +294,7 @@ async fn run_lifecycle_monitor(
     #[cfg(target_os = "linux")]
     let inspector = crate::process::linux::LinuxProcessInspector::default();
     #[cfg(target_os = "macos")]
-    let inspector = crate::process::macos::MacOsProcessInspector;
+    let inspector = crate::process::macos::MacOsProcessInspector::default();
     let mut monitors = std::collections::BTreeMap::new();
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use watchme::process::linux::{
     LinuxProcessInspector, canonical_tty_path, parse_proc_stat, parse_status_uid,
 };
-use watchme::process::macos::parse_ps_record;
+use watchme::process::macos::{MacProcessSource, VerifiedMacInspector, parse_ps_record};
 use watchme::process::{
     AgentKind, CandidateHints, LifecycleDecision, LifecycleMonitor, ProcessError, ProcessInspector,
     ProcessRecord, ProcessResolver,
@@ -271,6 +271,60 @@ fn macos_parser_uses_tty_name_and_is_runnable_cross_platform() {
     assert_eq!(parsed.tty.as_deref(), Some("/dev/ttys004"));
     assert_eq!(parsed.start_time, 123);
     assert!(parse_ps_record(b"42 malformed", 123).is_err());
+}
+
+#[derive(Default)]
+struct FakeMacSource {
+    calls: std::cell::RefCell<Vec<String>>,
+    starts: std::cell::RefCell<Vec<u64>>,
+}
+
+impl MacProcessSource for FakeMacSource {
+    fn start_time(&self, pid: u32) -> Result<u64, ProcessError> {
+        self.calls.borrow_mut().push(format!("start:{pid}"));
+        Ok(self.starts.borrow_mut().remove(0))
+    }
+    fn ps_record(&self, pid: u32) -> Result<Vec<u8>, ProcessError> {
+        self.calls.borrow_mut().push(format!("ps:{pid}"));
+        Ok(format!("{pid} 7 40 30 1000 ttys004 /opt/claude").into_bytes())
+    }
+    fn list_pids(&self) -> Result<Vec<u32>, ProcessError> {
+        self.calls.borrow_mut().push("list".into());
+        Ok(vec![42])
+    }
+}
+
+#[test]
+fn macos_inspection_rejects_recycle_with_before_ps_after_order() {
+    let source = FakeMacSource {
+        starts: std::cell::RefCell::new(vec![100, 101]),
+        ..FakeMacSource::default()
+    };
+    let inspector = VerifiedMacInspector::new(source);
+    assert_eq!(inspector.inspect(42), Err(ProcessError::Disappeared(42)));
+    assert_eq!(
+        inspector.source().calls.borrow().as_slice(),
+        ["start:42", "ps:42", "start:42"]
+    );
+}
+
+#[test]
+fn macos_tty_enumeration_verifies_each_pid_before_reading_its_row() {
+    let source = FakeMacSource {
+        starts: std::cell::RefCell::new(vec![100, 101]),
+        ..FakeMacSource::default()
+    };
+    let inspector = VerifiedMacInspector::new(source);
+    assert!(
+        inspector
+            .processes_on_tty("/dev/ttys004")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        inspector.source().calls.borrow().as_slice(),
+        ["list", "start:42", "ps:42", "start:42"]
+    );
 }
 
 #[test]

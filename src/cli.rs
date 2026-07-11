@@ -394,7 +394,7 @@ impl RegistrationContextDetector for ProductionContextDetector {
         #[cfg(target_os = "linux")]
         let inspector = watchme::process::linux::LinuxProcessInspector::default();
         #[cfg(target_os = "macos")]
-        let inspector = watchme::process::macos::MacOsProcessInspector;
+        let inspector = watchme::process::macos::MacOsProcessInspector::default();
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return Err(unsupported_registration_context());
 
