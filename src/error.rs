@@ -1,7 +1,4 @@
-use serde::Serialize;
 use thiserror::Error;
-
-pub const SCHEMA_VERSION: &str = "1.0";
 
 #[derive(Debug, Error)]
 #[allow(
@@ -21,44 +18,67 @@ pub enum WatchmeError {
     PolicyDenied(String),
     #[error("human action required: {0}")]
     HumanRequired(String),
-    #[error("capability unavailable: {message}")]
-    CapabilityUnavailable { message: String, json: bool },
-}
-
-#[derive(Serialize)]
-struct ErrorEnvelope<'a> {
-    schema_version: &'static str,
-    ok: bool,
-    error: ErrorBody<'a>,
-}
-
-#[derive(Serialize)]
-struct ErrorBody<'a> {
-    code: &'static str,
-    message: &'a str,
+    #[error("capability unavailable: {0}")]
+    CapabilityUnavailable(String),
 }
 
 impl WatchmeError {
-    pub fn render(&self) {
-        if let Self::CapabilityUnavailable {
-            message,
-            json: true,
-        } = self
-        {
-            let envelope = ErrorEnvelope {
-                schema_version: SCHEMA_VERSION,
-                ok: false,
-                error: ErrorBody {
-                    code: "capability_unavailable",
-                    message,
-                },
-            };
-            println!(
-                "{}",
-                serde_json::to_string(&envelope).expect("error envelope is serializable")
-            );
-        } else {
-            eprintln!("watchme: {self}");
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedContext(_) => "unsupported_context",
+            Self::Configuration(_) => "configuration",
+            Self::TargetTerminated(_) => "target_terminated",
+            Self::RetryableIntegration(_) => "retryable_integration",
+            Self::PolicyDenied(_) => "policy_denied",
+            Self::HumanRequired(_) => "human_required",
+            Self::CapabilityUnavailable(_) => "capability_unavailable",
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::UnsupportedContext(message)
+            | Self::Configuration(message)
+            | Self::TargetTerminated(message)
+            | Self::RetryableIntegration(message)
+            | Self::PolicyDenied(message)
+            | Self::HumanRequired(message)
+            | Self::CapabilityUnavailable(message) => message,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_errors_have_stable_codes() {
+        let cases = [
+            (
+                WatchmeError::UnsupportedContext("x".into()),
+                "unsupported_context",
+            ),
+            (WatchmeError::Configuration("x".into()), "configuration"),
+            (
+                WatchmeError::TargetTerminated("x".into()),
+                "target_terminated",
+            ),
+            (
+                WatchmeError::RetryableIntegration("x".into()),
+                "retryable_integration",
+            ),
+            (WatchmeError::PolicyDenied("x".into()), "policy_denied"),
+            (WatchmeError::HumanRequired("x".into()), "human_required"),
+            (
+                WatchmeError::CapabilityUnavailable("x".into()),
+                "capability_unavailable",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            assert_eq!(error.code(), expected_code);
+            assert_eq!(error.message(), "x");
         }
     }
 }

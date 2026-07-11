@@ -15,16 +15,14 @@ fn bare_watchme_outside_agent_explains_shell_escape_and_doctor() {
 }
 
 #[test]
-fn bare_watchme_in_supported_context_reaches_registration_boundary() {
+fn test_context_environment_variable_cannot_bypass_detection() {
     Command::cargo_bin("watchme")
         .expect("binary exists")
         .env("WATCHME_TEST_AGENT_CONTEXT", "claude")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "capability unavailable: registration is not implemented yet",
-        ))
-        .stderr(predicate::str::contains("!watchme").not());
+        .stderr(predicate::str::contains("unsupported context"))
+        .stderr(predicate::str::contains("!watchme"));
 }
 
 #[test]
@@ -40,22 +38,26 @@ fn start_is_not_a_command() {
 #[test]
 fn administrative_commands_parse() {
     for arguments in [
-        &["status", "--help"][..],
-        &["list", "--help"],
-        &["explain", "--help"],
-        &["snapshot", "--help"],
-        &["logs", "--help"],
-        &["stop", "--help"],
-        &["doctor", "--help"],
-        &["providers", "--help"],
-        &["config", "--help"],
-        &["daemon", "--help"],
+        &["status", "watcher-1"][..],
+        &["list"],
+        &["explain", "watcher-1"],
+        &["snapshot", "watcher-1", "--redacted"],
+        &["logs", "watcher-1", "--follow"],
+        &["stop", "--all"],
+        &["doctor", "--strict"],
+        &["providers"],
+        &["config", "check"],
+        &["daemon", "status"],
     ] {
         Command::cargo_bin("watchme")
             .expect("binary exists")
             .args(arguments)
             .assert()
-            .success();
+            .failure()
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::eq(
+                "watchme: capability unavailable: this administrative capability is not implemented yet\n",
+            ));
     }
 }
 
@@ -69,6 +71,16 @@ fn json_errors_are_versioned_envelopes() {
 
     assert!(!output.status.success());
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("valid JSON response");
-    assert_eq!(envelope["schema_version"], "1.0");
-    assert_eq!(envelope["ok"], false);
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "schema_version": "1.0",
+            "ok": false,
+            "error": {
+                "code": "capability_unavailable",
+                "message": "this administrative capability is not implemented yet"
+            }
+        })
+    );
+    assert!(output.stderr.is_empty());
 }
