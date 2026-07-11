@@ -44,6 +44,20 @@ impl JsonActionStore {
         };
         Ok(Self(Mutex::new(DurableLedger { store, state })))
     }
+
+    /// Snapshot active work for restart and lease recovery. The returned
+    /// records are durable claims, not in-memory work queues.
+    pub fn active_records(&self) -> Result<Vec<ActionRecord>, String> {
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| "action ledger lock poisoned")?
+            .state
+            .active
+            .values()
+            .cloned()
+            .collect())
+    }
 }
 
 impl ActionStore for JsonActionStore {

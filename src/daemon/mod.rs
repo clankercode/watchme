@@ -514,7 +514,7 @@ pub async fn run_with_components(
             .map_err(io::Error::other)?;
     let recovery_engine = std::sync::Arc::new(crate::recovery::engine::RecoveryEngine::new(
         action_store,
-        crate::recovery::engine::NoRecipes,
+        crate::recovery::engine::BuiltinRecipes,
     ));
     let observation_task = tokio::spawn(run_observation_monitor_with_recovery(
         registry.clone(),
@@ -604,7 +604,7 @@ async fn run_observation_monitor_with_recovery(
     recovery: std::sync::Arc<
         crate::recovery::engine::RecoveryEngine<
             crate::recovery::action_store::JsonActionStore,
-            crate::recovery::engine::NoRecipes,
+            crate::recovery::engine::BuiltinRecipes,
         >,
     >,
 ) {
@@ -635,7 +635,7 @@ async fn run_observation_loop(
         std::sync::Arc<
             crate::recovery::engine::RecoveryEngine<
                 crate::recovery::action_store::JsonActionStore,
-                crate::recovery::engine::NoRecipes,
+                crate::recovery::engine::BuiltinRecipes,
             >,
         >,
     >,
@@ -726,8 +726,9 @@ async fn run_observation_loop(
                 if let Some(engine) = recovery.as_ref()
                     && let Some(current) = guard.get(&watcher.watcher_id)
                 {
-                    // Recipes are deliberately empty in Task 8. Later provider
-                    // adapters enter the already-wired durable engine here.
+                    // Provider-independent recipes can only schedule an
+                    // explicitly wait-allowed observation. Provider input
+                    // recipes are added with their respective adapters.
                     let _ = engine.proposed_action(current);
                 }
             }

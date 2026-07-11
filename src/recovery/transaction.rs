@@ -92,6 +92,12 @@ pub trait ActionStore: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct LiveEvidence {
     pub identity: String,
+    /// These facts are derived by the live target reader immediately before an
+    /// action. They deliberately have no permissive default.
+    pub target_revalidated: bool,
+    pub process_alive: bool,
+    pub pane_matches: bool,
+    pub evidence_current: bool,
     pub composer_safe: bool,
     pub human_intervened: bool,
     pub event: Event,
@@ -342,7 +348,14 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
             Ok(record) => record,
             Err(error) => return Err(TransactionError::Uncertain(error.to_string())),
         };
-        if !needs_progress_verification(&action.kind) {
+        if !receipt_outcomes_hold(&output, &action.expected_outcomes) {
+            return self.uncertain(
+                target,
+                record,
+                "executor did not return the canonical outcome receipt".into(),
+            );
+        }
+        if !needs_progress_verification(&action.kind, &action.expected_outcomes) {
             return self.persist(
                 target,
                 record,
@@ -364,10 +377,16 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
             .monotonic_ms()
             .saturating_add(action.timeout_seconds.saturating_mul(1000));
         loop {
-            let after = self
-                .evidence
-                .read()
-                .map_err(|e| TransactionError::Uncertain(e.to_string()))?;
+            let after = match self.evidence.read() {
+                Ok(after) => after,
+                Err(error) => {
+                    return self.uncertain(
+                        target,
+                        record,
+                        format!("verification evidence unavailable: {error}"),
+                    );
+                }
+            };
             if after.human_intervened || after.identity != baseline.identity {
                 return self.uncertain(
                     target,
@@ -442,6 +461,15 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
         baseline: Option<&LiveEvidence>,
     ) -> Result<LiveEvidence, TransactionError> {
         let live = self.evidence.read().map_err(TransactionError::Store)?;
+        if !live.target_revalidated
+            || !live.process_alive
+            || !live.pane_matches
+            || !live.evidence_current
+        {
+            return Err(TransactionError::Revalidation(
+                "live target evidence incomplete",
+            ));
+        }
         if live.human_intervened {
             return Err(TransactionError::Revalidation("human intervention"));
         }
@@ -472,8 +500,19 @@ fn requires_composer(kind: &ActionKind) -> bool {
         ActionKind::SendText { .. } | ActionKind::SendKeys { .. }
     )
 }
-fn needs_progress_verification(kind: &ActionKind) -> bool {
+fn needs_progress_verification(kind: &ActionKind, outcomes: &[Condition]) -> bool {
     requires_composer(kind)
+        || outcomes.iter().any(|outcome| {
+            matches!(
+                outcome.kind.as_str(),
+                "AGENT_WORKING"
+                    | "AGENT_IDLE"
+                    | "BLOCK_CLEARED"
+                    | "GOAL_ACTIVE_OR_PURSUING"
+                    | "MENU_DISMISSED"
+                    | "PROCESS_TERMINATED"
+            )
+        })
 }
 fn action_fingerprint(action: &Action) -> &str {
     action
@@ -486,6 +525,10 @@ fn action_fingerprint(action: &Action) -> &str {
 }
 fn policy_context(live: &LiveEvidence, recovery: &RecoveryContext, wall: String) -> PolicyContext {
     let mut context = PolicyContext::safe();
+    context.target_revalidated = live.target_revalidated;
+    context.process_alive = live.process_alive;
+    context.pane_matches = live.pane_matches;
+    context.evidence_current = live.evidence_current;
     context.composer_empty = live.composer_safe;
     context.human_intervened = live.human_intervened;
     context.source_rank = live.event.source.kind.rank();
@@ -507,6 +550,22 @@ fn output_summary(output: &ExecutionOutput) -> String {
         ExecutionOutput::Captured(text) => format!("captured {} bytes", text.len()),
         other => format!("{other:?}"),
     }
+}
+fn receipt_outcomes_hold(output: &ExecutionOutput, outcomes: &[Condition]) -> bool {
+    outcomes.iter().all(|outcome| match outcome.kind.as_str() {
+        "WAIT_STATE_RECORDED" => matches!(output, ExecutionOutput::Scheduled(_)),
+        "HUMAN_NOTIFIED" => matches!(output, ExecutionOutput::Notified),
+        "NO_STATE_CHANGE_EXPECTED" => matches!(
+            output,
+            ExecutionOutput::Committed
+                | ExecutionOutput::Scheduled(_)
+                | ExecutionOutput::Captured(_)
+                | ExecutionOutput::Status(_)
+                | ExecutionOutput::Notified
+                | ExecutionOutput::Escalated
+        ),
+        _ => true,
+    })
 }
 fn verified(before: &LiveEvidence, after: &LiveEvidence, outcomes: &[Condition]) -> bool {
     if after.event.source.kind.rank() < before.event.source.kind.rank()

@@ -9,10 +9,87 @@ use watchme::recovery::action_store::JsonActionStore;
 use watchme::recovery::actuator::{
     ActionExecutor, ExecutionError, ExecutionOutput, RuntimeActuator, RuntimeServices,
 };
+use watchme::recovery::engine::{BuiltinRecipes, RecipeProvider};
 use watchme::recovery::transaction::{
     ActionPhase, ActionRecord, ActionStore, Clock, EvidenceReader, LiveEvidence, OwnerIdentity,
     PersistedEvidenceReader, ProcessProbe, RecoveryContext, Transaction, TransactionError,
 };
+
+#[test]
+fn builtin_recipes_refuse_generic_unknown_and_only_schedule_explicit_waits() {
+    let mut watcher = watchme::model::WatcherState::new(
+        "watcher".into(),
+        watchme::model::TargetIdentity::process(watchme::model::ProcessIdentity::new(7, 9)),
+        watchme::model::WatcherLifecycle::Observing,
+        1,
+        0,
+    );
+    let mut unknown = event(
+        EventCategory::UnknownBlocked,
+        &"a".repeat(64),
+        0.9,
+        SourceKind::StructuredLog,
+    );
+    unknown.policy_hint = PolicyHint::DeterministicActionAllowed;
+    watcher.last_observation = Some(unknown);
+    assert!(BuiltinRecipes.action_for(&watcher).is_none());
+
+    let mut wait = event(
+        EventCategory::WaitingForModel,
+        &"b".repeat(64),
+        0.9,
+        SourceKind::StructuredLog,
+    );
+    wait.policy_hint = PolicyHint::WaitAllowed;
+    watcher.last_observation = Some(wait);
+    assert!(matches!(
+        BuiltinRecipes
+            .action_for(&watcher)
+            .map(|action| action.kind),
+        Some(ActionKind::WaitDuration {
+            duration_seconds: 60
+        })
+    ));
+}
+
+#[test]
+fn wait_outcome_requires_a_durable_scheduler_receipt() {
+    let store = MemoryStore::default();
+    let reader = evidence(vec![
+        live(
+            EventCategory::WaitingForModel,
+            &"b".repeat(64),
+            0.8,
+        );
+        3
+    ]);
+    let mut action = Action::new(
+        "wait",
+        ActionKind::WaitDuration {
+            duration_seconds: 60,
+        },
+        "wait",
+        "b".repeat(64),
+        30,
+    );
+    action.expected_outcomes = vec![Condition {
+        kind: "WAIT_STATE_RECORDED".into(),
+        value: None,
+    }];
+    assert!(matches!(
+        Transaction::new(&store, &reader, &Executor::default(), &TestClock::default()).run(
+            "target",
+            owner(),
+            action,
+            context(),
+        ),
+        Err(TransactionError::Uncertain(_))
+    ));
+    assert_eq!(
+        store.audit("target").unwrap().last().unwrap().phase,
+        ActionPhase::HumanRequired
+    );
+}
 
 #[derive(Clone, Default)]
 struct MemoryStore(Arc<Mutex<Ledger>>);
@@ -132,9 +209,36 @@ fn event(category: EventCategory, fingerprint: &str, confidence: f64, source: So
 fn live(category: EventCategory, fingerprint: &str, confidence: f64) -> LiveEvidence {
     LiveEvidence {
         identity: target_identity(),
+        target_revalidated: true,
+        process_alive: true,
+        pane_matches: true,
+        evidence_current: true,
         composer_safe: true,
         human_intervened: false,
         event: event(category, fingerprint, confidence, SourceKind::StructuredLog),
+    }
+}
+
+#[test]
+fn derived_live_facts_fail_closed_before_a_side_effect() {
+    for invalid in ["target", "process", "pane", "evidence"] {
+        let mut current = live(EventCategory::BlockedGoal, &"b".repeat(64), 0.8);
+        match invalid {
+            "target" => current.target_revalidated = false,
+            "process" => current.process_alive = false,
+            "pane" => current.pane_matches = false,
+            _ => current.evidence_current = false,
+        }
+        let executor = Executor::default();
+        let result = Transaction::new(
+            &MemoryStore::default(),
+            &evidence(vec![current]),
+            &executor,
+            &TestClock::default(),
+        )
+        .run("target", owner(), send_action(), context());
+        assert!(result.is_err(), "{invalid}");
+        assert_eq!(*executor.calls.lock().unwrap(), 0, "{invalid}");
     }
 }
 fn target_identity() -> String {
@@ -464,6 +568,31 @@ fn json_action_store_survives_reload_with_append_only_audit() {
             )
             .unwrap()
     );
+}
+
+#[test]
+fn json_action_store_exposes_active_records_for_restart_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = JsonActionStore::load(temp.path().join("actions.json")).unwrap();
+    assert!(
+        store
+            .claim_prepared(
+                "watcher",
+                ActionRecord::prepared(
+                    "a",
+                    "key",
+                    "watcher",
+                    owner(),
+                    0,
+                    10,
+                    "identity",
+                    &"f".repeat(64),
+                    "snapshot",
+                ),
+            )
+            .unwrap()
+    );
+    assert_eq!(store.active_records().unwrap().len(), 1);
 }
 
 #[derive(Default)]
