@@ -601,6 +601,12 @@ fn policy_context(live: &LiveEvidence, recovery: &RecoveryContext, wall: String)
         .get("agent_state")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+    context.goal_state = live
+        .event
+        .metadata
+        .get("goal_state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     context.wall_time_rfc3339 = Some(wall);
     context.claude_resume_session = live
         .event
@@ -650,8 +656,19 @@ fn verified(before: &LiveEvidence, after: &LiveEvidence, outcomes: &[Condition])
         return false;
     }
     outcomes.iter().any(|outcome| match outcome.kind.as_str() {
-        "AGENT_WORKING" | "GOAL_ACTIVE_OR_PURSUING" => {
+        "AGENT_WORKING" => after.event.category == EventCategory::Working,
+        "GOAL_ACTIVE_OR_PURSUING" => {
             after.event.category == EventCategory::Working
+                || after
+                    .event
+                    .metadata
+                    .get("goal_state")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|state| {
+                        matches!(state.to_ascii_lowercase().as_str(), "active" | "pursuing")
+                    })
+                || after.event.metadata.get("codex_post_resume_progress")
+                    == Some(&serde_json::Value::Bool(true))
         }
         "AGENT_STATE_IS" => outcome
             .value

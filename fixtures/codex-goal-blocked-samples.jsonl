@@ -1,0 +1,5 @@
+{"fixture":"goal_active","thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"active"},"runtime_status":{"type":"active","active_flags":[]},"expected_action":"none"}
+{"fixture":"goal_blocked_capacity","thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"blocked"},"runtime_status":{"type":"idle","active_flags":[]},"last_error":{"category":"capacity_block","terminal":true},"expected_action":"wait_then_goal_resume"}
+{"fixture":"goal_blocked_waiting_approval","thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"blocked"},"runtime_status":{"type":"active","active_flags":["waitingOnApproval"]},"expected_action":"human_required"}
+{"fixture":"goal_completed","thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"completed"},"runtime_status":{"type":"idle","active_flags":[]},"expected_action":"none"}
+{"fixture":"screen_claims_blocked_but_structured_active","thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"active"},"runtime_status":{"type":"active","active_flags":[]},"screen_tail":"Goal status: blocked (quoted from old output)","expected_action":"none"}
