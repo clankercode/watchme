@@ -12,6 +12,10 @@ use crate::process::ProcessInspector;
 
 const FIELD_SEPARATOR: char = '\u{1f}';
 const OUTPUT_LIMIT: usize = 256 * 1024;
+/// Bytes needed after the requested boundary to complete any UTF-8 scalar.
+const UTF8_BOUNDARY_LOOKAHEAD: usize = 3;
+/// One extra byte records that the command produced more than its logical cap.
+const OUTPUT_OVERFLOW_SENTINEL: usize = 1;
 const METADATA_FORMAT: &str = "#{socket_path}\u{1f}#{session_id}\u{1f}#{session_name}\u{1f}#{window_id}\u{1f}#{window_name}\u{1f}#{window_index}\u{1f}#{pane_id}\u{1f}#{pane_index}\u{1f}#{pane_tty}\u{1f}#{pane_pid}\u{1f}#{pane_current_command}\u{1f}#{pane_current_path}\u{1f}#{pane_dead}\u{1f}#{pane_dead_status}\u{1f}#{pane_start_time}\u{1f}#{pane_dead_time}";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,7 +160,7 @@ impl Multiplexer for Tmux {
         let start_line = format!("-{lines}");
         let output = self.run(
             &capture_arguments(&identity.pane_id, &start_line),
-            max_bytes.saturating_add(1),
+            max_bytes.saturating_add(UTF8_BOUNDARY_LOOKAHEAD),
         )?;
         self.validate_identity(identity)?;
         let (text, bytes, truncated) = truncate_capture(&output, max_bytes)?;
@@ -303,8 +307,13 @@ fn validate_literal(value: &str) -> Result<(), MuxError> {
 }
 
 fn truncate_capture(output: &[u8], max_bytes: usize) -> Result<(String, usize, bool), MuxError> {
-    let complete = std::str::from_utf8(output).map_err(|_| MuxError::InvalidUtf8)?;
-    let mut boundary = output.len().min(max_bytes);
+    let valid_bytes = match std::str::from_utf8(output) {
+        Ok(_) => output,
+        Err(error) if error.error_len().is_none() => &output[..error.valid_up_to()],
+        Err(_) => return Err(MuxError::InvalidUtf8),
+    };
+    let complete = std::str::from_utf8(valid_bytes).map_err(|_| MuxError::InvalidUtf8)?;
+    let mut boundary = valid_bytes.len().min(max_bytes);
     while !complete.is_char_boundary(boundary) {
         boundary -= 1;
     }
@@ -368,7 +377,9 @@ fn run_bounded(
                     break;
                 }
                 if result.len() <= limit {
-                    let remaining = limit.saturating_add(1).saturating_sub(result.len());
+                    let remaining = limit
+                        .saturating_add(OUTPUT_OVERFLOW_SENTINEL)
+                        .saturating_sub(result.len());
                     result.extend_from_slice(&buffer[..read.min(remaining)]);
                 }
             }
@@ -615,5 +626,31 @@ mod tests {
             truncate_capture(&[0xff], 1),
             Err(MuxError::InvalidUtf8)
         ));
+        let emoji = "😀".as_bytes();
+        assert_eq!(
+            truncate_capture(emoji, 1).unwrap(),
+            (String::new(), 0, true)
+        );
+        assert_eq!(
+            truncate_capture(&emoji[..2], 1).unwrap(),
+            (String::new(), 0, true)
+        );
+        assert_eq!(
+            truncate_capture("a😀".as_bytes(), 3).unwrap(),
+            ("a".into(), 1, true)
+        );
+    }
+
+    #[test]
+    fn bounded_runner_timeout_returns_after_killing_child() {
+        let started = Instant::now();
+        let result = run_bounded(
+            "sh",
+            &["-c".into(), "exec sleep 10".into()],
+            Duration::from_millis(20),
+            16,
+        );
+        assert!(matches!(result, Err(MuxError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
