@@ -13,6 +13,7 @@ pub struct ObservationSchedule {
     pub event_wake_pending: bool,
     pub interval_sequence: u64,
     pub last_wake_fingerprint: Option<String>,
+    pub last_wake_completed_wall_ms: Option<u64>,
 }
 impl ObservationSchedule {
     fn is_default(&self) -> bool {

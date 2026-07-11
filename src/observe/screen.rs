@@ -188,6 +188,43 @@ impl LiveScreen {
         )
     }
 }
+
+/// Classifies only the region after a trusted, versioned adapter boundary.
+/// Without that exact boundary the capture is observation-only.
+pub fn trusted_tmux_screen(capture: &str, chrome: &TmuxChrome) -> LiveScreen {
+    let raw: Vec<&str> = capture.lines().collect();
+    let boundary = chrome
+        .is_supported()
+        .then(|| raw.iter().rposition(|line| *line == chrome.boundary_marker))
+        .flatten();
+    let mut fenced = false;
+    let lines = raw
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let trimmed = text.trim_start();
+            let provenance = if Some(index) == boundary {
+                LineProvenance::Chrome
+            } else if trimmed.starts_with("```") {
+                fenced = !fenced;
+                LineProvenance::CodeFence
+            } else if fenced {
+                LineProvenance::CodeFence
+            } else if trimmed.starts_with('>') || trimmed.starts_with('│') {
+                LineProvenance::Quote
+            } else if boundary.is_some_and(|value| index > value) {
+                LineProvenance::LiveOutput
+            } else {
+                LineProvenance::Transcript
+            };
+            ScreenLine {
+                text: (*text).into(),
+                provenance,
+            }
+        })
+        .collect();
+    LiveScreen::from_adapter(lines, boundary.map(|value| value + 1), boundary.is_some())
+}
 pub fn sanitize_terminal(input: &[u8], max_bytes: usize, max_lines: usize) -> String {
     TerminalSanitizer::default().feed(input, max_bytes, max_lines)
 }
@@ -215,5 +252,28 @@ impl ScreenDebouncer {
             self.stable = 1
         }
         self.stable >= self.required
+    }
+}
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TmuxChrome {
+    pub adapter: String,
+    pub version: u16,
+    pub boundary_marker: String,
+}
+impl TmuxChrome {
+    pub fn conservative_v1() -> Self {
+        Self {
+            adapter: "watchme_tmux".into(),
+            version: 1,
+            boundary_marker: "── watchme-live-v1 ──".into(),
+        }
+    }
+    fn is_supported(&self) -> bool {
+        self.adapter == "watchme_tmux"
+            && self.version == 1
+            && self.boundary_marker == "── watchme-live-v1 ──"
     }
 }

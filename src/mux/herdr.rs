@@ -96,14 +96,14 @@ pub struct AgentSession {
     pub process_id: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentEvent {
     pub sequence: u64,
     pub kind: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentStateEvents {
     pub state: String,
@@ -224,6 +224,39 @@ impl Herdr {
                 max_events,
             },
         )
+    }
+
+    pub async fn agent_state_events_async(
+        &self,
+        expected: &MuxIdentity,
+        after: u64,
+        max_events: usize,
+    ) -> Result<AgentStateEvents, MuxError> {
+        if max_events == 0 || max_events > 1_000 {
+            return Err(MuxError::Protocol("max_events is out of bounds".into()));
+        }
+        if &self.current_target_async().await? != expected {
+            return Err(MuxError::IdentityChanged("Herdr target changed".into()));
+        }
+        #[derive(Serialize)]
+        struct Params<'a> {
+            workspace_id: &'a str,
+            tab_id: &'a str,
+            pane_id: &'a str,
+            after: u64,
+            max_events: usize,
+        }
+        self.call_async(
+            "agent_state_events",
+            Params {
+                workspace_id: &self.context.workspace_id,
+                tab_id: &self.context.tab_id,
+                pane_id: &self.context.pane_id,
+                after,
+                max_events,
+            },
+        )
+        .await
     }
 
     pub fn notify(

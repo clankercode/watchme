@@ -447,12 +447,14 @@ impl RegistrationContextDetector for ProductionContextDetector {
             return Ok(ResolvedRegistration {
                 watcher: watchme::model::WatcherState::new(
                     watcher_id,
-                    watchme::model::TargetIdentity::multiplexer(
-                        "herdr".into(),
-                        format!("{}#{}", pane.server, pane.server_instance),
+                    watchme::model::TargetIdentity::herdr(
+                        pane.server,
+                        pane.server_instance,
+                        pane.session_id,
+                        pane.window_id,
                         pane.pane_id,
+                        pane.tty,
                         resolved.identity,
-                        Some(pane.session_id),
                     ),
                     watchme::model::WatcherLifecycle::Registered,
                     0,
@@ -484,12 +486,15 @@ impl RegistrationContextDetector for ProductionContextDetector {
             return Ok(ResolvedRegistration {
                 watcher: watchme::model::WatcherState::new(
                     watcher_id,
-                    watchme::model::TargetIdentity::multiplexer(
-                        "tmux".into(),
+                    watchme::model::TargetIdentity::tmux(
                         pane.server,
+                        pane.server_instance,
+                        pane.session_id,
+                        pane.window_id,
                         pane.pane_id,
+                        pane.tty,
                         resolved.identity,
-                        Some(pane.session_id),
+                        watchme::observe::screen::TmuxChrome::conservative_v1(),
                     ),
                     watchme::model::WatcherLifecycle::Registered,
                     0,

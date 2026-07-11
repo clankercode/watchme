@@ -2,7 +2,28 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const PROCESS_IDENTITY_SCHEMA_VERSION: u16 = 1;
-pub const TARGET_IDENTITY_SCHEMA_VERSION: u16 = 1;
+pub const TARGET_IDENTITY_SCHEMA_VERSION: u16 = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MultiplexerContext {
+    Tmux {
+        socket_path: String,
+        server_instance: String,
+        session_id: String,
+        window_id: String,
+        pane_id: String,
+        tty: String,
+    },
+    Herdr {
+        socket_path: String,
+        server_instance: String,
+        workspace_id: String,
+        tab_id: String,
+        pane_id: String,
+        tty: String,
+    },
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +114,9 @@ pub enum TargetIdentity {
         pane: String,
         process: ProcessIdentity,
         session: Option<String>,
+        context: Option<Box<MultiplexerContext>>,
+        chrome: Option<crate::observe::screen::TmuxChrome>,
+        needs_revalidation: bool,
     },
 }
 
@@ -114,6 +138,83 @@ impl TargetIdentity {
             pane,
             process,
             session,
+            context: None,
+            chrome: None,
+            needs_revalidation: true,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn tmux(
+        socket_path: String,
+        server_instance: String,
+        session_id: String,
+        window_id: String,
+        pane_id: String,
+        tty: String,
+        process: ProcessIdentity,
+        chrome: crate::observe::screen::TmuxChrome,
+    ) -> Self {
+        Self::Multiplexer {
+            provider: "tmux".into(),
+            server: socket_path.clone(),
+            pane: pane_id.clone(),
+            process,
+            session: Some(session_id.clone()),
+            context: Some(Box::new(MultiplexerContext::Tmux {
+                socket_path,
+                server_instance,
+                session_id,
+                window_id,
+                pane_id,
+                tty,
+            })),
+            chrome: Some(chrome),
+            needs_revalidation: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn herdr(
+        socket_path: String,
+        server_instance: String,
+        workspace_id: String,
+        tab_id: String,
+        pane_id: String,
+        tty: String,
+        process: ProcessIdentity,
+    ) -> Self {
+        Self::Multiplexer {
+            provider: "herdr".into(),
+            server: socket_path.clone(),
+            pane: pane_id.clone(),
+            process,
+            session: Some(workspace_id.clone()),
+            context: Some(Box::new(MultiplexerContext::Herdr {
+                socket_path,
+                server_instance,
+                workspace_id,
+                tab_id,
+                pane_id,
+                tty,
+            })),
+            chrome: None,
+            needs_revalidation: false,
+        }
+    }
+    pub const fn needs_revalidation(&self) -> bool {
+        matches!(
+            self,
+            Self::Multiplexer {
+                needs_revalidation: true,
+                ..
+            }
+        )
+    }
+    pub fn observation_context(&self) -> Option<&MultiplexerContext> {
+        match self {
+            Self::Multiplexer { context, .. } => context.as_deref(),
+            _ => None,
         }
     }
 
@@ -136,6 +237,12 @@ enum TargetWire {
         pane: String,
         process: ProcessIdentity,
         session: Option<String>,
+        #[serde(default)]
+        context: Option<Box<MultiplexerContext>>,
+        #[serde(default)]
+        chrome: Option<crate::observe::screen::TmuxChrome>,
+        #[serde(default)]
+        needs_revalidation: bool,
     },
 }
 
@@ -155,6 +262,10 @@ impl Serialize for TargetIdentity {
                 pane,
                 process,
                 session,
+                context,
+                chrome,
+                needs_revalidation,
+                ..
             } => TargetWire::Multiplexer {
                 schema_version: TARGET_IDENTITY_SCHEMA_VERSION,
                 provider: provider.clone(),
@@ -162,6 +273,9 @@ impl Serialize for TargetIdentity {
                 pane: pane.clone(),
                 process: process.clone(),
                 session: session.clone(),
+                context: context.clone(),
+                chrome: chrome.clone(),
+                needs_revalidation: *needs_revalidation,
             },
         };
         wire.serialize(serializer)
@@ -178,7 +292,7 @@ impl<'de> Deserialize<'de> for TargetIdentity {
             TargetWire::Process { schema_version, .. }
             | TargetWire::Multiplexer { schema_version, .. } => *schema_version,
         };
-        if version != TARGET_IDENTITY_SCHEMA_VERSION {
+        if version != 1 && version != TARGET_IDENTITY_SCHEMA_VERSION {
             return Err(D::Error::custom(format_args!(
                 "unsupported target identity schema version {version}"
             )));
@@ -191,6 +305,9 @@ impl<'de> Deserialize<'de> for TargetIdentity {
                 pane,
                 process,
                 session,
+                context,
+                chrome,
+                needs_revalidation,
                 ..
             } => Self::Multiplexer {
                 provider,
@@ -198,6 +315,9 @@ impl<'de> Deserialize<'de> for TargetIdentity {
                 pane,
                 process,
                 session,
+                context,
+                chrome,
+                needs_revalidation: version == 1 || needs_revalidation,
             },
         })
     }

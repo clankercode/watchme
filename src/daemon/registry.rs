@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
+use crate::recovery::state_machine::Budget;
 use crate::recovery::state_machine::{RecoveryCommand, RecoveryMachine, RecoveryState};
 use crate::store::{JsonStore, LoadOutcome, StoreError};
 
@@ -59,6 +60,15 @@ impl Registry {
         };
         let mut replay_transitioned = false;
         for watcher in watchers.values_mut() {
+            if watcher.target.needs_revalidation() && watcher.recovery.is_none() {
+                watcher.recovery = Some(RecoveryMachine::new(Budget {
+                    max_attempts: 3,
+                    max_cumulative_wait: std::time::Duration::from_secs(300),
+                    planner_calls: 0,
+                    cooldown: std::time::Duration::from_secs(60),
+                }));
+                replay_transitioned = true;
+            }
             if let Some(recovery) = watcher.recovery.take() {
                 watcher.recovery = Some(
                     recovery
@@ -249,7 +259,50 @@ impl Registry {
         if let Some(event) = event {
             watcher.last_observation = Some(event)
         }
-        watcher.observation_schedule.last_wake_fingerprint = None;
+        if watcher.observation_schedule.event_wake_pending {
+            watcher.observation_schedule.last_wake_completed_wall_ms = Some(now);
+        }
+        watcher.observation_schedule.event_wake_pending = false;
+        watcher.revision = next_revision(watcher)?;
+        watcher.updated_at_unix_ms = now;
+        self.persist_watchers(&updated)?;
+        self.watchers = updated;
+        Ok(())
+    }
+    pub fn commit_observation(
+        &mut self,
+        id: &str,
+        mut schedule: crate::model::ObservationSchedule,
+        event: Option<crate::model::Event>,
+        now: u64,
+    ) -> Result<(), RegistryError> {
+        let mut updated = self.watchers.clone();
+        let watcher = updated
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::Unknown(id.into()))?;
+        if schedule.event_wake_pending {
+            schedule.last_wake_completed_wall_ms = Some(now);
+        }
+        schedule.event_wake_pending = false;
+        watcher.observation_schedule = schedule;
+        if let Some(event) = event {
+            if let Some(machine) = watcher.recovery.as_mut() {
+                if machine.state() == RecoveryState::NeedsRevalidation {
+                    machine
+                        .apply(RecoveryCommand::Revalidated)
+                        .map_err(|reason| RegistryError::Corrupt(reason.into()))?;
+                    watcher.lifecycle = WatcherLifecycle::Observing;
+                }
+                if event.category.is_actionable() && machine.state() == RecoveryState::Observing {
+                    machine
+                        .apply(RecoveryCommand::Confirm {
+                            fingerprint: event.evidence_fingerprint.clone(),
+                        })
+                        .map_err(|reason| RegistryError::Corrupt(reason.into()))?;
+                }
+            }
+            watcher.last_observation = Some(event);
+        }
         watcher.revision = next_revision(watcher)?;
         watcher.updated_at_unix_ms = now;
         self.persist_watchers(&updated)?;
@@ -271,13 +324,17 @@ impl Registry {
         let watcher = self
             .get(id)
             .ok_or_else(|| RegistryError::Unknown(id.into()))?;
-        if watcher.observation_schedule.event_wake_pending
-            || watcher
+        const WAKE_COOLDOWN_MS: u64 = 60_000;
+        let duplicate_in_cooldown = watcher
+            .observation_schedule
+            .last_wake_fingerprint
+            .as_deref()
+            == Some(fingerprint)
+            && watcher
                 .observation_schedule
-                .last_wake_fingerprint
-                .as_deref()
-                == Some(fingerprint)
-        {
+                .last_wake_completed_wall_ms
+                .is_some_and(|completed| now < completed.saturating_add(WAKE_COOLDOWN_MS));
+        if watcher.observation_schedule.event_wake_pending || duplicate_in_cooldown {
             return Ok(());
         }
         let mut schedule = watcher.observation_schedule.clone();

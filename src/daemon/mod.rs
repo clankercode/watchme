@@ -69,6 +69,52 @@ impl Observer for GenericObserver {
     ) -> Pin<Box<dyn Future<Output = Result<Option<crate::model::Event>, String>> + Send + 'a>>
     {
         Box::pin(async move {
+            if let crate::model::TargetIdentity::Multiplexer {
+                context: Some(context),
+                process,
+                ..
+            } = &watcher.target
+                && let crate::model::MultiplexerContext::Herdr {
+                    socket_path,
+                    workspace_id,
+                    tab_id,
+                    pane_id,
+                    ..
+                } = context.as_ref()
+            {
+                let context = crate::mux::herdr::HerdrContext {
+                    socket_path: socket_path.clone(),
+                    workspace_id: workspace_id.clone(),
+                    tab_id: tab_id.clone(),
+                    pane_id: pane_id.clone(),
+                };
+                let herdr = crate::mux::herdr::Herdr::new(context, Duration::from_secs(2))
+                    .map_err(|error| error.to_string())?;
+                let actual = herdr
+                    .current_target_async()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if actual.process.pid != process.pid
+                    || actual.process.start_time != process.start_time
+                {
+                    return Err("target identity changed".into());
+                }
+                let state = herdr
+                    .agent_state_events_async(&actual, 0, 64)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let evidence = serde_json::to_vec(&state).map_err(|error| error.to_string())?;
+                return observation_event(
+                    &watcher,
+                    crate::model::SourceKind::HerdrAgentState,
+                    "herdr",
+                    "typed_pane_state",
+                    crate::model::EventCategory::UnknownBlocked,
+                    0.8,
+                    &evidence,
+                )
+                .map(Some);
+            }
             tokio::task::spawn_blocking(move || generic_observe(&watcher))
                 .await
                 .map_err(|error| error.to_string())?
@@ -80,19 +126,62 @@ fn generic_observe(
 ) -> Result<Option<crate::model::Event>, String> {
     use crate::mux::Multiplexer;
     use sha2::{Digest, Sha256};
+    if let crate::model::TargetIdentity::Process { process } = &watcher.target {
+        use crate::process::ProcessInspector;
+        #[cfg(target_os = "linux")]
+        let inspector = crate::process::linux::LinuxProcessInspector::default();
+        #[cfg(target_os = "macos")]
+        let inspector = crate::process::macos::MacOsProcessInspector::default();
+        let alive = inspector
+            .inspect(process.pid)
+            .ok()
+            .is_some_and(|actual| actual.start_time == process.start_time);
+        let category = if alive {
+            crate::model::EventCategory::UnknownBlocked
+        } else {
+            crate::model::EventCategory::Terminated
+        };
+        return observation_event(
+            watcher,
+            crate::model::SourceKind::ProcessMetadata,
+            "process",
+            "liveness",
+            category,
+            1.0,
+            if alive { b"alive" } else { b"dead" },
+        )
+        .map(Some);
+    }
     let crate::model::TargetIdentity::Multiplexer {
         provider,
         server,
         pane,
         process,
         session,
+        context,
+        chrome,
+        ..
     } = &watcher.target
     else {
         return Ok(None);
     };
-    if provider != "tmux" {
+    if provider != "tmux" || watcher.target.needs_revalidation() {
         return Ok(None);
     }
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let crate::model::MultiplexerContext::Tmux {
+        socket_path,
+        session_id,
+        window_id,
+        pane_id,
+        tty,
+        server_instance,
+    } = context.as_ref()
+    else {
+        return Ok(None);
+    };
     let tmux = crate::mux::tmux::Tmux::for_socket_path(server.clone(), Duration::from_secs(2));
     let selector =
         crate::mux::tmux::TmuxSelector::parse(pane).map_err(|error| error.to_string())?;
@@ -102,18 +191,23 @@ fn generic_observe(
     if identity.process.pid != process.pid || identity.process.start_time != process.start_time {
         return Err("target identity changed".into());
     }
+    if &identity.server != socket_path
+        || &identity.server_instance != server_instance
+        || &identity.session_id != session_id
+        || &identity.window_id != window_id
+        || &identity.pane_id != pane_id
+        || &identity.tty != tty
+    {
+        return Err("target multiplexer identity changed".into());
+    }
     let capture = tmux
         .capture_tail(&identity, 80, 32 * 1024)
         .map_err(|error| error.to_string())?;
     let clean = crate::observe::screen::sanitize_terminal(capture.text.as_bytes(), 32 * 1024, 80);
-    let lines = clean
-        .lines()
-        .map(|text| crate::observe::screen::ScreenLine {
-            text: text.into(),
-            provenance: crate::observe::screen::LineProvenance::LiveOutput,
-        })
-        .collect();
-    let live = crate::observe::screen::LiveScreen::from_adapter(lines, None, true);
+    let live = chrome.as_ref().map_or_else(
+        || crate::observe::screen::LiveScreen::from_adapter(Vec::new(), None, false),
+        |descriptor| crate::observe::screen::trusted_tmux_screen(&clean, descriptor),
+    );
     let actionable = live.actionable_bottom(40);
     let fingerprint =
         crate::observe::evidence_fingerprint("screen_detection", "generic_tail", clean.as_bytes());
@@ -124,10 +218,8 @@ fn generic_observe(
     let observed: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
     let category = if clean.trim().is_empty() {
         crate::model::EventCategory::Idle
-    } else if actionable.is_some() {
-        crate::model::EventCategory::UnknownBlocked
     } else {
-        crate::model::EventCategory::Working
+        crate::model::EventCategory::UnknownBlocked
     };
     let mut event = crate::model::Event::new(
         format!("obs-{}-{}", watcher.watcher_id, watcher.revision),
@@ -149,6 +241,37 @@ fn generic_observe(
     .map_err(|error| error.to_string())?;
     event.session_id = session.clone();
     Ok(Some(event))
+}
+
+fn observation_event(
+    watcher: &crate::model::WatcherState,
+    kind: crate::model::SourceKind,
+    source: &str,
+    rule: &str,
+    category: crate::model::EventCategory,
+    confidence: f64,
+    evidence: &[u8],
+) -> Result<crate::model::Event, String> {
+    use sha2::{Digest, Sha256};
+    let target_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&watcher.target).map_err(|error| error.to_string())?)
+    );
+    let observed: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    crate::model::Event::new(
+        format!("obs-{}-{}", watcher.watcher_id, watcher.revision),
+        observed.to_rfc3339(),
+        watcher.watcher_id.clone(),
+        target_hash,
+        crate::model::EventSource::new(kind, source, rule),
+        category,
+        confidence,
+        false,
+        crate::observe::evidence_fingerprint(source, rule, evidence),
+        "bounded observation",
+        crate::model::PolicyHint::ObserveOnly,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -448,7 +571,7 @@ pub async fn run_observation_monitor_with_clock(
         let now = clock.wall_now_ms();
         let mono = clock.mono_now_ms();
         let due = {
-            let mut guard = registry.lock().await;
+            let guard = registry.lock().await;
             let mut due = Vec::new();
             for watcher in guard.list() {
                 if matches!(
@@ -460,7 +583,6 @@ pub async fn run_observation_monitor_with_clock(
                     continue;
                 }
                 let schedule = &watcher.observation_schedule;
-                let clock_discontinuity = schedule.next_due_wall_ms > now.saturating_add(65_000);
                 let due_mono = *runtime_due
                     .entry(watcher.watcher_id.clone())
                     .or_insert_with(|| {
@@ -468,10 +590,9 @@ pub async fn run_observation_monitor_with_clock(
                             schedule.next_due_wall_ms.saturating_sub(now).min(65_000),
                         )
                     });
-                if schedule.event_wake_pending || mono >= due_mono || clock_discontinuity {
+                if schedule.event_wake_pending || mono >= due_mono {
                     let mut next = schedule.clone();
                     next.last_check_wall_ms = Some(now);
-                    next.event_wake_pending = false;
                     next.interval_sequence = next.interval_sequence.saturating_add(1);
                     let hash = watcher
                         .watcher_id
@@ -486,31 +607,30 @@ pub async fn run_observation_monitor_with_clock(
                         watcher.watcher_id.clone(),
                         mono.saturating_add_signed((60_000i64 + jitter * 1_000).max(1)),
                     );
-                    if guard
-                        .persist_observation_schedule(&watcher.watcher_id, next, now)
-                        .is_ok()
-                    {
-                        due.push(watcher)
-                    }
+                    due.push((watcher, next))
                 }
             }
             due
         };
-        for watcher in due {
+        for (watcher, next_schedule) in due {
             let event = match tokio::time::timeout(
                 Duration::from_secs(5),
                 observer.observe(watcher.clone()),
             )
             .await
             {
-                Ok(Ok(event)) => event,
-                _ => None,
+                Ok(result) => result,
+                Err(_) => Err("observation timed out".into()),
             };
-            let _ = registry.lock().await.complete_observation(
-                &watcher.watcher_id,
-                event,
-                clock.wall_now_ms(),
-            );
+            if let Ok(event) = event {
+                let mut guard = registry.lock().await;
+                let _ = guard.commit_observation(
+                    &watcher.watcher_id,
+                    next_schedule,
+                    event,
+                    clock.wall_now_ms(),
+                );
+            }
         }
         iterations += 1;
         if max_iterations > 0 && iterations >= max_iterations {

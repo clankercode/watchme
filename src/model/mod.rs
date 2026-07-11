@@ -7,8 +7,8 @@ pub use action::{Action, ActionKind, Condition, StatusCheck};
 pub use event::{Event, EventCategory, EventReset, EventSource, PolicyHint, SourceKind};
 
 pub use identity::{
-    PROCESS_IDENTITY_SCHEMA_VERSION, ProcessIdentity, TARGET_IDENTITY_SCHEMA_VERSION,
-    TargetIdentity,
+    MultiplexerContext, PROCESS_IDENTITY_SCHEMA_VERSION, ProcessIdentity,
+    TARGET_IDENTITY_SCHEMA_VERSION, TargetIdentity,
 };
 pub use state::{
     ObservationSchedule, WATCHER_STATE_SCHEMA_VERSION, WatcherLifecycle, WatcherState,
