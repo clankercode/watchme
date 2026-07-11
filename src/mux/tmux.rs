@@ -4,7 +4,10 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{Capture, Multiplexer, MuxError, MuxIdentity, PaneInfo, SymbolicKey};
+use super::{
+    Capture, ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, PaneInfo,
+    SymbolicKey,
+};
 use crate::process::ProcessInspector;
 
 const FIELD_SEPARATOR: char = '\u{1f}';
@@ -116,14 +119,13 @@ impl Multiplexer for Tmux {
             && actual.window_id == expected.window_id
             && actual.pane_id == expected.pane_id
             && actual.tty == expected.tty
-            && actual.process.pid == expected.process.pid
-            && actual.process.start_time == expected.process.start_time
+            && process_matches(&expected.process, &actual.process)
         {
             Ok(())
         } else {
             Err(MuxError::IdentityChanged(format!(
-                "expected pane {} PID {}, found pane {} PID {}",
-                expected.pane_id, expected.process.pid, actual.pane_id, actual.process.pid
+                "expected pane {} process {:?}, found pane {} process {:?}",
+                expected.pane_id, expected.process, actual.pane_id, actual.process
             )))
         }
     }
@@ -145,15 +147,7 @@ impl Multiplexer for Tmux {
         let start = Instant::now();
         let start_line = format!("-{lines}");
         let output = self.run(
-            &[
-                "capture-pane",
-                "-p",
-                "-J",
-                "-S",
-                &start_line,
-                "-t",
-                &identity.pane_id,
-            ],
+            &capture_arguments(&identity.pane_id, &start_line),
             max_bytes.saturating_add(1),
         )?;
         let truncated = output.len() > max_bytes;
@@ -168,21 +162,27 @@ impl Multiplexer for Tmux {
             elapsed: start.elapsed(),
         })
     }
-    fn send_literal(&self, identity: &MuxIdentity, text: &str) -> Result<(), MuxError> {
-        validate_argument(text)?;
+    fn send_literal(
+        &self,
+        identity: &MuxIdentity,
+        text: &str,
+        safety: &dyn ComposerSafety,
+    ) -> Result<(), MuxError> {
+        validate_literal(text)?;
         self.validate_identity(identity)?;
-        self.run(
-            &["send-keys", "-t", &identity.pane_id, "-l", "--", text],
-            OUTPUT_LIMIT,
-        )?;
+        require_safe(safety, identity)?;
+        self.run(&literal_arguments(&identity.pane_id, text), OUTPUT_LIMIT)?;
         Ok(())
     }
-    fn send_key(&self, identity: &MuxIdentity, key: SymbolicKey) -> Result<(), MuxError> {
+    fn send_key(
+        &self,
+        identity: &MuxIdentity,
+        key: SymbolicKey,
+        safety: &dyn ComposerSafety,
+    ) -> Result<(), MuxError> {
         self.validate_identity(identity)?;
-        self.run(
-            &["send-keys", "-t", &identity.pane_id, key.tmux_name()],
-            OUTPUT_LIMIT,
-        )?;
+        require_safe(safety, identity)?;
+        self.run(&symbolic_arguments(&identity.pane_id, key), OUTPUT_LIMIT)?;
         Ok(())
     }
 }
@@ -200,18 +200,40 @@ fn parse_metadata(value: &str) -> Result<PaneInfo, MuxError> {
             .parse::<u32>()
             .map_err(|_| MuxError::Malformed(format!("invalid {name}")))
     };
-    let optional_i32 = |index: usize| {
+    let optional_i32 = |index: usize| -> Result<Option<i32>, MuxError> {
         if fields[index].is_empty() {
-            None
+            Ok(None)
         } else {
-            fields[index].parse().ok()
+            fields[index]
+                .parse()
+                .map(Some)
+                .map_err(|_| MuxError::Malformed(format!("invalid optional numeric field {index}")))
         }
     };
-    let optional_u64 = |index: usize| {
+    let optional_u64 = |index: usize| -> Result<Option<u64>, MuxError> {
         if fields[index].is_empty() {
-            None
+            Ok(None)
         } else {
-            fields[index].parse().ok()
+            fields[index]
+                .parse()
+                .map(Some)
+                .map_err(|_| MuxError::Malformed(format!("invalid optional numeric field {index}")))
+        }
+    };
+    for index in [0, 1, 3, 6, 8] {
+        if fields[index].is_empty() {
+            return Err(MuxError::Malformed(format!(
+                "required field {index} is empty"
+            )));
+        }
+    }
+    let dead = match fields[12] {
+        "0" => false,
+        "1" => true,
+        _ => {
+            return Err(MuxError::Malformed(
+                "pane dead marker must be 0 or 1".into(),
+            ));
         }
     };
     let pid = number(9, "pane PID")?;
@@ -244,10 +266,10 @@ fn parse_metadata(value: &str) -> Result<PaneInfo, MuxError> {
         pane_index: number(7, "pane index")?,
         current_command: fields[10].into(),
         current_path: fields[11].into(),
-        dead: fields[12] == "1",
-        dead_status: optional_i32(13),
-        started_at: optional_u64(14),
-        dead_at: optional_u64(15),
+        dead,
+        dead_status: optional_i32(13)?,
+        started_at: optional_u64(14)?,
+        dead_at: optional_u64(15)?,
     })
 }
 
@@ -262,6 +284,57 @@ fn validate_argument(value: &str) -> Result<(), MuxError> {
         ));
     }
     Ok(())
+}
+
+fn validate_literal(value: &str) -> Result<(), MuxError> {
+    if value.chars().any(|character| character.is_control()) {
+        return Err(MuxError::InvalidSelector(
+            "literal text contains a control character".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn capture_arguments<'a>(pane: &'a str, start_line: &'a str) -> [&'a str; 7] {
+    ["capture-pane", "-p", "-J", "-S", start_line, "-t", pane]
+}
+
+fn literal_arguments<'a>(pane: &'a str, text: &'a str) -> [&'a str; 6] {
+    ["send-keys", "-t", pane, "-l", "--", text]
+}
+
+fn symbolic_arguments(pane: &str, key: SymbolicKey) -> [&str; 4] {
+    ["send-keys", "-t", pane, key.tmux_name()]
+}
+
+fn require_safe(safety: &dyn ComposerSafety, identity: &MuxIdentity) -> Result<(), MuxError> {
+    match safety.observe(identity)? {
+        ComposerState::Safe => Ok(()),
+        state => Err(MuxError::IdentityChanged(format!(
+            "composer safety is {state:?}"
+        ))),
+    }
+}
+
+fn process_matches(
+    expected: &crate::model::ProcessIdentity,
+    actual: &crate::model::ProcessIdentity,
+) -> bool {
+    expected.pid == actual.pid
+        && expected.start_time == actual.start_time
+        && option_matches(&expected.executable, &actual.executable)
+        && option_matches(&expected.argv_digest, &actual.argv_digest)
+        && option_matches(&expected.uid, &actual.uid)
+        && option_matches(&expected.process_group_id, &actual.process_group_id)
+        && option_matches(&expected.session_leader_id, &actual.session_leader_id)
+        && option_matches(&expected.tty, &actual.tty)
+        && option_matches(&expected.parent_digest, &actual.parent_digest)
+}
+
+fn option_matches<T: Eq>(expected: &Option<T>, actual: &Option<T>) -> bool {
+    expected
+        .as_ref()
+        .is_none_or(|value| actual.as_ref() == Some(value))
 }
 
 fn run_bounded(
@@ -340,5 +413,173 @@ mod tests {
     fn argument_validation_rejects_control_boundaries() {
         assert!(validate_argument("a\nb").is_err());
         assert!(validate_argument("unicode-λ").is_ok());
+    }
+
+    #[test]
+    fn capture_arguments_are_exact_and_do_not_use_pipe_pane() {
+        assert_eq!(
+            capture_arguments("%7", "-40"),
+            ["capture-pane", "-p", "-J", "-S", "-40", "-t", "%7"]
+        );
+    }
+
+    #[test]
+    fn literal_and_symbolic_argument_paths_are_distinct() {
+        assert_eq!(
+            literal_arguments("%2", "-n;λ"),
+            ["send-keys", "-t", "%2", "-l", "--", "-n;λ"]
+        );
+        assert_eq!(
+            symbolic_arguments("%2", SymbolicKey::Enter),
+            ["send-keys", "-t", "%2", "Enter"]
+        );
+        for key in [
+            SymbolicKey::Enter,
+            SymbolicKey::Escape,
+            SymbolicKey::Up,
+            SymbolicKey::Down,
+            SymbolicKey::Left,
+            SymbolicKey::Right,
+            SymbolicKey::Tab,
+            SymbolicKey::Backspace,
+        ] {
+            assert!(!key.tmux_name().is_empty());
+        }
+    }
+
+    #[test]
+    fn server_targeting_arguments_are_fixed() {
+        assert!(
+            Tmux::default_server(Duration::from_secs(1))
+                .args()
+                .is_empty()
+        );
+        assert_eq!(
+            Tmux::for_socket_name("private".into(), Duration::from_secs(1)).args(),
+            vec![OsString::from("-L"), OsString::from("private")]
+        );
+        assert_eq!(
+            Tmux {
+                server: Server::SocketPath("/tmp/socket".into()),
+                timeout: Duration::from_secs(1)
+            }
+            .args(),
+            vec![OsString::from("-S"), OsString::from("/tmp/socket")]
+        );
+    }
+
+    fn metadata(dead: &str, status: &str, started: &str, ended: &str) -> String {
+        let pid = std::process::id().to_string();
+        [
+            "/tmp/socket",
+            "$1",
+            "sλ",
+            "@2",
+            "wλ",
+            "3",
+            "%4",
+            "5",
+            "/dev/pts/1",
+            &pid,
+            "bash",
+            "/tmp/λ",
+            dead,
+            status,
+            started,
+            ended,
+        ]
+        .join(&FIELD_SEPARATOR.to_string())
+    }
+
+    #[test]
+    fn metadata_parses_exact_fields_and_rejects_bad_optional_numbers_and_markers() {
+        let info = parse_metadata(&metadata("1", "7", "8", "9")).unwrap();
+        assert_eq!(
+            (
+                info.identity.server.as_str(),
+                info.identity.session_id.as_str(),
+                info.identity.window_id.as_str(),
+                info.identity.pane_id.as_str()
+            ),
+            ("/tmp/socket", "$1", "@2", "%4")
+        );
+        assert_eq!(
+            (
+                info.session_name.as_str(),
+                info.window_name.as_str(),
+                info.window_index,
+                info.pane_index
+            ),
+            ("sλ", "wλ", 3, 5)
+        );
+        assert_eq!(
+            (info.dead, info.dead_status, info.started_at, info.dead_at),
+            (true, Some(7), Some(8), Some(9))
+        );
+        for malformed in [
+            metadata("2", "", "", ""),
+            metadata("0", "x", "", ""),
+            metadata("0", "", "x", ""),
+            metadata("0", "", "", "x"),
+        ] {
+            assert!(parse_metadata(&malformed).is_err());
+        }
+        let extra_delimiter =
+            metadata("0", "", "", "").replace("sλ", &format!("s{}λ", FIELD_SEPARATOR));
+        assert!(parse_metadata(&extra_delimiter).is_err());
+    }
+
+    #[test]
+    fn literal_validation_rejects_all_control_ranges() {
+        for code in (0..=0x1f).chain(0x7f..=0x9f) {
+            assert!(validate_literal(&char::from_u32(code).unwrap().to_string()).is_err());
+        }
+        assert!(validate_literal("printable λ text").is_ok());
+    }
+
+    #[test]
+    fn strong_process_fields_reject_every_contradiction() {
+        let mut expected = crate::model::ProcessIdentity::new(1, 2);
+        expected.executable = Some("agent".into());
+        expected.argv_digest = Some("argv".into());
+        expected.uid = Some(3);
+        expected.process_group_id = Some(4);
+        expected.session_leader_id = Some(5);
+        expected.tty = Some("tty".into());
+        expected.parent_digest = Some("parent".into());
+        assert!(process_matches(&expected, &expected));
+        let mut variants = Vec::new();
+        let mut value = expected.clone();
+        value.pid = 9;
+        variants.push(value);
+        let mut value = expected.clone();
+        value.start_time = 9;
+        variants.push(value);
+        let mut value = expected.clone();
+        value.executable = Some("other".into());
+        variants.push(value);
+        let mut value = expected.clone();
+        value.argv_digest = Some("other".into());
+        variants.push(value);
+        let mut value = expected.clone();
+        value.uid = Some(9);
+        variants.push(value);
+        let mut value = expected.clone();
+        value.process_group_id = Some(9);
+        variants.push(value);
+        let mut value = expected.clone();
+        value.session_leader_id = Some(9);
+        variants.push(value);
+        let mut value = expected.clone();
+        value.tty = Some("other".into());
+        variants.push(value);
+        let mut value = expected.clone();
+        value.parent_digest = Some("other".into());
+        variants.push(value);
+        assert!(
+            variants
+                .iter()
+                .all(|actual| !process_matches(&expected, actual))
+        );
     }
 }

@@ -53,6 +53,18 @@ pub enum SymbolicKey {
     Backspace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComposerState {
+    Safe,
+    Unsafe,
+    Unknown,
+    Stale,
+}
+
+pub trait ComposerSafety {
+    fn observe(&self, identity: &MuxIdentity) -> Result<ComposerState, MuxError>;
+}
+
 impl SymbolicKey {
     pub(crate) const fn tmux_name(self) -> &'static str {
         match self {
@@ -96,6 +108,16 @@ pub trait Multiplexer {
         lines: usize,
         max_bytes: usize,
     ) -> Result<Capture, MuxError>;
-    fn send_literal(&self, identity: &MuxIdentity, text: &str) -> Result<(), MuxError>;
-    fn send_key(&self, identity: &MuxIdentity, key: SymbolicKey) -> Result<(), MuxError>;
+    fn send_literal(
+        &self,
+        identity: &MuxIdentity,
+        text: &str,
+        safety: &dyn ComposerSafety,
+    ) -> Result<(), MuxError>;
+    fn send_key(
+        &self,
+        identity: &MuxIdentity,
+        key: SymbolicKey,
+        safety: &dyn ComposerSafety,
+    ) -> Result<(), MuxError>;
 }

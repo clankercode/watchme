@@ -1,8 +1,27 @@
 use std::process::Command;
 use std::time::Duration;
+use std::time::Instant;
 
 use watchme::mux::tmux::{Tmux, TmuxSelector};
-use watchme::mux::{Multiplexer, SymbolicKey};
+use watchme::mux::{
+    ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, SymbolicKey,
+};
+
+struct Composer(ComposerState);
+impl ComposerSafety for Composer {
+    fn observe(&self, _: &MuxIdentity) -> Result<ComposerState, MuxError> {
+        Ok(self.0)
+    }
+}
+
+struct ServerGuard(String);
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("tmux")
+            .args(["-L", &self.0, "kill-server"])
+            .output();
+    }
+}
 
 #[test]
 fn selector_diagnostics_reject_controls_and_accept_explicit_ids() {
@@ -20,11 +39,12 @@ fn private_tmux_server_captures_sends_and_refuses_stale_identity() {
         return;
     }
     let socket = format!("watchme-test-{}", std::process::id());
+    let _guard = ServerGuard(socket.clone());
     let target = "watchme";
     let cleanup = || {
         let _ = Command::new("tmux")
             .args(["-L", &socket, "kill-server"])
-            .status();
+            .output();
     };
     cleanup();
     let status = Command::new("tmux")
@@ -42,27 +62,102 @@ fn private_tmux_server_captures_sends_and_refuses_stale_identity() {
         .status()
         .unwrap();
     assert!(status.success());
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-window",
+                "-d",
+                "-t",
+                target,
+                "-n",
+                "spare",
+                "sleep",
+                "30"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
 
     let tmux = Tmux::for_socket_name(socket.clone(), Duration::from_secs(2));
-    let identity = tmux
-        .resolve_selector(&TmuxSelector::parse(target).unwrap())
-        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let identity = loop {
+        let candidate = tmux
+            .resolve_selector(&TmuxSelector::parse(target).unwrap())
+            .unwrap();
+        if candidate.process.executable.as_deref() != Some("/usr/bin/tmux")
+            && tmux
+                .capture_tail(&candidate, 40, 16 * 1024)
+                .is_ok_and(|capture| capture.text.contains("ready"))
+        {
+            break candidate;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "private tmux pane did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let captured = tmux.capture_tail(&identity, 40, 16 * 1024).unwrap();
     assert!(captured.text.contains("ready"));
-    tmux.send_literal(&identity, "hello ; $(false)").unwrap();
-    tmux.send_key(&identity, SymbolicKey::Enter).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(
-        tmux.capture_tail(&identity, 40, 16 * 1024)
+    let safe = Composer(ComposerState::Safe);
+    tmux.send_literal(&identity, "hello ; $(false)", &safe)
+        .unwrap();
+    tmux.send_key(&identity, SymbolicKey::Enter, &safe).unwrap();
+    for state in [
+        ComposerState::Unsafe,
+        ComposerState::Unknown,
+        ComposerState::Stale,
+    ] {
+        assert!(
+            tmux.send_literal(&identity, "blocked", &Composer(state))
+                .is_err()
+        );
+    }
+    for control in [
+        '\0', '\u{1}', '\u{7}', '\u{8}', '\t', '\n', '\r', '\u{1b}', '\u{7f}', '\u{80}', '\u{9f}',
+    ] {
+        assert!(
+            tmux.send_literal(&identity, &format!("bad{control}"), &safe)
+                .is_err()
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if tmux
+            .capture_tail(&identity, 40, 16 * 1024)
             .unwrap()
             .text
             .contains("got:hello ; $(false)")
-    );
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fake agent did not echo input");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     Command::new("tmux")
         .args(["-L", &socket, "kill-pane", "-t", &identity.pane_id])
         .status()
         .unwrap();
-    assert!(tmux.send_literal(&identity, "must refuse").is_err());
-    cleanup();
+    assert!(
+        Command::new("tmux")
+            .args([
+                "-L",
+                &socket,
+                "new-window",
+                "-d",
+                "-t",
+                target,
+                "sh",
+                "-c",
+                "printf replacement; sleep 30"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(tmux.send_literal(&identity, "must refuse", &safe).is_err());
 }
