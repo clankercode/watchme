@@ -153,7 +153,7 @@ impl TargetIdentity {
         pane_id: String,
         tty: String,
         process: ProcessIdentity,
-        chrome: crate::observe::screen::TmuxChrome,
+        chrome: Option<crate::observe::screen::TmuxChrome>,
     ) -> Self {
         Self::Multiplexer {
             provider: "tmux".into(),
@@ -169,7 +169,7 @@ impl TargetIdentity {
                 pane_id,
                 tty,
             })),
-            chrome: Some(chrome),
+            chrome,
             needs_revalidation: false,
         }
     }

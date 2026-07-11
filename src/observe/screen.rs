@@ -264,16 +264,7 @@ pub struct TmuxChrome {
     pub boundary_marker: String,
 }
 impl TmuxChrome {
-    pub fn conservative_v1() -> Self {
-        Self {
-            adapter: "watchme_tmux".into(),
-            version: 1,
-            boundary_marker: "── watchme-live-v1 ──".into(),
-        }
-    }
     fn is_supported(&self) -> bool {
-        self.adapter == "watchme_tmux"
-            && self.version == 1
-            && self.boundary_marker == "── watchme-live-v1 ──"
+        !self.adapter.is_empty() && self.version == 1 && !self.boundary_marker.is_empty()
     }
 }

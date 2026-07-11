@@ -494,7 +494,7 @@ impl RegistrationContextDetector for ProductionContextDetector {
                         pane.pane_id,
                         pane.tty,
                         resolved.identity,
-                        watchme::observe::screen::TmuxChrome::conservative_v1(),
+                        None,
                     ),
                     watchme::model::WatcherLifecycle::Registered,
                     0,

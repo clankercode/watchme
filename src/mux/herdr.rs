@@ -259,6 +259,70 @@ impl Herdr {
         .await
     }
 
+    pub async fn capture_tail_async(
+        &self,
+        expected: &MuxIdentity,
+        lines: usize,
+        max_bytes: usize,
+    ) -> Result<Capture, MuxError> {
+        if lines == 0
+            || lines > MAX_CAPTURE_LINES
+            || max_bytes == 0
+            || max_bytes > MAX_CAPTURE_BYTES
+        {
+            return Err(MuxError::Protocol("pane read bounds exceeded".into()));
+        }
+        if &self.current_target_async().await? != expected {
+            return Err(MuxError::IdentityChanged("Herdr target changed".into()));
+        }
+        #[derive(Serialize)]
+        struct Params<'a> {
+            workspace_id: &'a str,
+            tab_id: &'a str,
+            pane_id: &'a str,
+            max_lines: usize,
+            max_bytes: usize,
+            recent_unwrapped: bool,
+            detect_state: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReadResult {
+            text: String,
+            bytes: usize,
+            truncated: bool,
+        }
+        let started = Instant::now();
+        let result: ReadResult = self
+            .call_async(
+                "pane_read",
+                Params {
+                    workspace_id: &self.context.workspace_id,
+                    tab_id: &self.context.tab_id,
+                    pane_id: &self.context.pane_id,
+                    max_lines: lines,
+                    max_bytes,
+                    recent_unwrapped: true,
+                    detect_state: true,
+                },
+            )
+            .await?;
+        if result.bytes > max_bytes || result.text.len() != result.bytes {
+            return Err(MuxError::Protocol(
+                "pane read violated byte contract".into(),
+            ));
+        }
+        if &self.current_target_async().await? != expected {
+            return Err(MuxError::IdentityChanged("Herdr target changed".into()));
+        }
+        Ok(Capture {
+            text: result.text,
+            bytes: result.bytes,
+            truncated: result.truncated,
+            elapsed: started.elapsed(),
+        })
+    }
+
     pub fn notify(
         &self,
         identity: &MuxIdentity,

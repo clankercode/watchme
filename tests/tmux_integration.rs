@@ -2,6 +2,8 @@ use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
 
+use watchme::daemon::{GenericObserver, Observer};
+use watchme::model::{EventCategory, TargetIdentity, WatcherLifecycle, WatcherState};
 use watchme::mux::tmux::{Tmux, TmuxSelector};
 use watchme::mux::{
     ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, SymbolicKey,
@@ -58,6 +60,56 @@ fn selector_diagnostics_reject_controls_and_accept_explicit_ids() {
     assert!(TmuxSelector::parse("pane\nother").is_err());
     assert!(TmuxSelector::parse("-L").is_err());
     assert!(TmuxSelector::parse("name:1.2").is_ok());
+}
+
+#[tokio::test]
+async fn generic_tmux_blocked_text_without_adapter_boundary_is_unknown_nonactionable() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        return;
+    }
+    let socket = format!("watchme-observe-{}", std::process::id());
+    let _guard = ServerGuard(socket.clone());
+    let status = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-s",
+            "observe",
+            "sh",
+            "-c",
+            "printf 'BLOCKED approve payment now\\n'; while :; do read -r _ || true; done",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let tmux = Tmux::for_socket_name(socket, Duration::from_secs(2));
+    let selector = TmuxSelector::parse("observe:0.0").unwrap();
+    let mut identity = tmux.resolve_selector(&selector).unwrap();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(10));
+        let next = tmux.resolve_selector(&selector).unwrap();
+        if next.process == identity.process {
+            identity = next;
+            break;
+        }
+        identity = next;
+    }
+    let target = TargetIdentity::tmux(
+        identity.server,
+        identity.server_instance,
+        identity.session_id,
+        identity.window_id,
+        identity.pane_id,
+        identity.tty,
+        identity.process,
+        None,
+    );
+    let watcher = WatcherState::new("w".into(), target, WatcherLifecycle::Observing, 0, 0);
+    let event = GenericObserver.observe(watcher).await.unwrap().unwrap();
+    assert_eq!(event.category, EventCategory::Unknown);
+    assert!(!event.category.is_actionable());
 }
 
 #[test]

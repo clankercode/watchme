@@ -61,7 +61,7 @@ impl ObservationClock for SystemObservationClock {
         )))
     }
 }
-struct GenericObserver;
+pub struct GenericObserver;
 impl Observer for GenericObserver {
     fn observe<'a>(
         &'a self,
@@ -100,20 +100,45 @@ impl Observer for GenericObserver {
                     return Err("target identity changed".into());
                 }
                 let state = herdr
-                    .agent_state_events_async(&actual, 0, 64)
+                    .agent_state_events_async(
+                        &actual,
+                        watcher.observation_schedule.herdr_after_sequence,
+                        64,
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
-                let evidence = serde_json::to_vec(&state).map_err(|error| error.to_string())?;
-                return observation_event(
+                let evidence = if state.events.is_empty() {
+                    let capture = herdr
+                        .capture_tail_async(&actual, 80, 32 * 1024)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    crate::observe::screen::sanitize_terminal(
+                        capture.text.as_bytes(),
+                        32 * 1024,
+                        80,
+                    )
+                    .into_bytes()
+                } else {
+                    serde_json::to_vec(&state).map_err(|error| error.to_string())?
+                };
+                let terminal_evidence = state.events.iter().any(|event| event.kind == "terminal");
+                let (category, terminal) = if state.events.is_empty() {
+                    (crate::model::EventCategory::Unknown, false)
+                } else {
+                    classify_herdr_state(&state.state, terminal_evidence)
+                };
+                let mut event = observation_event(
                     &watcher,
                     crate::model::SourceKind::HerdrAgentState,
                     "herdr",
                     "typed_pane_state",
-                    crate::model::EventCategory::UnknownBlocked,
+                    category,
                     0.8,
                     &evidence,
-                )
-                .map(Some);
+                )?;
+                event.terminal = terminal;
+                event.monotonic_sequence = state.events.iter().map(|event| event.sequence).max();
+                return Ok(Some(event));
             }
             tokio::task::spawn_blocking(move || generic_observe(&watcher))
                 .await
@@ -137,7 +162,7 @@ fn generic_observe(
             .ok()
             .is_some_and(|actual| actual.start_time == process.start_time);
         let category = if alive {
-            crate::model::EventCategory::UnknownBlocked
+            crate::model::EventCategory::Working
         } else {
             crate::model::EventCategory::Terminated
         };
@@ -219,7 +244,7 @@ fn generic_observe(
     let category = if clean.trim().is_empty() {
         crate::model::EventCategory::Idle
     } else {
-        crate::model::EventCategory::UnknownBlocked
+        crate::model::EventCategory::Unknown
     };
     let mut event = crate::model::Event::new(
         format!("obs-{}-{}", watcher.watcher_id, watcher.revision),
@@ -241,6 +266,21 @@ fn generic_observe(
     .map_err(|error| error.to_string())?;
     event.session_id = session.clone();
     Ok(Some(event))
+}
+
+pub fn classify_herdr_state(
+    state: &str,
+    terminal_evidence: bool,
+) -> (crate::model::EventCategory, bool) {
+    use crate::model::EventCategory;
+    match (state, terminal_evidence) {
+        ("working", _) => (EventCategory::Working, false),
+        ("idle", _) => (EventCategory::Idle, false),
+        ("waiting", _) => (EventCategory::WaitingForTool, false),
+        ("terminated", true) => (EventCategory::Terminated, true),
+        ("blocked", true) => (EventCategory::BlockedGoal, true),
+        _ => (EventCategory::Unknown, false),
+    }
 }
 
 fn observation_event(
@@ -612,7 +652,7 @@ pub async fn run_observation_monitor_with_clock(
             }
             due
         };
-        for (watcher, next_schedule) in due {
+        for (watcher, mut next_schedule) in due {
             let event = match tokio::time::timeout(
                 Duration::from_secs(5),
                 observer.observe(watcher.clone()),
@@ -623,6 +663,28 @@ pub async fn run_observation_monitor_with_clock(
                 Err(_) => Err("observation timed out".into()),
             };
             if let Ok(event) = event {
+                if let Some(sequence) = event.as_ref().and_then(|event| event.monotonic_sequence) {
+                    next_schedule.herdr_after_sequence = sequence;
+                }
+                if let Some(event) = event.as_ref()
+                    && event.source.kind == crate::model::SourceKind::ScreenDetection
+                {
+                    if event.category.is_actionable() {
+                        if next_schedule.screen_fingerprint.as_deref()
+                            == Some(&event.evidence_fingerprint)
+                        {
+                            next_schedule.screen_stable_count =
+                                next_schedule.screen_stable_count.saturating_add(1);
+                        } else {
+                            next_schedule.screen_fingerprint =
+                                Some(event.evidence_fingerprint.clone());
+                            next_schedule.screen_stable_count = 1;
+                        }
+                    } else {
+                        next_schedule.screen_fingerprint = None;
+                        next_schedule.screen_stable_count = 0;
+                    }
+                }
                 let mut guard = registry.lock().await;
                 let _ = guard.commit_observation(
                     &watcher.watcher_id,

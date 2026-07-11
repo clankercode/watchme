@@ -54,7 +54,8 @@ fn contradicts(a: EventCategory, b: EventCategory) -> bool {
     a != b
         && matches!(
             a,
-            EventCategory::Working
+            EventCategory::Unknown
+                | EventCategory::Working
                 | EventCategory::Idle
                 | EventCategory::Recovered
                 | EventCategory::HumanIntervention

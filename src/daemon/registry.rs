@@ -103,8 +103,19 @@ impl Registry {
         &mut self,
         watcher: WatcherState,
     ) -> Result<RegistrationOutcome, RegistryError> {
-        if let Some(existing) = self.watchers.get(&watcher.watcher_id) {
+        if let Some(existing) = self.watchers.get(&watcher.watcher_id).cloned() {
             if stable_target_eq(&existing.target, &watcher.target) {
+                if existing.target.needs_revalidation() && !watcher.target.needs_revalidation() {
+                    let mut updated = self.watchers.clone();
+                    let upgraded = updated
+                        .get_mut(&watcher.watcher_id)
+                        .ok_or_else(|| RegistryError::Unknown(watcher.watcher_id.clone()))?;
+                    upgraded.target = watcher.target;
+                    upgraded.revision = next_revision(upgraded)?;
+                    upgraded.updated_at_unix_ms = watcher.updated_at_unix_ms;
+                    self.persist_watchers(&updated)?;
+                    self.watchers = updated;
+                }
                 return Ok(RegistrationOutcome::Existing(existing.watcher_id.clone()));
             }
             return Err(RegistryError::IdCollision(watcher.watcher_id));
@@ -293,7 +304,13 @@ impl Registry {
                         .map_err(|reason| RegistryError::Corrupt(reason.into()))?;
                     watcher.lifecycle = WatcherLifecycle::Observing;
                 }
-                if event.category.is_actionable() && machine.state() == RecoveryState::Observing {
+                let screen_is_stable = event.source.kind
+                    != crate::model::SourceKind::ScreenDetection
+                    || watcher.observation_schedule.screen_stable_count >= 2;
+                if event.category.is_actionable()
+                    && screen_is_stable
+                    && machine.state() == RecoveryState::Observing
+                {
                     machine
                         .apply(RecoveryCommand::Confirm {
                             fingerprint: event.evidence_fingerprint.clone(),
