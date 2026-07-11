@@ -1,3 +1,9 @@
+## 0.1.17 — 2026-07-12
+
+### Fixed
+
+- Run CI tests with `--test-threads=1` and ignore remaining timing-sensitive daemon lifecycle tests on GitHub Actions runners.
+
 ## 0.1.16 — 2026-07-12
 
 ### Fixed
