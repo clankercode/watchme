@@ -1,7 +1,7 @@
 #[derive(Default)]
 pub struct TerminalSanitizer {
     state: EscapeState,
-    utf8_remaining: u8,
+    utf8_pending: Vec<u8>,
 }
 #[derive(Default)]
 enum EscapeState {
@@ -17,16 +17,22 @@ impl TerminalSanitizer {
         let mut out = Vec::with_capacity(input.len().min(max_bytes));
         let mut lines = 1;
         for &byte in input {
-            if matches!(self.state, EscapeState::Text) && self.utf8_remaining > 0 {
+            if matches!(self.state, EscapeState::Text) && !self.utf8_pending.is_empty() {
                 if (0x80..=0xbf).contains(&byte) {
-                    if out.len() < max_bytes {
-                        out.push(byte);
+                    self.utf8_pending.push(byte);
+                    let expected = utf8_sequence_len(self.utf8_pending[0]);
+                    if self.utf8_pending.len() == expected {
+                        if std::str::from_utf8(&self.utf8_pending).is_ok()
+                            && out.len() + expected <= max_bytes
+                        {
+                            out.extend_from_slice(&self.utf8_pending);
+                        }
+                        self.utf8_pending.clear();
                     }
-                    self.utf8_remaining -= 1;
                     continue;
                 }
                 // A malformed sequence cannot consume a following control byte.
-                self.utf8_remaining = 0;
+                self.utf8_pending.clear();
             }
             match self.state {
                 EscapeState::Text => match byte {
@@ -46,27 +52,13 @@ impl TerminalSanitizer {
                         }
                     }
                     0xc2..=0xdf => {
-                        if out.len() < max_bytes {
-                            out.push(byte);
-                            self.utf8_remaining = 1;
-                        }
+                        self.utf8_pending.push(byte);
                     }
                     0xe0..=0xef => {
-                        if out.len() < max_bytes {
-                            out.push(byte);
-                            self.utf8_remaining = 2;
-                        }
+                        self.utf8_pending.push(byte);
                     }
                     0xf0..=0xf4 => {
-                        if out.len() < max_bytes {
-                            out.push(byte);
-                            self.utf8_remaining = 3;
-                        }
-                    }
-                    0xa0..=0xbf => {
-                        if out.len() < max_bytes {
-                            out.push(byte)
-                        }
+                        self.utf8_pending.push(byte);
                     }
                     _ => {}
                 },
@@ -109,6 +101,15 @@ impl TerminalSanitizer {
             sanitized.truncate(boundary);
         }
         sanitized
+    }
+}
+
+fn utf8_sequence_len(lead: u8) -> usize {
+    match lead {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
     }
 }
 
@@ -195,24 +196,22 @@ pub fn trusted_tmux_screen(capture: &str, chrome: &TmuxChrome) -> LiveScreen {
     let raw: Vec<&str> = capture.lines().collect();
     let boundary = chrome
         .is_supported()
-        .then(|| raw.iter().rposition(|line| *line == chrome.boundary_marker))
-        .flatten();
+        .then_some(chrome.first_live_line)
+        .filter(|first_live_line| *first_live_line < raw.len());
     let mut fenced = false;
     let lines = raw
         .iter()
         .enumerate()
         .map(|(index, text)| {
             let trimmed = text.trim_start();
-            let provenance = if Some(index) == boundary {
-                LineProvenance::Chrome
-            } else if trimmed.starts_with("```") {
+            let provenance = if trimmed.starts_with("```") {
                 fenced = !fenced;
                 LineProvenance::CodeFence
             } else if fenced {
                 LineProvenance::CodeFence
             } else if trimmed.starts_with('>') || trimmed.starts_with('│') {
                 LineProvenance::Quote
-            } else if boundary.is_some_and(|value| index > value) {
+            } else if boundary.is_some_and(|value| index >= value) {
                 LineProvenance::LiveOutput
             } else {
                 LineProvenance::Transcript
@@ -223,7 +222,7 @@ pub fn trusted_tmux_screen(capture: &str, chrome: &TmuxChrome) -> LiveScreen {
             }
         })
         .collect();
-    LiveScreen::from_adapter(lines, boundary.map(|value| value + 1), boundary.is_some())
+    LiveScreen::from_adapter(lines, boundary, boundary.is_some())
 }
 pub fn sanitize_terminal(input: &[u8], max_bytes: usize, max_lines: usize) -> String {
     TerminalSanitizer::default().feed(input, max_bytes, max_lines)
@@ -258,13 +257,17 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TmuxChrome {
+pub struct TrustedScreenBoundary {
     pub adapter: String,
     pub version: u16,
-    pub boundary_marker: String,
+    /// Zero-based first line of the live region, supplied by the adapter rather
+    /// than inferred from terminal content.
+    pub first_live_line: usize,
 }
-impl TmuxChrome {
+impl TrustedScreenBoundary {
     fn is_supported(&self) -> bool {
-        !self.adapter.is_empty() && self.version == 1 && !self.boundary_marker.is_empty()
+        !self.adapter.is_empty() && self.version == 1
     }
 }
+
+pub type TmuxChrome = TrustedScreenBoundary;

@@ -75,6 +75,33 @@ fn jsonl_reader_handles_partial_malformed_truncate_and_replace() {
 }
 
 #[test]
+fn jsonl_reader_detects_same_inode_copy_truncate_and_regrow() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, b"{\"old\":1}\n{\"old\":2}\n").unwrap();
+    let mut cursor = JsonlCursor::new(path.clone(), ReadLimits::default());
+    assert_eq!(cursor.read_new().unwrap().records.len(), 2);
+
+    let inode_before = fs::metadata(&path).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{\"new\":1}\n{\"new\":2}\n{\"new\":3}\n")
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(inode_before.ino(), fs::metadata(&path).unwrap().ino());
+    }
+
+    let batch = cursor.read_new().unwrap();
+    assert_eq!(batch.records.len(), 3);
+    assert_eq!(batch.records[0]["new"], 1);
+}
+
+#[test]
 fn sanitizer_strips_terminal_protocol_and_bounds_output() {
     let hostile =
         b"ok\x1b[31mred\x1b[0m\x1b]52;c;SECRET\x07\x1bPpayload\x1b\\\r\n\xe2\x80\xaeevil\0end";
@@ -101,6 +128,22 @@ fn split_sequences_and_malformed_utf8_cannot_reveal_terminal_payloads() {
             .feed(b"\x1b]52;c;SECRET\x07", 128, 4)
             .contains("SECRET")
     );
+}
+
+#[test]
+fn incremental_sanitizer_emits_only_complete_utf8_scalars() {
+    for scalar in ["¢", "€", "🦀"] {
+        let bytes = scalar.as_bytes();
+        for split in 1..bytes.len() {
+            let mut sanitizer = watchme::observe::screen::TerminalSanitizer::default();
+            assert_eq!(sanitizer.feed(&bytes[..split], 128, 4), "");
+            assert_eq!(sanitizer.feed(&bytes[split..], 128, 4), scalar);
+        }
+    }
+
+    let mut sanitizer = watchme::observe::screen::TerminalSanitizer::default();
+    assert_eq!(sanitizer.feed(&[0xe2], 128, 4), "");
+    assert_eq!(sanitizer.feed(b"\x1b]52;c;SECRET\x07safe", 128, 4), "safe");
 }
 
 #[test]
@@ -149,6 +192,8 @@ fn compiled_policy_is_deny_by_default() {
         r#"{"schema_version":"1.0","action_id":"x","type":"SHELL","reason":"x","evidence_fingerprint":"0123456789abcdef","timeout_seconds":1}"#,
     );
     assert!(unknown.is_err());
+    let mut matching_context = PolicyContext::safe();
+    matching_context.evidence_fingerprint = Some("fp".into());
     assert!(
         policy
             .authorize(
@@ -162,10 +207,80 @@ fn compiled_policy_is_deny_by_default() {
                     "fp",
                     10
                 ),
-                &PolicyContext::safe()
+                &matching_context
             )
             .is_ok()
     );
+}
+
+#[test]
+fn action_constructors_bind_and_enforce_the_supplied_evidence_fingerprint() {
+    let action = Action::send_text("a", "continue", "reason", "fresh-fingerprint");
+    assert!(action.preconditions.iter().any(|condition| {
+        condition.kind == "EVIDENCE_FINGERPRINT_MATCHES"
+            && condition.value.as_ref().and_then(serde_json::Value::as_str)
+                == Some("fresh-fingerprint")
+    }));
+
+    let policy = CompiledPolicy;
+    let mut context = PolicyContext::safe();
+    context.evidence_fingerprint = Some("stale-fingerprint".into());
+    assert_eq!(
+        policy.authorize(&action, &context),
+        Err("declared precondition failed")
+    );
+    context.evidence_fingerprint = Some("fresh-fingerprint".into());
+    assert!(policy.authorize(&action, &context).is_ok());
+}
+
+#[test]
+fn policy_bounds_wait_until_against_parsed_wall_time_and_wait_budget() {
+    let action = Action::new(
+        "wait",
+        ActionKind::WaitUntil {
+            at: "2026-07-11T00:01:00Z".into(),
+        },
+        "bounded wait",
+        "fp",
+        60,
+    );
+    let mut context = PolicyContext::safe();
+    context.evidence_fingerprint = Some("fp".into());
+    context.wall_time_rfc3339 = Some("2026-07-11T00:00:00Z".into());
+    context.cumulative_wait_remaining_seconds = 60;
+    assert!(CompiledPolicy.authorize(&action, &context).is_ok());
+    context.cumulative_wait_remaining_seconds = 59;
+    assert_eq!(
+        CompiledPolicy.authorize(&action, &context),
+        Err("cumulative wait budget denied")
+    );
+    context.wall_time_rfc3339 = Some("invalid".into());
+    assert!(CompiledPolicy.authorize(&action, &context).is_err());
+}
+
+#[test]
+fn alternate_planner_escalation_requires_independent_provider_and_planner_budgets() {
+    let action = Action::new(
+        "alternate",
+        ActionKind::Escalate {
+            level: "alternate_planner".into(),
+        },
+        "independent review",
+        "fp",
+        30,
+    );
+    let mut context = PolicyContext::safe();
+    context.evidence_fingerprint = Some("fp".into());
+    context.failed_provider_family = Some("provider-a".into());
+    context.planner_provider_family = Some("provider-b".into());
+    assert!(CompiledPolicy.authorize(&action, &context).is_ok());
+    context.planner_provider_family = Some("provider-a".into());
+    assert!(CompiledPolicy.authorize(&action, &context).is_err());
+    context.planner_provider_family = None;
+    assert!(CompiledPolicy.authorize(&action, &context).is_err());
+    context.planner_provider_family = Some("provider-b".into());
+    context.planner_calls_remaining = 0;
+    assert!(CompiledPolicy.authorize(&action, &context).is_err());
 }
 
 #[test]

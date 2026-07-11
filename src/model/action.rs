@@ -78,14 +78,17 @@ impl Action {
         id: impl Into<String>,
         kind: ActionKind,
         reason: impl Into<String>,
-        _fingerprint: impl Into<String>,
+        fingerprint: impl Into<String>,
         timeout_seconds: u64,
     ) -> Self {
         Self {
             action_id: id.into(),
             kind,
             reason: reason.into(),
-            preconditions: Vec::new(),
+            preconditions: vec![Condition {
+                kind: "EVIDENCE_FINGERPRINT_MATCHES".into(),
+                value: Some(serde_json::Value::String(fingerprint.into())),
+            }],
             expected_outcomes: vec![Condition {
                 kind: "NO_STATE_CHANGE_EXPECTED".into(),
                 value: None,

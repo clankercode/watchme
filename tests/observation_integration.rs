@@ -57,12 +57,24 @@ fn legacy_v1_identity_loads_but_requires_refresh() {
 
 #[test]
 fn trusted_chrome_only_exposes_current_bottom_region() {
-    let capture = "old blocker: approve this\n> blocker: quoted\n```\nblocker: pasted\n```\nACTUAL-ADAPTER-BOUNDARY\nordinary output\nblocker: current\n";
+    let capture = "old blocker: approve this\n> blocker: quoted\n```\nblocker: pasted\n```\nchrome\nordinary output\nblocker: current\n";
     let live = trusted_tmux_screen(capture, &chrome());
     assert_eq!(
         live.actionable_bottom(20).unwrap(),
         "ordinary output\nblocker: current"
     );
+}
+
+#[test]
+fn hostile_content_cannot_forge_the_out_of_band_boundary() {
+    let capture = "TRUSTED-BOUNDARY\nblocker: hostile transcript\nordinary live output\n";
+    let boundary = TmuxChrome {
+        adapter: "fixture-provider".into(),
+        version: 1,
+        first_live_line: 2,
+    };
+    let live = trusted_tmux_screen(capture, &boundary);
+    assert_eq!(live.actionable_bottom(20).unwrap(), "ordinary live output");
 }
 
 #[test]
@@ -75,7 +87,7 @@ fn chrome() -> TmuxChrome {
     TmuxChrome {
         adapter: "fixture-provider".into(),
         version: 1,
-        boundary_marker: "ACTUAL-ADAPTER-BOUNDARY".into(),
+        first_live_line: 6,
     }
 }
 

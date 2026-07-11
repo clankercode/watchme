@@ -63,8 +63,10 @@ impl CompiledPolicy {
         {
             return Err("revalidation required");
         }
-        if context.failed_provider_family.is_some()
-            && context.failed_provider_family == context.planner_provider_family
+        if matches!(action.kind, ActionKind::Escalate { ref level } if level != "human_required")
+            && (context.failed_provider_family.is_none()
+                || context.planner_provider_family.is_none()
+                || context.failed_provider_family == context.planner_provider_family)
         {
             return Err("same-provider planner denied");
         }
@@ -74,6 +76,15 @@ impl CompiledPolicy {
         if matches!(action.kind, ActionKind::WaitDuration { duration_seconds } if duration_seconds > context.cumulative_wait_remaining_seconds)
         {
             return Err("cumulative wait budget denied");
+        }
+        if let ActionKind::WaitUntil { at } = &action.kind {
+            let Some(wait_seconds) = wait_until_seconds(at, context.wall_time_rfc3339.as_deref())
+            else {
+                return Err("valid wall time required");
+            };
+            if wait_seconds > context.cumulative_wait_remaining_seconds {
+                return Err("cumulative wait budget denied");
+            }
         }
         if matches!(action.kind, ActionKind::Escalate { ref level } if level != "human_required")
             && context.planner_calls_remaining == 0
@@ -94,6 +105,7 @@ impl CompiledPolicy {
             return Err("higher-ranked contradiction");
         }
         match &action.kind {
+            ActionKind::WaitUntil { .. } => Ok(()),
             ActionKind::WaitDuration { duration_seconds } if *duration_seconds <= 86400 => Ok(()),
             ActionKind::Capture { max_lines, .. } if *max_lines <= 300 => Ok(()),
             ActionKind::CheckStatus { .. }
@@ -101,6 +113,7 @@ impl CompiledPolicy {
             | ActionKind::StopWatching
             | ActionKind::Noop => Ok(()),
             ActionKind::Escalate { level } if level == "human_required" => Ok(()),
+            ActionKind::Escalate { level } if level == "alternate_planner" => Ok(()),
             ActionKind::SendKeys { keys }
                 if context.composer_empty
                     && keys.iter().all(|k| {
@@ -127,6 +140,12 @@ impl CompiledPolicy {
             _ => Err("action denied by compiled policy"),
         }
     }
+}
+
+fn wait_until_seconds(at: &str, now: Option<&str>) -> Option<u64> {
+    let at = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    let now = chrono::DateTime::parse_from_rfc3339(now?).ok()?;
+    u64::try_from((at - now).num_seconds()).ok()
 }
 fn precondition_holds(condition: &crate::model::Condition, context: &PolicyContext) -> bool {
     let text = || condition.value.as_ref().and_then(serde_json::Value::as_str);
