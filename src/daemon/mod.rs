@@ -27,6 +27,40 @@ pub trait Observer: Send + Sync + 'static {
         watcher: crate::model::WatcherState,
     ) -> Pin<Box<dyn Future<Output = Result<Option<crate::model::Event>, String>> + Send + 'a>>;
 }
+pub trait ObservationClock: Send + Sync + 'static {
+    fn wall_now_ms(&self) -> u64;
+    fn mono_now_ms(&self) -> u64;
+    fn sleep_until_mono<'a>(
+        &'a self,
+        deadline: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+struct SystemObservationClock {
+    origin: std::time::Instant,
+}
+impl SystemObservationClock {
+    fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+        }
+    }
+}
+impl ObservationClock for SystemObservationClock {
+    fn wall_now_ms(&self) -> u64 {
+        now_ms()
+    }
+    fn mono_now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+    fn sleep_until_mono<'a>(
+        &'a self,
+        deadline: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(tokio::time::sleep(Duration::from_millis(
+            deadline.saturating_sub(self.mono_now_ms()),
+        )))
+    }
+}
 struct GenericObserver;
 impl Observer for GenericObserver {
     fn observe<'a>(
@@ -394,11 +428,25 @@ pub async fn run_observation_monitor(
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
     observer: std::sync::Arc<dyn Observer>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    run_observation_monitor_with_clock(
+        registry,
+        observer,
+        std::sync::Arc::new(SystemObservationClock::new()),
+        0,
+    )
+    .await
+}
+pub async fn run_observation_monitor_with_clock(
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+    observer: std::sync::Arc<dyn Observer>,
+    clock: std::sync::Arc<dyn ObservationClock>,
+    max_iterations: usize,
+) {
+    let mut iterations = 0;
+    let mut runtime_due = std::collections::BTreeMap::<String, u64>::new();
     loop {
-        interval.tick().await;
-        let now = now_ms();
+        let now = clock.wall_now_ms();
+        let mono = clock.mono_now_ms();
         let due = {
             let mut guard = registry.lock().await;
             let mut due = Vec::new();
@@ -413,10 +461,14 @@ pub async fn run_observation_monitor(
                 }
                 let schedule = &watcher.observation_schedule;
                 let clock_discontinuity = schedule.next_due_wall_ms > now.saturating_add(65_000);
-                if schedule.event_wake_pending
-                    || schedule.next_due_wall_ms <= now
-                    || clock_discontinuity
-                {
+                let due_mono = *runtime_due
+                    .entry(watcher.watcher_id.clone())
+                    .or_insert_with(|| {
+                        mono.saturating_add(
+                            schedule.next_due_wall_ms.saturating_sub(now).min(65_000),
+                        )
+                    });
+                if schedule.event_wake_pending || mono >= due_mono || clock_discontinuity {
                     let mut next = schedule.clone();
                     next.last_check_wall_ms = Some(now);
                     next.event_wake_pending = false;
@@ -430,6 +482,10 @@ pub async fn run_observation_monitor(
                     let jitter = (hash % 11) as i64 - 5;
                     next.next_due_wall_ms =
                         now.saturating_add_signed((60_000i64 + jitter * 1_000).max(1));
+                    runtime_due.insert(
+                        watcher.watcher_id.clone(),
+                        mono.saturating_add_signed((60_000i64 + jitter * 1_000).max(1)),
+                    );
                     if guard
                         .persist_observation_schedule(&watcher.watcher_id, next, now)
                         .is_ok()
@@ -441,17 +497,26 @@ pub async fn run_observation_monitor(
             due
         };
         for watcher in due {
-            if let Ok(Ok(Some(event))) =
-                tokio::time::timeout(Duration::from_secs(5), observer.observe(watcher.clone()))
-                    .await
+            let event = match tokio::time::timeout(
+                Duration::from_secs(5),
+                observer.observe(watcher.clone()),
+            )
+            .await
             {
-                let _ = registry.lock().await.persist_observation_event(
-                    &watcher.watcher_id,
-                    event,
-                    now_ms(),
-                );
-            }
+                Ok(Ok(event)) => event,
+                _ => None,
+            };
+            let _ = registry.lock().await.complete_observation(
+                &watcher.watcher_id,
+                event,
+                clock.wall_now_ms(),
+            );
         }
+        iterations += 1;
+        if max_iterations > 0 && iterations >= max_iterations {
+            return;
+        }
+        clock.sleep_until_mono(mono.saturating_add(1_000)).await;
     }
 }
 

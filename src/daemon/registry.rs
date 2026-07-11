@@ -236,6 +236,26 @@ impl Registry {
         self.watchers = updated;
         Ok(())
     }
+    pub fn complete_observation(
+        &mut self,
+        id: &str,
+        event: Option<crate::model::Event>,
+        now: u64,
+    ) -> Result<(), RegistryError> {
+        let mut updated = self.watchers.clone();
+        let watcher = updated
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::Unknown(id.into()))?;
+        if let Some(event) = event {
+            watcher.last_observation = Some(event)
+        }
+        watcher.observation_schedule.last_wake_fingerprint = None;
+        watcher.revision = next_revision(watcher)?;
+        watcher.updated_at_unix_ms = now;
+        self.persist_watchers(&updated)?;
+        self.watchers = updated;
+        Ok(())
+    }
     pub fn wake_observation(
         &mut self,
         id: &str,
