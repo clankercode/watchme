@@ -11,7 +11,7 @@ use watchme::recovery::actuator::{
 };
 use watchme::recovery::transaction::{
     ActionPhase, ActionRecord, ActionStore, Clock, EvidenceReader, LiveEvidence, OwnerIdentity,
-    ProcessProbe, RecoveryContext, Transaction, TransactionError,
+    PersistedEvidenceReader, ProcessProbe, RecoveryContext, Transaction, TransactionError,
 };
 
 #[derive(Clone, Default)]
@@ -542,4 +542,16 @@ fn every_non_input_action_dispatches_to_a_concrete_service() {
     let calls = services.0.lock().unwrap();
     assert_eq!(calls.len(), 7, "NOOP alone has no external service effect");
     assert!(calls.iter().any(|call| call == "stop"));
+}
+
+#[test]
+fn persisted_evidence_reader_seeds_current_event_then_reads_live_observer() {
+    let seed = live(EventCategory::BlockedGoal, &"b".repeat(64), 0.8);
+    let observer = evidence(vec![live(EventCategory::Working, &"c".repeat(64), 0.8)]);
+    let reader = PersistedEvidenceReader::new(seed.clone(), observer);
+    assert_eq!(reader.read().unwrap().event, seed.event);
+    assert_eq!(
+        reader.read().unwrap().event.category,
+        EventCategory::Working
+    );
 }

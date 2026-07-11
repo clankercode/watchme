@@ -99,6 +99,30 @@ pub struct LiveEvidence {
 pub trait EvidenceReader {
     fn read(&self) -> Result<LiveEvidence, String>;
 }
+/// Bridges a registry-persisted current event to a live observer. The first
+/// read is exactly the durable baseline; every later read is fresh evidence.
+pub struct PersistedEvidenceReader<E> {
+    persisted: LiveEvidence,
+    live: E,
+    seeded: std::sync::atomic::AtomicBool,
+}
+impl<E> PersistedEvidenceReader<E> {
+    pub const fn new(persisted: LiveEvidence, live: E) -> Self {
+        Self {
+            persisted,
+            live,
+            seeded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+impl<E: EvidenceReader> EvidenceReader for PersistedEvidenceReader<E> {
+    fn read(&self) -> Result<LiveEvidence, String> {
+        if !self.seeded.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(self.persisted.clone());
+        }
+        self.live.read()
+    }
+}
 pub trait Clock {
     fn monotonic_ms(&self) -> u64;
     fn wall_time_rfc3339(&self) -> String;
