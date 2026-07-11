@@ -1,0 +1,91 @@
+{
+  "schema_version": "1.0",
+  "plan_id": "plan-demo-001",
+  "generated_at": "2026-07-11T10:00:00Z",
+  "valid_until": "2026-07-11T10:05:00Z",
+  "target": {
+    "watcher_id": "watcher-demo-001",
+    "process_pid": 4242,
+    "process_start_time": "2026-07-11T09:00:00Z",
+    "mux_kind": "tmux",
+    "mux_server_id": "test-socket",
+    "pane_id": "%7",
+    "agent_id": "codex",
+    "session_id": "session-demo",
+    "evidence_fingerprint": "0123456789abcdef0123456789abcdef"
+  },
+  "diagnosis": {
+    "category": "blocked_goal",
+    "confidence": 0.96,
+    "summary": "The durable Codex goal is blocked after a terminal capacity event; wait briefly and use the compiled goal-resume command if the state remains current.",
+    "failed_provider_family": "openai",
+    "planner_provider_family": "anthropic",
+    "human_required": false,
+    "uncertainties": []
+  },
+  "actions": [
+    {
+      "type": "WAIT_DURATION",
+      "action_id": "wait-001",
+      "reason": "Avoid retrying immediately after a capacity event.",
+      "preconditions": [
+        { "kind": "TARGET_IDENTITY_MATCHES" },
+        { "kind": "PROCESS_ALIVE" },
+        { "kind": "EVIDENCE_FINGERPRINT_MATCHES", "value": "0123456789abcdef0123456789abcdef" }
+      ],
+      "expected_outcomes": [
+        { "kind": "NO_STATE_CHANGE_EXPECTED" }
+      ],
+      "timeout_seconds": 90,
+      "duration_seconds": 60
+    },
+    {
+      "type": "SEND_TEXT",
+      "action_id": "text-001",
+      "reason": "Request the known Codex durable-goal resume operation.",
+      "preconditions": [
+        { "kind": "TARGET_IDENTITY_MATCHES" },
+        { "kind": "PROCESS_ALIVE" },
+        { "kind": "EVIDENCE_FINGERPRINT_MATCHES", "value": "0123456789abcdef0123456789abcdef" },
+        { "kind": "COMPOSER_EMPTY" },
+        { "kind": "GOAL_STATE_IS", "value": "blocked" },
+        { "kind": "NO_HUMAN_INTERVENTION" }
+      ],
+      "expected_outcomes": [
+        { "kind": "GOAL_ACTIVE_OR_PURSUING" }
+      ],
+      "timeout_seconds": 120,
+      "text": "/goal resume"
+    },
+    {
+      "type": "SEND_KEYS",
+      "action_id": "keys-001",
+      "reason": "Submit the already validated slash command.",
+      "preconditions": [
+        { "kind": "TARGET_IDENTITY_MATCHES" },
+        { "kind": "PROCESS_ALIVE" },
+        { "kind": "EVIDENCE_FINGERPRINT_MATCHES", "value": "0123456789abcdef0123456789abcdef" },
+        { "kind": "NO_HUMAN_INTERVENTION" }
+      ],
+      "expected_outcomes": [
+        { "kind": "GOAL_ACTIVE_OR_PURSUING" }
+      ],
+      "timeout_seconds": 120,
+      "keys": ["ENTER"]
+    },
+    {
+      "type": "CHECK_STATUS",
+      "action_id": "check-001",
+      "reason": "Verify the durable goal resumed instead of assuming the key input worked.",
+      "preconditions": [
+        { "kind": "TARGET_IDENTITY_MATCHES" },
+        { "kind": "PROCESS_ALIVE" }
+      ],
+      "expected_outcomes": [
+        { "kind": "GOAL_ACTIVE_OR_PURSUING" }
+      ],
+      "timeout_seconds": 120,
+      "check": { "kind": "GOAL_STATE", "value": "active_or_pursuing" }
+    }
+  ]
+}
