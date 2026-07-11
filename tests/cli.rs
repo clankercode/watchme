@@ -42,22 +42,26 @@ fn start_is_not_a_command() {
 
 #[test]
 fn administrative_commands_parse() {
+    // Operability commands must not fall through to the generic unimplemented
+    // stub: they succeed, or return a specific actionable error.
     for arguments in [
         &["explain", "watcher-1"][..],
         &["snapshot", "watcher-1", "--redacted"],
-        &["logs", "watcher-1", "--follow"],
+        &["logs", "watcher-1"],
         &["doctor", "--strict"],
         &["providers"],
     ] {
-        Command::cargo_bin("watchme")
+        let output = Command::cargo_bin("watchme")
             .expect("binary exists")
             .args(arguments)
-            .assert()
-            .failure()
-            .stdout(predicate::str::is_empty())
-            .stderr(predicate::eq(
-                "watchme: capability unavailable: this administrative capability is not implemented yet\n",
-            ));
+            .output()
+            .expect("command runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("not implemented yet"),
+            "{} still unimplemented: {stderr}",
+            arguments[0]
+        );
     }
 
     for arguments in [

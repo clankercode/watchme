@@ -1,13 +1,16 @@
 pub mod agents;
+pub mod audit;
 pub mod claude_attachment;
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod doctor;
 pub mod error;
 pub mod hooks;
 pub mod ipc;
 pub mod model;
 pub mod mux;
+pub mod notify;
 pub mod observe;
 pub mod paths;
 pub mod planner;

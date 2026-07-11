@@ -73,8 +73,30 @@ impl crate::recovery::actuator::RuntimeServices for DaemonRuntimeServices {
         Ok(target_process_is_alive(&watcher.target))
     }
 
-    fn notify(&self, _: &str, _: &str) -> Result<(), String> {
-        Err("notification requires a target adapter".into())
+    fn notify(&self, severity: &str, message: &str) -> Result<(), String> {
+        let config = crate::config::NotificationsConfig::default();
+        let desktop = crate::notify::DesktopBackend::system_default();
+        // Use the cleanup-safe path so notification failures never panic or
+        // block recovery/shutdown work.
+        let outcome = crate::notify::notify_during_cleanup(
+            &config,
+            &crate::notify::NotifyRequest {
+                title: format!("watchme:{severity}"),
+                body: message.to_owned(),
+            },
+            crate::notify::NotifyTarget {
+                herdr: None,
+                desktop: Some(&desktop),
+                stderr_write: Some(&|line: &str| {
+                    eprint!("{line}");
+                    Ok(())
+                }),
+            },
+        );
+        match outcome {
+            crate::notify::NotificationOutcome::Delivered { .. } => Ok(()),
+            crate::notify::NotificationOutcome::Suppressed { reason } => Err(reason),
+        }
     }
 
     fn escalate(&self, level: &str) -> Result<(), String> {

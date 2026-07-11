@@ -5,9 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
+use watchme::audit::{
+    AuditLog, DecisionChain, RetentionPolicy, append_decision, explain_decision,
+    load_decision_chains,
+};
 use watchme::client::ResolvedRegistration;
 use watchme::config::Config;
 use watchme::daemon;
+use watchme::doctor::{list_providers, run_doctor};
 use watchme::ipc::protocol::{Request, Response};
 use watchme::ipc::{read_response, write_request};
 use watchme::mux::Multiplexer;
@@ -242,7 +247,11 @@ pub fn run() -> Result<(), CliFailure> {
             command: DaemonCommand::Stop,
         }) => admin(Request::Shutdown, false),
         Some(Command::Config { command }) => config_command(command).map_err(Into::into),
-        Some(command) => Err(unavailable(command)),
+        Some(Command::Explain(options)) => explain_command(options).map_err(Into::into),
+        Some(Command::Snapshot(options)) => snapshot_command(options).map_err(Into::into),
+        Some(Command::Logs(options)) => logs_command(options).map_err(Into::into),
+        Some(Command::Doctor(options)) => doctor_command(options),
+        Some(Command::Providers(options)) => providers_command(options).map_err(Into::into),
     }
 }
 
@@ -267,6 +276,238 @@ fn config_command(command: ConfigCommand) -> Result<(), WatchmeError> {
             Ok(())
         }
     }
+}
+
+fn load_config(paths: &WatchmePaths) -> Result<Config, WatchmeError> {
+    let config_path = paths.config_dir().join("config.toml");
+    Config::load_layers([config_path.as_path()])
+        .map_err(|error| WatchmeError::Configuration(error.to_string()))
+}
+
+fn audit_log(paths: &WatchmePaths) -> Result<AuditLog, WatchmeError> {
+    let path = paths
+        .state_file("audit.jsonl")
+        .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+    AuditLog::open(path).map_err(|error| WatchmeError::Configuration(error.to_string()))
+}
+
+fn explain_command(options: OptionalId) -> Result<(), WatchmeError> {
+    let paths = runtime_paths().map_err(|failure| failure.error)?;
+    let _ = paths.create_owner_only();
+    let mut log = audit_log(&paths)?;
+    let chains = load_decision_chains(&mut log)
+        .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+    let chain = explain_decision(&chains, options.id.as_deref()).map_err(|message| {
+        WatchmeError::Configuration(format!("{message}; daemon may be down or audit empty"))
+    })?;
+    print_decision_chain(&chain);
+    Ok(())
+}
+
+fn print_decision_chain(chain: &DecisionChain) {
+    println!("watcher: {}", chain.watcher_id);
+    println!("detector: {}", chain.detector);
+    println!("evidence: {}", chain.evidence);
+    println!("state: {}", chain.state);
+    println!("policy_decision: {}", chain.policy_decision);
+    println!("attempted_action: {}", chain.attempted_action);
+    println!("verification: {}", chain.verification);
+}
+
+fn snapshot_command(options: SnapshotOptions) -> Result<(), WatchmeError> {
+    let paths = runtime_paths().map_err(|failure| failure.error)?;
+    let _ = paths.create_owner_only();
+    let id = options
+        .id
+        .ok_or_else(|| WatchmeError::Configuration("snapshot requires a watcher ID".into()))?;
+    let snap_dir = paths.state_dir().join("snapshots");
+    let path = snap_dir.join(format!("{id}.json"));
+    if !path.exists() {
+        return Err(WatchmeError::Configuration(format!(
+            "no watcher snapshot found for {id}"
+        )));
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+    // Snapshots are always emitted redacted; --redacted is accepted for clarity.
+    let _ = options.redacted;
+    let (redacted, report) = watchme::redact::redact_json(&value, &[]);
+    let mut output = redacted;
+    if let Some(object) = output.as_object_mut() {
+        object.insert(
+            "redaction".into(),
+            serde_json::json!({
+                "performed": true,
+                "replacement_count": report.replacement_count,
+                "categories": report.categories.iter().cloned().collect::<Vec<_>>(),
+                "raw_evidence_included": false,
+            }),
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .map_err(|error| WatchmeError::Configuration(error.to_string()))?
+    );
+    Ok(())
+}
+
+fn logs_command(options: LogOptions) -> Result<(), WatchmeError> {
+    let paths = runtime_paths().map_err(|failure| failure.error)?;
+    let _ = paths.create_owner_only();
+    let config = load_config(&paths).unwrap_or_default();
+    let mut log = audit_log(&paths)?;
+    let retention = RetentionPolicy::from(&config.retention);
+    let _ = log.apply_retention(&retention, &chrono_now());
+    if options.follow {
+        return follow_logs(&mut log, options.id.as_deref());
+    }
+    let events = log
+        .read_lines(options.id.as_deref(), 200)
+        .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+    if events.is_empty() {
+        return Err(WatchmeError::Configuration(
+            "no audit events found for watcher".into(),
+        ));
+    }
+    for event in events {
+        println!(
+            "{}",
+            serde_json::to_string(&event)
+                .map_err(|error| WatchmeError::Configuration(error.to_string()))?
+        );
+    }
+    Ok(())
+}
+
+fn follow_logs(log: &mut AuditLog, watcher_id: Option<&str>) -> Result<(), WatchmeError> {
+    let mut offset = 0_u64;
+    // Print existing lines first, then poll for appends.
+    let existing = log
+        .read_lines(watcher_id, 200)
+        .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+    for event in &existing {
+        println!(
+            "{}",
+            serde_json::to_string(event)
+                .map_err(|error| WatchmeError::Configuration(error.to_string()))?
+        );
+    }
+    if let Ok(meta) = std::fs::metadata(log.path()) {
+        offset = meta.len();
+    }
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        let (events, next) = log
+            .follow_from(offset, watcher_id, 64 * 1024)
+            .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+        offset = next;
+        for event in events {
+            println!(
+                "{}",
+                serde_json::to_string(&event)
+                    .map_err(|error| WatchmeError::Configuration(error.to_string()))?
+            );
+        }
+    }
+}
+
+fn doctor_command(options: DoctorOptions) -> Result<(), CliFailure> {
+    let paths = runtime_paths()?;
+    let _ = paths.create_owner_only();
+    let config = load_config(&paths).unwrap_or_default();
+    let report = run_doctor(
+        &paths,
+        &config,
+        watchme::doctor::DoctorOptions {
+            strict: options.strict,
+            json: options.json,
+        },
+    );
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("doctor report serializable")
+        );
+    } else {
+        for check in &report.checks {
+            let status = match check.status {
+                watchme::doctor::CheckStatus::Ok => "ok",
+                watchme::doctor::CheckStatus::Warn => "warn",
+                watchme::doctor::CheckStatus::Fail => "fail",
+            };
+            println!("{status}\t{}\t{}", check.name, check.message);
+        }
+        if report.ok {
+            println!("doctor: ok");
+        } else {
+            println!("doctor: problems found");
+        }
+    }
+    if report.ok {
+        Ok(())
+    } else {
+        Err(CliFailure {
+            error: WatchmeError::Configuration("doctor reported problems".into()),
+            daemon_error: None,
+            json: false,
+        })
+    }
+}
+
+fn providers_command(options: JsonOutput) -> Result<(), WatchmeError> {
+    let paths = runtime_paths().map_err(|failure| failure.error)?;
+    let config = load_config(&paths).unwrap_or_default();
+    let providers = list_providers(&config).map_err(WatchmeError::Configuration)?;
+    if options.json {
+        #[derive(Serialize)]
+        struct Envelope<'a> {
+            schema_version: &'static str,
+            ok: bool,
+            providers: &'a [watchme::doctor::ProviderRow],
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&Envelope {
+                schema_version: SCHEMA_VERSION,
+                ok: true,
+                providers: &providers,
+            })
+            .expect("providers envelope serializable")
+        );
+    } else {
+        for provider in providers {
+            println!(
+                "{}\t{}\t{}\t{}",
+                provider.id,
+                provider.support_tier,
+                provider.readiness,
+                if provider.first_class {
+                    "first_class"
+                } else {
+                    "manifest"
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn chrono_now() -> String {
+    let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Persist a decision chain for later `explain` (daemon/recovery callers).
+#[allow(dead_code)]
+pub fn record_decision_chain(
+    paths: &WatchmePaths,
+    chain: &DecisionChain,
+) -> Result<(), WatchmeError> {
+    let mut log = audit_log(paths)?;
+    append_decision(&mut log, chain).map_err(|error| WatchmeError::Configuration(error.to_string()))
 }
 
 fn hook_lifecycle(command: crate::hook_cli::HooksCommand) -> Result<(), WatchmeError> {
@@ -533,9 +774,14 @@ impl RegistrationContextDetector for ProductionContextDetector {
             uid: current.uid,
             executable_hint: None,
         };
-        let resolved = ProcessResolver::default()
-            .resolve(&inspector, current_pid, &hints)
-            .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+        let resolved = {
+            let names = watchme::agents::manifest::ManifestRegistry::bundled()
+                .map(|registry| registry.process_match_basenames())
+                .unwrap_or_default();
+            ProcessResolver::with_manifest_names(names)
+                .resolve(&inspector, current_pid, &hints)
+                .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?
+        };
 
         if std::env::var_os("HERDR_SOCKET_PATH").is_some()
             || std::env::var_os("HERDR_WORKSPACE_ID").is_some()
@@ -833,22 +1079,6 @@ async fn within_attempt_deadline<T>(
             "daemon readiness deadline elapsed",
         )
     })?
-}
-
-fn unavailable(command: Command) -> CliFailure {
-    let json = match command {
-        Command::Status(options) => options.json,
-        Command::List(options) | Command::Providers(options) => options.json,
-        Command::Doctor(options) => options.json,
-        _ => false,
-    };
-    CliFailure {
-        error: WatchmeError::CapabilityUnavailable(
-            "this administrative capability is not implemented yet".to_owned(),
-        ),
-        daemon_error: None,
-        json,
-    }
 }
 
 #[cfg(test)]
