@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
@@ -18,10 +22,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Match Cargo version to tag
+      - name: Validate tag and match Cargo version
         shell: bash
         run: |
           set -euo pipefail
+          scripts/release-notes.sh --validate-tag "$GITHUB_REF_NAME"
           tag_version="${GITHUB_REF_NAME#v}"
           cargo_version="$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
           test -n "$cargo_version"
@@ -80,6 +85,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: watchme-${{ github.ref_name }}-*
@@ -104,10 +112,8 @@ jobs:
           done
           sha256sum -- *.tar.gz > SHA256SUMS
           sha256sum --check SHA256SUMS
-      - name: Create release with generated notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --fail-on-no-commits --title "WatchMe $GITHUB_REF_NAME"
+      - name: Generate detailed release notes
+        run: scripts/release-notes.sh "$GITHUB_REF_NAME" > dist/RELEASE_NOTES.md
       - name: Upload immutable release bundle record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -115,5 +121,40 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/SHA256SUMS
+            dist/RELEASE_NOTES.md
           if-no-files-found: error
           retention-days: 90
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --draft \
+              --title "WatchMe $GITHUB_REF_NAME" \
+              --notes-file dist/RELEASE_NOTES.md
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "WatchMe $GITHUB_REF_NAME" \
+              --notes-file dist/RELEASE_NOTES.md
+          fi
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/SHA256SUMS --clobber
+      - name: Verify remote assets and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir verified-release
+          gh release download "$GITHUB_REF_NAME" --dir verified-release
+          cp verified-release/SHA256SUMS verified-release/EXPECTED_SHA256SUMS
+          (cd verified-release && sha256sum --check EXPECTED_SHA256SUMS)
+          test "$(find verified-release -maxdepth 1 -name '*.tar.gz' -type f | wc -l)" -eq 4
+          gh release edit "$GITHUB_REF_NAME" --draft=false \
+            --title "WatchMe $GITHUB_REF_NAME" \
+            --notes-file dist/RELEASE_NOTES.md
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = false
+          test "$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')" -eq 5

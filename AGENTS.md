@@ -32,6 +32,10 @@ For every release:
 2. Review all changes since the previous SemVer tag. For the first release,
    review the complete project history. Prepare release notes that accurately
    cover every user-visible change; do not rely solely on generated notes.
+   The previous release is the highest strictly lower SemVer precedence tag
+   that is an ancestor of the current tag. Ignore malformed, equal-precedence,
+   higher, and non-ancestor tags. Prereleases participate in SemVer precedence;
+   build metadata does not.
 3. Create and push an annotated `vMAJOR.MINOR.PATCH` tag. The tag version must
    exactly match `[package].version` in `Cargo.toml`.
 4. Monitor every CI and release workflow with `gh run list`, `gh run watch`,

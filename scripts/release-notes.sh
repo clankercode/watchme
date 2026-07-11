@@ -1,102 +1,137 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
-current_tag="${1:-$(git describe --tags --exact-match 2>/dev/null)}"
-if [[ ! "$current_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-  printf 'error: expected a SemVer tag, got %q\n' "$current_tag" >&2
-  exit 1
-fi
-git rev-parse --verify --quiet "${current_tag}^{commit}" >/dev/null || {
-  printf 'error: tag does not resolve to a commit: %s\n' "$current_tag" >&2
-  exit 1
+is_semver_tag() {
+  local tag="$1" core prerelease identifier
+  local -a identifiers=()
+  local pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+  [[ "$tag" =~ $pattern ]] || return 1
+  core="${tag#v}"
+  core="${core%%+*}"
+  prerelease=""
+  if [[ "$core" == *-* ]]; then
+    prerelease="${core#*-}"
+  fi
+  IFS=. read -r -a identifiers <<<"$prerelease"
+  for identifier in "${identifiers[@]}"; do
+    if [[ "$identifier" =~ ^[0-9]+$ && ${#identifier} -gt 1 && "$identifier" == 0* ]]; then
+      return 1
+    fi
+  done
 }
 
-previous_tag="$({
-  git tag --merged "${current_tag}^{commit}" --list 'v[0-9]*' --sort=-version:refname
-} | while IFS= read -r tag; do
-  if [[ "$tag" != "$current_tag" ]]; then
-    printf '%s\n' "$tag"
-    break
+numeric_compare() {
+  local left="$1" right="$2"
+  if ((${#left} < ${#right})); then printf '%s\n' -1
+  elif ((${#left} > ${#right})); then printf '%s\n' 1
+  elif [[ "$left" < "$right" ]]; then printf '%s\n' -1
+  elif [[ "$left" > "$right" ]]; then printf '%s\n' 1
+  else printf '%s\n' 0
   fi
-done)"
+}
 
-if [[ -n "$previous_tag" ]]; then
-  range="${previous_tag}..${current_tag}"
-  comparison="since ${previous_tag}"
-else
-  range="$current_tag"
-  comparison="across the complete project history"
+semver_compare() {
+  local left="${1#v}" right="${2#v}" index comparison
+  local -a left_parts=() right_parts=()
+  local left_base="${left%%+*}" right_base="${right%%+*}"
+  local left_core="${left_base%%-*}" right_core="${right_base%%-*}"
+  local left_pre="" right_pre=""
+  [[ "$left_base" == *-* ]] && left_pre="${left_base#*-}"
+  [[ "$right_base" == *-* ]] && right_pre="${right_base#*-}"
+  IFS=. read -r -a left_parts <<<"$left_core"
+  IFS=. read -r -a right_parts <<<"$right_core"
+  for index in 0 1 2; do
+    comparison="$(numeric_compare "${left_parts[index]}" "${right_parts[index]}")"
+    [[ "$comparison" != 0 ]] && { printf '%s\n' "$comparison"; return; }
+  done
+  [[ -z "$left_pre" && -z "$right_pre" ]] && { printf '0\n'; return; }
+  [[ -z "$left_pre" ]] && { printf '1\n'; return; }
+  [[ -z "$right_pre" ]] && { printf '%s\n' -1; return; }
+  IFS=. read -r -a left_parts <<<"$left_pre"
+  IFS=. read -r -a right_parts <<<"$right_pre"
+  for ((index = 0; index < ${#left_parts[@]} || index < ${#right_parts[@]}; index++)); do
+    ((index >= ${#left_parts[@]})) && { printf '%s\n' -1; return; }
+    ((index >= ${#right_parts[@]})) && { printf '1\n'; return; }
+    if [[ "${left_parts[index]}" =~ ^[0-9]+$ && "${right_parts[index]}" =~ ^[0-9]+$ ]]; then
+      comparison="$(numeric_compare "${left_parts[index]}" "${right_parts[index]}")"
+    elif [[ "${left_parts[index]}" =~ ^[0-9]+$ ]]; then comparison=-1
+    elif [[ "${right_parts[index]}" =~ ^[0-9]+$ ]]; then comparison=1
+    elif [[ "${left_parts[index]}" < "${right_parts[index]}" ]]; then comparison=-1
+    elif [[ "${left_parts[index]}" > "${right_parts[index]}" ]]; then comparison=1
+    else comparison=0
+    fi
+    [[ "$comparison" != 0 ]] && { printf '%s\n' "$comparison"; return; }
+  done
+  printf '0\n'
+}
+
+sanitize_subject() {
+  LC_ALL=C.UTF-8 perl -CS -pe '
+    s/[\x{0000}-\x{001F}\x{007F}-\x{009F}\x{061C}\x{200E}\x{200F}\x{202A}-\x{202E}\x{2066}-\x{2069}]//g;
+    s/([\\`*_{}\[\]<>\(\)#+.!|~\-:\@])/\\$1/g;
+  '
+}
+
+if [[ "${1:-}" == --validate-tag ]]; then
+  is_semver_tag "${2:-}" || { printf 'error: invalid SemVer 2.0.0 tag: %s\n' "${2:-}" >&2; exit 1; }
+  exit 0
+fi
+
+current_tag="${1:-$(git describe --tags --exact-match 2>/dev/null)}"
+is_semver_tag "$current_tag" || { printf 'error: invalid SemVer 2.0.0 tag: %s\n' "$current_tag" >&2; exit 1; }
+git rev-parse --verify --quiet "${current_tag}^{commit}" >/dev/null || { printf 'error: unresolved tag: %s\n' "$current_tag" >&2; exit 1; }
+
+previous_tag=""
+# Select the highest strictly lower SemVer-precedence ancestor. Prereleases
+# participate normally; build metadata is intentionally precedence-neutral.
+while IFS= read -r candidate; do
+  is_semver_tag "$candidate" || continue
+  [[ "$(semver_compare "$candidate" "$current_tag")" == -1 ]] || continue
+  if [[ -z "$previous_tag" || "$(semver_compare "$candidate" "$previous_tag")" == 1 ]]; then
+    previous_tag="$candidate"
+  fi
+done < <(git tag --merged "${current_tag}^{commit}")
+
+if [[ -n "$previous_tag" ]]; then range="${previous_tag}..${current_tag}"; comparison="since ${previous_tag}"
+else range="$current_tag"; comparison="across the complete project history"
 fi
 
 declare -a breaking=() features=() fixes=() documentation=() other=()
-breaking_subject_pattern='^[a-zA-Z]+(\([^)]*\))?!:'
-feature_subject_pattern='^feat(\([^)]*\))?:'
-fix_subject_pattern='^fix(\([^)]*\))?:'
-docs_subject_pattern='^docs?(\([^)]*\))?:'
+breaking_pattern='^[a-zA-Z]+(\([^)]*\))?!:'
+feature_pattern='^feat(\([^)]*\))?:'
+fix_pattern='^fix(\([^)]*\))?:'
+docs_pattern='^docs?(\([^)]*\))?:'
 while IFS= read -r commit; do
-  subject="$(git show -s --format=%s "$commit")"
+  raw_subject="$(git show -s --format=%s "$commit")"
   body="$(git show -s --format=%B "$commit")"
-  subject="${subject//&/&amp;}"
-  subject="${subject//</&lt;}"
-  subject="${subject//>/&gt;}"
+  subject="$(printf '%s' "$raw_subject" | sanitize_subject)"
   entry="- ${subject} ([${commit:0:7}](../../commit/${commit}))"
-
-  if [[ "$subject" =~ $breaking_subject_pattern ]] ||
-     grep -q '^BREAKING[ -]CHANGE:' <<<"$body"; then
-    breaking+=("$entry")
-  elif [[ "$subject" =~ $feature_subject_pattern ]]; then
-    features+=("$entry")
-  elif [[ "$subject" =~ $fix_subject_pattern ]]; then
-    fixes+=("$entry")
-  elif [[ "$subject" =~ $docs_subject_pattern ]]; then
-    documentation+=("$entry")
-  else
-    other+=("$entry")
+  if [[ "$raw_subject" =~ $breaking_pattern ]] || grep -q '^BREAKING[ -]CHANGE:' <<<"$body"; then breaking+=("$entry")
+  elif [[ "$raw_subject" =~ $feature_pattern ]]; then features+=("$entry")
+  elif [[ "$raw_subject" =~ $fix_pattern ]]; then fixes+=("$entry")
+  elif [[ "$raw_subject" =~ $docs_pattern ]]; then documentation+=("$entry")
+  else other+=("$entry")
   fi
 done < <(git log "$range" --no-merges --format=%H)
 
-commit_count=$((${#breaking[@]} + ${#features[@]} + ${#fixes[@]} + ${#documentation[@]} + ${#other[@]}))
-
-print_group() {
-  local title="$1"
-  shift
-  printf '### %s\n\n' "$title"
-  if (($# == 0)); then
-    printf 'None.\n\n'
-  else
-    printf '%s\n' "$@"
-    printf '\n'
-  fi
-}
-
+print_group() { local title="$1"; shift; printf '### %s\n\n' "$title"; if (($#)); then printf '%s\n' "$@"; else printf 'None.\n'; fi; printf '\n'; }
+count=$((${#breaking[@]} + ${#features[@]} + ${#fixes[@]} + ${#documentation[@]} + ${#other[@]}))
 cat <<EOF
 # WatchMe ${current_tag}
 
 ## Summary
 
-WatchMe ${current_tag} contains ${commit_count} non-merge changes ${comparison}.
-It provides a local supervisor for long-running coding-agent sessions on Linux
-and macOS.
+WatchMe ${current_tag} contains ${count} non-merge changes ${comparison}. It supports Linux and macOS coding-agent sessions.
 
 ## Changes ${comparison^}
 
 EOF
-print_group 'Breaking changes' "${breaking[@]}"
-print_group 'Features' "${features[@]}"
-print_group 'Fixes' "${fixes[@]}"
-print_group 'Documentation' "${documentation[@]}"
-print_group 'Other changes' "${other[@]}"
-
+print_group 'Breaking changes' "${breaking[@]}"; print_group 'Features' "${features[@]}"; print_group 'Fixes' "${fixes[@]}"; print_group 'Documentation' "${documentation[@]}"; print_group 'Other changes' "${other[@]}"
 cat <<EOF
 ## Installation and upgrade
 
-Download the archive matching your platform, then verify it against
-\`SHA256SUMS\` before extraction. Extract the archive and copy \`watchme\` to a
-directory on your \`PATH\`. The included \`WatchMe\` symbolic link is the
-uppercase compatibility alias and must remain beside \`watchme\` if used.
-
-For an upgrade, replace the existing \`watchme\` binary and \`WatchMe\` alias
-with the files from the new archive.
+Download and verify the matching archive. Extract it and copy \`watchme\` to a directory on \`PATH\`. Keep the included \`WatchMe\` symbolic-link alias beside it if used. To upgrade, replace both existing entries.
 
 ## Artifacts
 
@@ -108,22 +143,14 @@ with the files from the new archive.
 
 ## Checksums and verification
 
-On Linux, run \`sha256sum --check SHA256SUMS\`. On macOS, run
-\`shasum -a 256 -c SHA256SUMS\`. The release workflow validates the Cargo
-version against the tag, builds and smoke-tests each native binary, verifies
-both executable names in every archive, and rechecks all generated SHA-256
-checksums before publication. CI runs formatting, Clippy, tests, and a release
-build on all four supported system and architecture combinations.
+Run \`sha256sum --check SHA256SUMS\` on Linux or \`shasum -a 256 -c SHA256SUMS\` on macOS. CI runs formatting and Clippy once, then tests and release-builds all four native targets. Release automation validates tag/version equality, smoke-tests binaries, checks archive contents, and verifies local and downloaded checksums before publication.
 
 ## Compatibility and support
 
-Release binaries support Linux and macOS on x86_64 and aarch64. Windows is not
-supported. See \`docs/compatibility.md\` for provider-specific compatibility.
+Linux and macOS x86_64/aarch64 are supported. Windows is unsupported. See \`docs/compatibility.md\` for provider details.
 
 ## Known limitations
 
 - Windows is not supported.
-- Herdr integration follows WatchMe's local bridge contract because an
-  installed upstream Herdr API was unavailable for verification during v1
-  development.
+- Herdr uses WatchMe's local bridge contract because an upstream Herdr API was unavailable for v1 verification.
 EOF
