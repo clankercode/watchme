@@ -1,10 +1,16 @@
 # Changelog
 
+## 0.1.5 — 2026-07-12
+
+### Fixed
+
+- Actually switch `tests/observation_policy.rs` `include_str!` paths to in-repo `fixtures/` (0.1.4 only bumped the version).
+
 ## 0.1.4 — 2026-07-12
 
 ### Fixed
 
-- Replace absolute host `include_str!` fixture paths in `tests/observation_policy.rs` with in-repo `fixtures/` paths so CI can compile.
+- Intended to replace absolute host fixture includes; the path edit did not land. Superseded by 0.1.5.
 
 ## 0.1.3 — 2026-07-12
 

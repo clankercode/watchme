@@ -380,18 +380,14 @@ fn independent_second_opinion_requires_two_calls_and_every_safe_context_gate() {
 
 #[test]
 fn canonical_recovery_plan_actions_match_wire_contract() {
-    let valid: serde_json::Value = serde_json::from_str(include_str!(
-        "/home/xertrov/Downloads/WatchMe-one-shot-bundle/fixtures/recovery-plan.valid.json"
-    ))
-    .unwrap();
+    let valid: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/recovery-plan.valid.json")).unwrap();
     for value in valid["actions"].as_array().unwrap() {
         let action: Action = serde_json::from_value(value.clone()).unwrap();
         action.validate().unwrap();
     }
-    let invalid: serde_json::Value = serde_json::from_str(include_str!(
-        "/home/xertrov/Downloads/WatchMe-one-shot-bundle/fixtures/recovery-plan.invalid.json"
-    ))
-    .unwrap();
+    let invalid: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/recovery-plan.invalid.json")).unwrap();
     assert!(serde_json::from_value::<Action>(invalid["actions"][0].clone()).is_err());
 }
 
