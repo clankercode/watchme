@@ -1,6 +1,14 @@
 //! Conservative Claude Code classification and labelled-menu planning.
 //! Terminal captures are only eligible when supplied by a trusted live screen adapter.
 
+use crate::model::{
+    Action, ActionKind, Condition, Event, EventCategory, EventReset, EventSource, PolicyHint,
+    SourceKind, WatcherState,
+};
+use crate::recovery::engine::{BuiltinRecipes, RecipeProvider};
+use crate::recovery::reset_time::parse_reset;
+use sha2::{Digest, Sha256};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClaudeClass {
     UsageLimit,
@@ -106,11 +114,11 @@ pub fn labelled_wait_menu(first: &str, second: &str) -> Option<WaitMenu> {
         return None;
     }
     let rows: Vec<_> = first.lines().filter_map(menu_row).collect();
-    let target = rows.iter().position(|row| row.1 == WAIT_LABEL)?;
+    let target = rows.iter().position(|row| is_wait_label(&row.1))?;
     let cursor = rows.iter().position(|row| row.0)?;
     // Account-changing choices may be present but are never selected. Refuse
     // ambiguous duplicate labels/cursors and wrapped/malformed rows.
-    if rows.iter().filter(|row| row.1 == WAIT_LABEL).count() != 1
+    if rows.iter().filter(|row| is_wait_label(&row.1)).count() != 1
         || rows.iter().filter(|row| row.0).count() != 1
     {
         return None;
@@ -123,21 +131,35 @@ pub fn labelled_wait_menu(first: &str, second: &str) -> Option<WaitMenu> {
 
 fn menu_row(line: &str) -> Option<(bool, String)> {
     let trimmed = line.trim();
-    let (cursor, rest) = if let Some(rest) = trimmed.strip_prefix('>') {
+    let (cursor, rest) = if let Some(rest) = trimmed
+        .strip_prefix('>')
+        .or_else(|| trimmed.strip_prefix('›'))
+    {
         (true, rest.trim_start())
     } else {
         (false, trimmed)
     };
-    let (_, label) = rest.split_once('.')?;
+    // A row number proves this is current UI chrome. It is intentionally
+    // discarded: selection is derived from row order and the semantic label.
+    let (number, label) = rest.split_once('.')?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
     let label = label.trim().to_ascii_lowercase();
     (!label.is_empty() && label.len() <= 200).then_some((cursor, label))
 }
 fn looks_quoted(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with('"')
-        || trimmed.starts_with('>')
-        || trimmed.contains("documentation below")
-        || trimmed.contains("UNTRUSTED TOOL OUTPUT")
+    let lower = text.to_ascii_lowercase();
+    lower.contains("documentation below")
+        || lower.contains("untrusted tool output")
+        || lower.lines().any(|line| line.trim_start().starts_with('"'))
+}
+fn is_wait_label(label: &str) -> bool {
+    label == WAIT_LABEL
+        || label.strip_prefix(WAIT_LABEL).is_some_and(|suffix| {
+            let suffix = suffix.trim_start();
+            suffix.starts_with('(') || suffix.starts_with('-') || suffix.starts_with('–')
+        })
 }
 fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| value.contains(needle))
@@ -164,3 +186,217 @@ pub fn menu_keys(menu: &WaitMenu) -> Vec<&'static str> {
 }
 
 pub const DEFAULT_RESUME: &str = "Continue exactly where you left off.";
+
+/// Convert only an exactly correlated, owner-private StopFailure marker into a
+/// normalized event.  Missing, rotated, partial, or untrusted marker files are
+/// not evidence and therefore produce no action.
+pub fn correlated_hook_event(watcher: &WatcherState) -> Option<Event> {
+    let reference = watcher.claude_session.as_ref()?;
+    let process = match &watcher.target {
+        crate::model::TargetIdentity::Process { process }
+        | crate::model::TargetIdentity::Multiplexer { process, .. } => process,
+    };
+    if process.start_time != reference.process_start_time
+        || !process_cwd_matches(process.pid, &reference.process_cwd)
+    {
+        return None;
+    }
+    let markers =
+        crate::hooks::claude::read_markers(std::path::Path::new(&reference.marker_path)).ok()?;
+    let marker = crate::hooks::claude::correlate_marker(
+        &markers,
+        &reference.session_id,
+        std::path::Path::new(&reference.transcript_path),
+    )?;
+    let class = classify_stop_failure(&marker.error_type, &marker.detail, false);
+    let (category, hint, terminal) = match class {
+        ClaudeClass::UsageLimit => (EventCategory::UsageLimit, PolicyHint::WaitAllowed, true),
+        ClaudeClass::SessionLimit => (EventCategory::SessionLimit, PolicyHint::WaitAllowed, true),
+        ClaudeClass::WeeklyLimit => (EventCategory::WeeklyLimit, PolicyHint::WaitAllowed, true),
+        ClaudeClass::TerminalOverload => (
+            EventCategory::TransientOverload,
+            PolicyHint::WaitAllowed,
+            true,
+        ),
+        ClaudeClass::NativeRetry => return None,
+        ClaudeClass::HumanRequired => (
+            EventCategory::TerminalFailure,
+            PolicyHint::HumanRequired,
+            true,
+        ),
+        ClaudeClass::Unknown => return None,
+    };
+    let target_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&watcher.target).ok()?)
+    );
+    let fingerprint = crate::observe::evidence_fingerprint(
+        "claude_stop_failure",
+        &marker.error_type,
+        format!("{}:{}", marker.session_id, marker.transcript_path).as_bytes(),
+    );
+    let observed: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    let mut event = Event::new(
+        format!("claude-hook-{}", watcher.watcher_id),
+        observed.to_rfc3339(),
+        watcher.watcher_id.clone(),
+        target_hash,
+        EventSource::new(SourceKind::Hook, "claude_stop_failure", "StopFailure"),
+        category,
+        1.0,
+        terminal,
+        fingerprint,
+        "correlated Claude StopFailure",
+        hint,
+    )
+    .ok()?;
+    event.session_id = Some(reference.session_id.clone());
+    if let Some(reset) = parse_reset(&marker.detail, observed.fixed_offset()) {
+        event.metadata.insert(
+            "claude_reset_at".into(),
+            serde_json::Value::String(reset.at.to_rfc3339()),
+        );
+        event.reset = Some(EventReset {
+            source_text: "Claude StopFailure reset".into(),
+            parsed_at: reset.at.to_rfc3339(),
+            timezone: Some(reset.timezone),
+            confidence: f64::from(reset.confidence_milli) / 1000.0,
+            margin_seconds: Some(reset.margin_seconds),
+        });
+    }
+    Some(event)
+}
+
+fn process_cwd_matches(pid: u32, expected: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(actual) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+            return false;
+        };
+        actual == std::path::Path::new(expected)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, expected);
+        false
+    }
+}
+
+/// Claude owns structured limits and terminal-overload decisions before the
+/// provider-independent wait recipe.  Only a correlated Claude Hook event can
+/// reach these actions; unknown, native-retrying, and account-sensitive events
+/// never fall through into an input action.
+pub struct ClaudeRecipes {
+    generic: BuiltinRecipes,
+}
+
+impl Default for ClaudeRecipes {
+    fn default() -> Self {
+        Self {
+            generic: BuiltinRecipes,
+        }
+    }
+}
+
+impl RecipeProvider for ClaudeRecipes {
+    fn action_for(&self, watcher: &WatcherState) -> Option<Action> {
+        let event = watcher.last_observation.as_ref()?;
+        if event.source.kind != crate::model::SourceKind::Hook
+            || event.source.source_id != "claude_stop_failure"
+        {
+            return self.generic.action_for(watcher);
+        }
+        match event.category {
+            EventCategory::UsageLimit
+            | EventCategory::SessionLimit
+            | EventCategory::WeeklyLimit
+                if event.policy_hint == PolicyHint::WaitAllowed =>
+            {
+                wait_for_reset(event)
+            }
+            EventCategory::TransientOverload if event.terminal => {
+                Some(overload_wait(event, watcher.revision))
+            }
+            EventCategory::WaitingForModel
+                if event.policy_hint == PolicyHint::DeterministicActionAllowed
+                    && event.metadata.get("claude_resume")
+                        == Some(&serde_json::Value::Bool(true)) =>
+            {
+                Some(resume_action(event))
+            }
+            // Internal Claude retry, auth/billing/safety, credit exhaustion,
+            // malformed hook data, and unrecognised events require observation
+            // or a human rather than a generic speculative recovery.
+            _ => None,
+        }
+    }
+}
+
+fn wait_for_reset(event: &crate::model::Event) -> Option<Action> {
+    let at = event.metadata.get("claude_reset_at")?.as_str()?;
+    let mut action = Action::new(
+        "claude.wait_for_reset",
+        ActionKind::WaitUntil { at: at.to_owned() },
+        "correlated Claude reset time",
+        event.evidence_fingerprint.clone(),
+        30,
+    );
+    action.expected_outcomes = vec![Condition {
+        kind: "WAIT_STATE_RECORDED".into(),
+        value: None,
+    }];
+    Some(action)
+}
+
+fn overload_wait(event: &crate::model::Event, revision: u64) -> Action {
+    let seconds =
+        overload_backoff_seconds(revision as u32, hash64(&event.evidence_fingerprint), 300).max(1);
+    let mut action = Action::new(
+        "claude.terminal_overload_wait",
+        ActionKind::WaitDuration {
+            duration_seconds: seconds,
+        },
+        "terminal Claude overload after native retry ended",
+        event.evidence_fingerprint.clone(),
+        30,
+    );
+    action.expected_outcomes = vec![Condition {
+        kind: "WAIT_STATE_RECORDED".into(),
+        value: None,
+    }];
+    action
+}
+
+fn resume_action(event: &crate::model::Event) -> Action {
+    let mut action = Action::send_text(
+        "claude.resume_once",
+        DEFAULT_RESUME,
+        "reset wait revalidated by fresh Claude evidence",
+        event.evidence_fingerprint.clone(),
+    );
+    action.preconditions.extend([
+        Condition {
+            kind: "PROCESS_ALIVE".into(),
+            value: None,
+        },
+        Condition {
+            kind: "NO_HUMAN_INTERVENTION".into(),
+            value: None,
+        },
+        Condition {
+            kind: "COMPOSER_EMPTY".into(),
+            value: None,
+        },
+    ]);
+    action.expected_outcomes = vec![Condition {
+        kind: "AGENT_STATE_IS".into(),
+        value: Some(serde_json::Value::String("WORKING".into())),
+    }];
+    action
+}
+
+fn hash64(value: &str) -> u64 {
+    value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}

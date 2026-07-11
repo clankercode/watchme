@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
@@ -25,6 +26,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    WatchmeHookStopFailure(HookStopFailure),
     Status(IdAndJson),
     List(JsonOutput),
     Explain(OptionalId),
@@ -105,6 +108,12 @@ struct DoctorOptions {
     strict: bool,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct HookStopFailure {
+    #[arg(long)]
+    marker: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -198,6 +207,9 @@ pub fn run() -> Result<(), CliFailure> {
     let cli = Cli::parse();
     match cli.command {
         None => register_current_context().map_err(Into::into),
+        Some(Command::WatchmeHookStopFailure(options)) => {
+            hook_stop_failure(options).map_err(Into::into)
+        }
         Some(Command::Status(options)) => admin(Request::Status { id: options.id }, options.json),
         Some(Command::List(options)) => admin(Request::List, options.json),
         Some(Command::Stop(options)) if options.id.is_none() && !options.all => Err(CliFailure {
@@ -225,6 +237,30 @@ pub fn run() -> Result<(), CliFailure> {
         }) => admin(Request::Shutdown, false),
         Some(command) => Err(unavailable(command)),
     }
+}
+
+fn hook_stop_failure(options: HookStopFailure) -> Result<(), WatchmeError> {
+    const MAX_HOOK_PAYLOAD_BYTES: usize = 8192;
+    let mut payload = Vec::new();
+    std::io::stdin()
+        .take((MAX_HOOK_PAYLOAD_BYTES + 1) as u64)
+        .read_to_end(&mut payload)
+        .map_err(|_| {
+            WatchmeError::RetryableIntegration("cannot read Claude hook payload".into())
+        })?;
+    if payload.len() > MAX_HOOK_PAYLOAD_BYTES {
+        return Err(WatchmeError::PolicyDenied(
+            "Claude hook payload exceeds size limit".into(),
+        ));
+    }
+    let marker =
+        serde_json::from_slice::<watchme::hooks::claude::HookMarker>(&payload).map_err(|_| {
+            WatchmeError::PolicyDenied(
+                "Claude hook payload is not a valid StopFailure marker".into(),
+            )
+        })?;
+    watchme::hooks::claude::write_marker(&options.marker, &marker)
+        .map_err(|_| WatchmeError::PolicyDenied("Claude hook marker path is unsafe".into()))
 }
 
 fn runtime_paths() -> Result<WatchmePaths, CliFailure> {
@@ -444,23 +480,23 @@ impl RegistrationContextDetector for ProductionContextDetector {
                 "herdr-{}-{}-{}",
                 pane.pane_id, resolved.identity.pid, resolved.identity.start_time
             );
-            return Ok(ResolvedRegistration {
-                watcher: watchme::model::WatcherState::new(
-                    watcher_id,
-                    watchme::model::TargetIdentity::herdr(
-                        pane.server,
-                        pane.server_instance,
-                        pane.session_id,
-                        pane.window_id,
-                        pane.pane_id,
-                        pane.tty,
-                        resolved.identity,
-                    ),
-                    watchme::model::WatcherLifecycle::Registered,
-                    0,
-                    unix_time_ms(),
+            let mut watcher = watchme::model::WatcherState::new(
+                watcher_id,
+                watchme::model::TargetIdentity::herdr(
+                    pane.server,
+                    pane.server_instance,
+                    pane.session_id,
+                    pane.window_id,
+                    pane.pane_id,
+                    pane.tty,
+                    resolved.identity,
                 ),
-            });
+                watchme::model::WatcherLifecycle::Registered,
+                0,
+                unix_time_ms(),
+            );
+            attach_process_correlated_claude_session(&mut watcher);
+            return Ok(ResolvedRegistration { watcher });
         }
 
         if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some() {
@@ -483,38 +519,84 @@ impl RegistrationContextDetector for ProductionContextDetector {
                 resolved.identity.pid,
                 resolved.identity.start_time
             );
-            return Ok(ResolvedRegistration {
-                watcher: watchme::model::WatcherState::new(
-                    watcher_id,
-                    watchme::model::TargetIdentity::tmux(
-                        pane.server,
-                        pane.server_instance,
-                        pane.session_id,
-                        pane.window_id,
-                        pane.pane_id,
-                        pane.tty,
-                        resolved.identity,
-                        None,
-                    ),
-                    watchme::model::WatcherLifecycle::Registered,
-                    0,
-                    unix_time_ms(),
+            let mut watcher = watchme::model::WatcherState::new(
+                watcher_id,
+                watchme::model::TargetIdentity::tmux(
+                    pane.server,
+                    pane.server_instance,
+                    pane.session_id,
+                    pane.window_id,
+                    pane.pane_id,
+                    pane.tty,
+                    resolved.identity,
+                    None,
                 ),
-            });
+                watchme::model::WatcherLifecycle::Registered,
+                0,
+                unix_time_ms(),
+            );
+            attach_process_correlated_claude_session(&mut watcher);
+            return Ok(ResolvedRegistration { watcher });
         }
         let watcher_id = format!(
             "process-{}-{}",
             resolved.identity.pid, resolved.identity.start_time
         );
-        Ok(ResolvedRegistration {
-            watcher: watchme::model::WatcherState::new(
-                watcher_id,
-                watchme::model::TargetIdentity::process(resolved.identity),
-                watchme::model::WatcherLifecycle::Registered,
-                0,
-                unix_time_ms(),
-            ),
-        })
+        let mut watcher = watchme::model::WatcherState::new(
+            watcher_id,
+            watchme::model::TargetIdentity::process(resolved.identity),
+            watchme::model::WatcherLifecycle::Registered,
+            0,
+            unix_time_ms(),
+        );
+        attach_process_correlated_claude_session(&mut watcher);
+        Ok(ResolvedRegistration { watcher })
+    }
+}
+
+/// Claude's registration variables are accepted only when the durable
+/// transcript is open by the resolved agent process.  There is deliberately no
+/// directory/newest-file fallback: absent or malformed data merely disables
+/// hook recovery for this watcher.
+fn attach_process_correlated_claude_session(watcher: &mut watchme::model::WatcherState) {
+    let (Some(session_id), Some(transcript), Some(marker)) = (
+        std::env::var_os("CLAUDE_SESSION_ID"),
+        std::env::var_os("CLAUDE_TRANSCRIPT_PATH"),
+        std::env::var_os("WATCHME_CLAUDE_MARKER_PATH"),
+    ) else {
+        return;
+    };
+    let transcript = match std::fs::canonicalize(transcript) {
+        Ok(path) if path.is_file() => path,
+        _ => return,
+    };
+    let marker = PathBuf::from(marker);
+    if !marker.is_absolute() {
+        return;
+    }
+    let process = match &watcher.target {
+        watchme::model::TargetIdentity::Process { process }
+        | watchme::model::TargetIdentity::Multiplexer { process, .. } => process,
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let fd_dir = format!("/proc/{}/fd", process.pid);
+        let opened = std::fs::read_dir(fd_dir).ok().is_some_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| std::fs::read_link(entry.path()).ok().as_ref() == Some(&transcript))
+        });
+        let cwd = std::fs::read_link(format!("/proc/{}/cwd", process.pid)).ok();
+        let (true, Some(cwd)) = (opened, cwd) else {
+            return;
+        };
+        let _ = watcher.set_claude_session(watchme::model::ClaudeSessionReference {
+            session_id: session_id.to_string_lossy().into(),
+            transcript_path: transcript.to_string_lossy().into(),
+            marker_path: marker.to_string_lossy().into(),
+            process_start_time: process.start_time,
+            process_cwd: cwd.to_string_lossy().into(),
+        });
     }
 }
 

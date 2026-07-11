@@ -18,6 +18,20 @@ pub struct ObservationSchedule {
     pub screen_fingerprint: Option<String>,
     pub screen_stable_count: u8,
 }
+
+/// A Claude session reference is established at registration from a hook/API
+/// payload or a process-correlated open transcript.  It is never populated by
+/// a newest-file search.  The daemon needs all four values before reading a
+/// StopFailure marker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeSessionReference {
+    pub session_id: String,
+    pub transcript_path: String,
+    pub marker_path: String,
+    pub process_start_time: u64,
+    pub process_cwd: String,
+}
 impl ObservationSchedule {
     fn is_default(&self) -> bool {
         self == &Self::default()
@@ -52,6 +66,8 @@ pub struct WatcherState {
     pub observation_schedule: ObservationSchedule,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_observation: Option<crate::model::Event>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session: Option<ClaudeSessionReference>,
 }
 
 impl WatcherState {
@@ -72,11 +88,25 @@ impl WatcherState {
             recovery: None,
             observation_schedule: ObservationSchedule::default(),
             last_observation: None,
+            claude_session: None,
         }
     }
 
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
+    }
+
+    pub fn set_claude_session(&mut self, reference: ClaudeSessionReference) -> Result<(), String> {
+        if reference.session_id.is_empty()
+            || reference.session_id.len() > 256
+            || !std::path::Path::new(&reference.transcript_path).is_absolute()
+            || !std::path::Path::new(&reference.marker_path).is_absolute()
+            || !std::path::Path::new(&reference.process_cwd).is_absolute()
+        {
+            return Err("invalid trusted Claude session reference".into());
+        }
+        self.claude_session = Some(reference);
+        Ok(())
     }
 }
 
@@ -100,6 +130,8 @@ impl<'de> Deserialize<'de> for WatcherState {
             observation_schedule: ObservationSchedule,
             #[serde(default)]
             last_observation: Option<crate::model::Event>,
+            #[serde(default)]
+            claude_session: Option<ClaudeSessionReference>,
         }
         let wire = Wire::deserialize(deserializer)?;
         if wire.schema_version != WATCHER_STATE_SCHEMA_VERSION {
@@ -118,6 +150,7 @@ impl<'de> Deserialize<'de> for WatcherState {
         state.recovery = wire.recovery;
         state.observation_schedule = wire.observation_schedule;
         state.last_observation = wire.last_observation;
+        state.claude_session = wire.claude_session;
         Ok(state)
     }
 }

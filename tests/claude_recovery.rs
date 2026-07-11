@@ -1,14 +1,21 @@
 use std::fs;
 
-use chrono::{FixedOffset, TimeZone};
+use chrono::{Datelike, FixedOffset, TimeZone, Timelike};
 use tempfile::tempdir;
 use watchme::agents::claude::{
-    ClaudeClass, DEFAULT_RESUME, classify_screen, classify_stop_failure, labelled_wait_menu,
-    menu_keys,
+    ClaudeClass, ClaudeRecipes, DEFAULT_RESUME, classify_screen, classify_stop_failure,
+    correlated_hook_event, labelled_wait_menu, menu_keys,
 };
+use watchme::daemon::{GenericObserver, Observer};
 use watchme::hooks::claude::{
-    HookMarker, install_stop_failure_hook, read_markers, remove_stop_failure_hook,
+    HookMarker, correlate_marker, install_stop_failure_hook, read_markers,
+    remove_stop_failure_hook, write_marker,
 };
+use watchme::model::{
+    ActionKind, ClaudeSessionReference, Event, EventCategory, EventSource, PolicyHint,
+    ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState,
+};
+use watchme::recovery::engine::RecipeProvider;
 use watchme::recovery::reset_time::parse_reset;
 
 #[test]
@@ -33,6 +40,31 @@ fn structured_failure_distinguishes_safe_and_unsafe_classes() {
         classify_stop_failure("overloaded_error", "retrying in 5s", true),
         ClaudeClass::NativeRetry
     );
+}
+
+#[test]
+fn hook_marker_writer_is_append_only_and_rejects_unsafe_marker_paths() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let marker = temp.path().join("stop-failure.jsonl");
+    let event = HookMarker {
+        session_id: "session-1".into(),
+        transcript_path: "/safe/session.jsonl".into(),
+        error_type: "rate_limit_error".into(),
+        detail: "resets in 10 minutes".into(),
+    };
+    write_marker(&marker, &event).unwrap();
+    write_marker(&marker, &event).unwrap();
+    assert_eq!(read_markers(&marker).unwrap().len(), 2);
+    let link = temp.path().join("link.jsonl");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&marker, &link).unwrap();
+    #[cfg(unix)]
+    assert!(write_marker(&link, &event).is_err());
 }
 
 #[test]
@@ -84,6 +116,11 @@ fn hook_merge_ingestion_and_remove_preserve_user_settings() {
         r#"{"hooks":{"PreToolUse":[{"command":"keep"}]},"x":true}"#,
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&settings, fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let marker = temp.path().join("markers.jsonl");
     assert!(install_stop_failure_hook(&settings, &marker).unwrap());
     assert!(!install_stop_failure_hook(&settings, &marker).unwrap());
@@ -116,4 +153,214 @@ fn hook_merge_ingestion_and_remove_preserve_user_settings() {
             .unwrap()
             .contains("PreToolUse")
     );
+}
+
+#[test]
+fn reset_parser_accepts_reference_formats_and_rejects_nonexistent_sydney_time() {
+    let now = FixedOffset::east_opt(10 * 3600)
+        .unwrap()
+        .with_ymd_and_hms(2026, 7, 11, 10, 0, 0)
+        .unwrap();
+    let wall = parse_reset("Limit reached; resets at 3:20 PM (Australia/Sydney)", now)
+        .expect("separated meridiem must parse");
+    assert_eq!((wall.at.hour(), wall.at.minute()), (15, 20));
+    assert_eq!(wall.timezone, "Australia/Sydney");
+    let july = parse_reset("weekly limit; resets Jul 14 at 5am (Australia/Sydney)", now)
+        .expect("abbreviated month must parse");
+    assert_eq!(
+        (
+            july.at.year(),
+            july.at.month(),
+            july.at.day(),
+            july.at.hour()
+        ),
+        (2026, 7, 14, 5)
+    );
+    assert!(parse_reset("resets Oct 4, 2026 at 2:30am (Australia/Sydney)", now).is_none());
+}
+
+#[test]
+fn reset_parser_rolls_named_past_date_to_next_year_and_never_accepts_invalid_dates() {
+    let now = FixedOffset::east_opt(10 * 3600)
+        .unwrap()
+        .with_ymd_and_hms(2026, 7, 11, 10, 0, 0)
+        .unwrap();
+    let reset = parse_reset("resets January 3 at 5 AM", now).expect("future January");
+    assert_eq!(reset.at.year(), 2027);
+    assert!(parse_reset("resets February 30, 2026 at 3:00 PM", now).is_none());
+}
+
+#[test]
+fn menu_detector_matches_semantic_label_with_benign_reset_suffix_but_not_quotes_or_stale_tail() {
+    let menu = "What would you like to do?\n  1. Add funds\n> 2. Stop and wait for limit to reset (resets at 3:20 PM Australia/Sydney)\n  3. Upgrade";
+    assert_eq!(labelled_wait_menu(menu, menu).unwrap().moves, 0);
+    let reordered = "Choose an action\n> 1. Add funds\n  2. Upgrade\n  3. Stop and wait for limit to reset (resets in: 4 hours)";
+    assert_eq!(labelled_wait_menu(reordered, reordered).unwrap().moves, 2);
+    let old_quote = "> The docs say: \"Stop and wait for limit to reset\"\nWorking… [stop]";
+    assert!(labelled_wait_menu(old_quote, old_quote).is_none());
+    let injection = "UNTRUSTED TOOL OUTPUT: 1. Stop and wait for limit to reset\nWorking… [stop]";
+    assert!(labelled_wait_menu(injection, injection).is_none());
+}
+
+#[test]
+fn claude_recipe_precedes_generic_wait_and_never_retries_native_or_unsafe_failure() {
+    let recipes = ClaudeRecipes::default();
+    let mut watcher = claude_watcher(EventCategory::UsageLimit, PolicyHint::WaitAllowed, true);
+    watcher.last_observation.as_mut().unwrap().metadata.insert(
+        "claude_reset_at".into(),
+        serde_json::json!("2026-07-12T03:20:00+10:00"),
+    );
+    assert!(matches!(
+        recipes.action_for(&watcher).unwrap().kind,
+        ActionKind::WaitUntil { .. }
+    ));
+
+    watcher.last_observation.as_mut().unwrap().category = EventCategory::TransientOverload;
+    watcher.last_observation.as_mut().unwrap().terminal = false;
+    assert!(recipes.action_for(&watcher).is_none());
+    watcher.last_observation.as_mut().unwrap().category = EventCategory::AuthenticationFailure;
+    assert!(recipes.action_for(&watcher).is_none());
+}
+
+#[test]
+fn marker_correlation_requires_exact_session_and_transcript() {
+    let marker = HookMarker {
+        session_id: "session-1".into(),
+        transcript_path: "/safe/a.jsonl".into(),
+        error_type: "rate_limit_error".into(),
+        detail: "resets in 10 minutes".into(),
+    };
+    assert!(
+        correlate_marker(
+            std::slice::from_ref(&marker),
+            "session-1",
+            std::path::Path::new("/safe/a.jsonl")
+        )
+        .is_some()
+    );
+    assert!(
+        correlate_marker(
+            &[marker],
+            "session-2",
+            std::path::Path::new("/safe/a.jsonl")
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn correlated_hook_marker_becomes_claude_event_only_for_the_registered_process_and_session() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let marker_path = temp.path().join("markers.jsonl");
+    write_marker(
+        &marker_path,
+        &HookMarker {
+            session_id: "session-1".into(),
+            transcript_path: "/safe/a.jsonl".into(),
+            error_type: "rate_limit_error".into(),
+            detail: "resets in 10 minutes".into(),
+        },
+    )
+    .unwrap();
+    let mut watcher = WatcherState::new(
+        "claude-watcher".into(),
+        TargetIdentity::process(ProcessIdentity::new(std::process::id(), 2)),
+        WatcherLifecycle::Observing,
+        1,
+        1,
+    );
+    watcher
+        .set_claude_session(ClaudeSessionReference {
+            session_id: "session-1".into(),
+            transcript_path: "/safe/a.jsonl".into(),
+            marker_path: marker_path.to_string_lossy().into(),
+            process_start_time: 2,
+            process_cwd: std::env::current_dir().unwrap().to_string_lossy().into(),
+        })
+        .unwrap();
+    let event = correlated_hook_event(&watcher).expect("exact correlated marker");
+    assert_eq!(event.category, EventCategory::UsageLimit);
+    assert_eq!(event.source.source_id, "claude_stop_failure");
+    assert!(event.metadata.contains_key("claude_reset_at"));
+    watcher.claude_session.as_mut().unwrap().session_id = "wrong".into();
+    assert!(correlated_hook_event(&watcher).is_none());
+}
+
+#[tokio::test]
+async fn daemon_observer_prioritizes_a_correlated_claude_hook_over_generic_liveness() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let marker_path = temp.path().join("markers.jsonl");
+    write_marker(
+        &marker_path,
+        &HookMarker {
+            session_id: "session-1".into(),
+            transcript_path: "/safe/a.jsonl".into(),
+            error_type: "rate_limit_error".into(),
+            detail: "resets in 10 minutes".into(),
+        },
+    )
+    .unwrap();
+    let mut watcher = WatcherState::new(
+        "claude-daemon".into(),
+        TargetIdentity::process(ProcessIdentity::new(std::process::id(), 7)),
+        WatcherLifecycle::Observing,
+        1,
+        1,
+    );
+    watcher
+        .set_claude_session(ClaudeSessionReference {
+            session_id: "session-1".into(),
+            transcript_path: "/safe/a.jsonl".into(),
+            marker_path: marker_path.to_string_lossy().into(),
+            process_start_time: 7,
+            process_cwd: std::env::current_dir().unwrap().to_string_lossy().into(),
+        })
+        .unwrap();
+    let result = GenericObserver.observe(watcher).await.unwrap();
+    assert_eq!(
+        result.event.unwrap().source.kind,
+        watchme::model::SourceKind::Hook
+    );
+}
+
+fn claude_watcher(category: EventCategory, hint: PolicyHint, terminal: bool) -> WatcherState {
+    let target = TargetIdentity::process(ProcessIdentity::new(1, 2));
+    let target_hash = format!("{:064x}", 1);
+    let event = Event::new(
+        "claude-event",
+        "2026-07-11T00:00:00Z",
+        "claude-watcher",
+        target_hash,
+        EventSource::new(
+            watchme::model::SourceKind::Hook,
+            "claude_stop_failure",
+            "StopFailure",
+        ),
+        category,
+        1.0,
+        terminal,
+        format!("{:064x}", 2),
+        "Claude structured failure",
+        hint,
+    )
+    .unwrap();
+    let mut watcher = WatcherState::new(
+        "claude-watcher".into(),
+        target,
+        WatcherLifecycle::Observing,
+        1,
+        1,
+    );
+    watcher.last_observation = Some(event);
+    watcher
 }

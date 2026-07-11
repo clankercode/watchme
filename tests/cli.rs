@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
+use std::fs;
+use tempfile::tempdir;
 
 #[test]
 fn bare_watchme_outside_agent_explains_shell_escape_and_doctor() {
@@ -121,4 +123,28 @@ fn json_errors_are_versioned_envelopes() {
             .contains("daemon unavailable")
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn stop_failure_hook_mode_writes_only_a_valid_marker() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let marker = temp.path().join("markers.jsonl");
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .args(["watchme-hook-stop-failure", "--marker", marker.to_str().unwrap()])
+        .write_stdin(r#"{"session_id":"s","transcript_path":"/tmp/t.jsonl","error_type":"rate_limit_error","detail":"resets in 10 minutes"}"#)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+    assert!(
+        fs::read_to_string(marker)
+            .unwrap()
+            .contains("rate_limit_error")
+    );
 }

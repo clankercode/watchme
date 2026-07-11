@@ -1,5 +1,15 @@
-//! Strict reset-time parser. Absence of an explicit reset cue is never inferred.
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveTime, TimeZone};
+//! Conservative parser for human-facing Claude reset messages.
+//!
+//! It deliberately accepts only messages with a reset/retry cue.  IANA zones
+//! use chrono-tz's local-time resolver: nonexistent DST wall times are refused
+//! and an ambiguous fall-back time is deterministically resolved to its earliest
+//! future instant.
+use chrono::{
+    DateTime, Datelike, Duration, FixedOffset, LocalResult, NaiveDate, NaiveTime, TimeZone,
+};
+use chrono_tz::Tz;
+
+const MIN_WALL_FUTURE_SECONDS: i64 = 300;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResetTime {
@@ -9,183 +19,229 @@ pub struct ResetTime {
     pub margin_seconds: u64,
 }
 
+#[derive(Clone, Copy)]
+enum Zone {
+    Iana(Tz),
+    Fixed(FixedOffset),
+}
+
+impl Zone {
+    fn from_text(text: &str, fallback: FixedOffset) -> Self {
+        text.split_whitespace()
+            .map(|token| {
+                token.trim_matches(|value: char| !value.is_ascii_alphanumeric() && value != '/')
+            })
+            .find_map(|token| {
+                token
+                    .contains('/')
+                    .then(|| token.parse::<Tz>().ok())
+                    .flatten()
+            })
+            .map_or(Self::Fixed(fallback), Self::Iana)
+    }
+
+    fn name(self) -> String {
+        match self {
+            Self::Iana(zone) => zone.name().to_owned(),
+            Self::Fixed(offset) => offset.to_string(),
+        }
+    }
+
+    fn local_date(self, now: DateTime<FixedOffset>) -> NaiveDate {
+        match self {
+            Self::Iana(zone) => now.with_timezone(&zone).date_naive(),
+            Self::Fixed(_) => now.date_naive(),
+        }
+    }
+
+    fn resolve(
+        self,
+        date: NaiveDate,
+        hour: u32,
+        minute: u32,
+        now: DateTime<FixedOffset>,
+    ) -> Option<DateTime<FixedOffset>> {
+        let local = date.and_time(NaiveTime::from_hms_opt(hour, minute, 0)?);
+        let candidates = match self {
+            Self::Iana(zone) => match zone.from_local_datetime(&local) {
+                LocalResult::None => return None,
+                LocalResult::Single(value) => vec![value.fixed_offset()],
+                // The earliest future instant is the documented policy.  This
+                // keeps a repeated fall-back clock time deterministic.
+                LocalResult::Ambiguous(first, second) => {
+                    vec![first.fixed_offset(), second.fixed_offset()]
+                }
+            },
+            Self::Fixed(offset) => vec![offset.from_local_datetime(&local).single()?],
+        };
+        candidates
+            .into_iter()
+            .filter(|candidate| candidate.timestamp() > now.timestamp())
+            .min_by_key(DateTime::timestamp)
+    }
+}
+
+/// Parse a reset into an absolute instant.  Dates without an explicit year may
+/// roll into the next year; explicit past dates are rejected instead of guessed.
 pub fn parse_reset(text: &str, now: DateTime<FixedOffset>) -> Option<ResetTime> {
-    let lower = text.to_ascii_lowercase();
-    let cue = lower.contains("reset") || lower.contains("resets");
-    if !cue || text.len() > 500 {
+    if text.is_empty() || text.len() > 500 {
         return None;
     }
-    if let Some((hours, minutes)) = relative(&lower) {
+    let lower = text.to_ascii_lowercase();
+    if !(lower.contains("reset") || lower.contains("try again")) {
+        return None;
+    }
+    if let Some(duration) = parse_relative(&lower) {
         return Some(ResetTime {
-            at: now + Duration::hours(hours) + Duration::minutes(minutes),
-            confidence_milli: 1000,
+            at: now + duration,
+            confidence_milli: 980,
             timezone: now.offset().to_string(),
             margin_seconds: 60,
         });
     }
-    let zone: &dyn Zone = if lower.contains("australia/sydney") {
-        &Sydney
-    } else {
-        &Fixed(*now.offset())
-    };
-    let (hour, minute, pm) = clock(&lower)?;
-    let mut date = date_from(&lower, now)?;
-    let mut hour = hour;
-    if let Some(is_pm) = pm {
-        hour = match (hour, is_pm) {
-            (12, false) => 0,
-            (12, true) => 12,
-            (h, true) => h + 12,
-            (h, false) => h,
-        };
+    let zone = Zone::from_text(text, *now.offset());
+    let (hour, minute) = parse_clock(&lower)?;
+    let (date, named_date, explicit_year) = parse_date(&lower, zone.local_date(now))?;
+    let mut candidate = zone.resolve(date, hour, minute, now);
+    if candidate.is_none() && named_date && !explicit_year {
+        candidate = zone.resolve(
+            date.with_year(date.year().checked_add(1)?)?,
+            hour,
+            minute,
+            now,
+        );
     }
-    if hour > 23 || minute > 59 {
+    if candidate.is_none() && !named_date {
+        for days in 1..=2 {
+            if let Some(next) = zone.resolve(date + Duration::days(days), hour, minute, now) {
+                candidate = Some(next);
+                break;
+            }
+        }
+    }
+    let at = candidate?;
+    if !named_date && at.timestamp().saturating_sub(now.timestamp()) < MIN_WALL_FUTURE_SECONDS {
         return None;
-    }
-    let offset = zone.offset(date);
-    let at = offset
-        .from_local_datetime(&date.and_time(NaiveTime::from_hms_opt(hour, minute, 0)?))
-        .single()?;
-    if at <= now {
-        date = if has_named_date(&lower) {
-            date.with_year(date.year().checked_add(1)?)?
-        } else {
-            date.succ_opt()?
-        };
-        let offset = zone.offset(date);
-        return Some(ResetTime {
-            at: offset
-                .from_local_datetime(&date.and_time(NaiveTime::from_hms_opt(hour, minute, 0)?))
-                .single()?,
-            confidence_milli: 800,
-            timezone: zone.name().into(),
-            margin_seconds: 60,
-        });
     }
     Some(ResetTime {
         at,
-        confidence_milli: 900,
-        timezone: zone.name().into(),
+        confidence_milli: if named_date { 930 } else { 860 },
+        timezone: zone.name(),
         margin_seconds: 60,
     })
 }
 
-fn has_named_date(text: &str) -> bool {
-    [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ]
-    .iter()
-    .any(|month| text.contains(month))
-}
-
-fn relative(text: &str) -> Option<(i64, i64)> {
-    let after = text
-        .split("in:")
-        .nth(1)
-        .or_else(|| text.split("in ").nth(1))?;
-    let nums: Vec<i64> = after
-        .split_whitespace()
-        .filter_map(|part| part.parse().ok())
-        .collect();
-    let hours = if after.contains("hour") {
-        *nums.first()?
-    } else {
-        0
-    };
-    let minutes = if after.contains("minute") {
-        *nums.get(usize::from(after.contains("hour")))?
-    } else {
-        0
-    };
-    (hours > 0 || minutes > 0).then_some((hours, minutes))
-}
-fn clock(text: &str) -> Option<(u32, u32, Option<bool>)> {
-    let token = text
-        .split_whitespace()
-        .find(|part| part.contains(':'))
-        .or_else(|| {
-            text.split_whitespace()
-                .find(|part| part.ends_with("am") || part.ends_with("pm"))
-        })?;
-    let clean = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != ':');
-    let (digits, meridiem) = if let Some(value) = clean.strip_suffix("am") {
-        (value, Some(false))
-    } else if let Some(value) = clean.strip_suffix("pm") {
-        (value, Some(true))
-    } else {
-        (clean, None)
-    };
-    let (h, m) = match digits.split_once(':') {
-        Some((h, m)) => (h.parse().ok()?, m.parse().ok()?),
-        None => (digits.parse().ok()?, 0),
-    };
-    Some((h, m, meridiem))
-}
-fn date_from(text: &str, now: DateTime<FixedOffset>) -> Option<NaiveDate> {
-    let months = [
-        ("jan", 1),
-        ("feb", 2),
-        ("mar", 3),
-        ("apr", 4),
-        ("may", 5),
-        ("jun", 6),
-        ("jul", 7),
-        ("aug", 8),
-        ("sep", 9),
-        ("oct", 10),
-        ("nov", 11),
-        ("dec", 12),
-    ];
-    for (name, month) in months {
-        if let Some(rest) = text.split(name).nth(1) {
-            let day: u32 = rest
-                .split_whitespace()
-                .next()?
-                .trim_matches(|c: char| !c.is_ascii_digit())
-                .parse()
-                .ok()?;
-            let year = rest
-                .split_whitespace()
-                .find_map(|x| (x.len() == 4).then(|| x.parse().ok()).flatten())
-                .unwrap_or(now.year());
-            return NaiveDate::from_ymd_opt(year, month, day);
+fn parse_relative(text: &str) -> Option<Duration> {
+    let start = text
+        .find("resets in")
+        .or_else(|| text.find("reset in"))
+        .or_else(|| text.find("try again in"))?;
+    let fragment = &text[start..];
+    let mut number = None;
+    let mut seconds = 0_i64;
+    for token in words(fragment) {
+        if let Ok(value) = token.parse::<i64>() {
+            number = Some(value);
+            continue;
+        }
+        let Some(value) = number.take() else { continue };
+        let multiplier = if token.starts_with('h') {
+            3600
+        } else if token.starts_with('m') {
+            60
+        } else if token.starts_with('s') {
+            1
+        } else {
+            return None;
+        };
+        seconds = seconds.checked_add(value.checked_mul(multiplier)?)?;
+        if seconds > 31_536_000 {
+            return None;
         }
     }
-    NaiveDate::from_ymd_opt(now.year(), now.month(), now.day())
+    (seconds > 0).then(|| Duration::seconds(seconds))
 }
-trait Zone {
-    fn offset(&self, date: NaiveDate) -> FixedOffset;
-    fn name(&self) -> &'static str;
-}
-struct Fixed(FixedOffset);
-impl Zone for Fixed {
-    fn offset(&self, _: NaiveDate) -> FixedOffset {
-        self.0
-    }
-    fn name(&self) -> &'static str {
-        "local"
-    }
-}
-struct Sydney;
-impl Zone for Sydney {
-    fn offset(&self, date: NaiveDate) -> FixedOffset {
-        let y = date.year();
-        let start = first_sunday(y, 10);
-        let end = first_sunday(y, 4);
-        let daylight = if date.month() >= 10 {
-            date >= start
-        } else if date.month() <= 4 {
-            date < end
+
+fn parse_clock(text: &str) -> Option<(u32, u32)> {
+    let tokens = words(text);
+    for (index, token) in tokens.iter().enumerate() {
+        let (digits, suffix) = split_meridiem(token);
+        let following_meridiem = tokens.get(index + 1).and_then(meridiem);
+        let (hour, minute) = if let Some((hour, minute)) = digits.split_once(':') {
+            (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?)
+        } else if suffix.is_some() || following_meridiem.is_some() {
+            (digits.parse::<u32>().ok()?, 0)
         } else {
-            false
+            continue;
         };
-        FixedOffset::east_opt(if daylight { 11 * 3600 } else { 10 * 3600 }).unwrap()
+        let meridiem = suffix.or(following_meridiem);
+        let hour = match meridiem {
+            Some(is_pm) if (1..=12).contains(&hour) => hour % 12 + u32::from(is_pm) * 12,
+            Some(_) => continue,
+            None if hour <= 23 => hour,
+            None => continue,
+        };
+        if minute < 60 {
+            return Some((hour, minute));
+        }
     }
-    fn name(&self) -> &'static str {
-        "Australia/Sydney"
+    None
+}
+
+fn parse_date(text: &str, fallback: NaiveDate) -> Option<(NaiveDate, bool, bool)> {
+    let tokens = words(text);
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(month) = month(token) else { continue };
+        let day = tokens.get(index + 1)?.parse::<u32>().ok()?;
+        let explicit_year = tokens.get(index + 2).and_then(|value| {
+            (value.len() == 4)
+                .then(|| value.parse::<i32>().ok())
+                .flatten()
+        });
+        let date = NaiveDate::from_ymd_opt(explicit_year.unwrap_or(fallback.year()), month, day)?;
+        return Some((date, true, explicit_year.is_some()));
+    }
+    Some((fallback, false, false))
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split(|value: char| !value.is_ascii_alphanumeric() && value != ':')
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn split_meridiem(token: &str) -> (&str, Option<bool>) {
+    if let Some(value) = token.strip_suffix("am") {
+        (value, Some(false))
+    } else if let Some(value) = token.strip_suffix("pm") {
+        (value, Some(true))
+    } else {
+        (token, None)
     }
 }
-fn first_sunday(year: i32, month: u32) -> NaiveDate {
-    let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
-    first + Duration::days(i64::from((7 - first.weekday().num_days_from_sunday()) % 7))
+
+fn meridiem(token: &&str) -> Option<bool> {
+    match *token {
+        "am" => Some(false),
+        "pm" => Some(true),
+        _ => None,
+    }
+}
+
+fn month(token: &str) -> Option<u32> {
+    match &token[..token.len().min(3)] {
+        "jan" => Some(1),
+        "feb" => Some(2),
+        "mar" => Some(3),
+        "apr" => Some(4),
+        "may" => Some(5),
+        "jun" => Some(6),
+        "jul" => Some(7),
+        "aug" => Some(8),
+        "sep" => Some(9),
+        "oct" => Some(10),
+        "nov" => Some(11),
+        "dec" => Some(12),
+        _ => None,
+    }
 }

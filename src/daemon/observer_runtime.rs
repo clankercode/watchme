@@ -69,6 +69,18 @@ impl Observer for GenericObserver {
         watcher: crate::model::WatcherState,
     ) -> Pin<Box<dyn Future<Output = Result<ObservationResult, String>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(event) = tokio::task::spawn_blocking({
+                let watcher = watcher.clone();
+                move || crate::agents::claude::correlated_hook_event(&watcher)
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            {
+                return Ok(ObservationResult {
+                    event: Some(event),
+                    herdr_after_sequence: None,
+                });
+            }
             if let crate::model::TargetIdentity::Multiplexer {
                 context: Some(context),
                 process,

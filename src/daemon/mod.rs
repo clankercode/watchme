@@ -85,7 +85,7 @@ pub async fn run_with_peer_provider(
         stay_resident,
         peer_credentials,
         std::sync::Arc::new(GenericObserver),
-        std::sync::Arc::new(crate::recovery::engine::BuiltinRecipes),
+        std::sync::Arc::new(crate::agents::claude::ClaudeRecipes::default()),
     )
     .await
 }

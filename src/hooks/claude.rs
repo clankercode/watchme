@@ -1,6 +1,6 @@
 //! Owner-only StopFailure hook lifecycle and bounded marker ingestion.
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,10 @@ pub struct HookMarker {
 pub fn install_stop_failure_hook(settings: &Path, marker: &Path) -> Result<bool, String> {
     check_parent(settings)?;
     let mut root = read_settings(settings)?;
-    let command = format!("watchme-hook-stop-failure --marker {}", marker.display());
+    let command = format!(
+        "watchme watchme-hook-stop-failure --marker {}",
+        marker.display()
+    );
     let hooks = root
         .as_object_mut()
         .ok_or("Claude settings root must be object")?
@@ -71,17 +74,7 @@ pub fn remove_stop_failure_hook(settings: &Path, _marker: &Path) -> Result<bool,
 /// returned markers to the current process-correlated session/transcript; this
 /// function deliberately does not search for any "newest" transcript.
 pub fn read_markers(path: &Path) -> Result<Vec<HookMarker>, String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if !meta.file_type().is_file() {
-        return Err("hook marker is not a regular file".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.mode() & OWNER_ONLY != 0 || meta.uid() != rustix::process::getuid().as_raw() {
-            return Err("hook marker must be owner-only".into());
-        }
-    }
+    let meta = checked_file(path, "hook marker", true)?;
     if meta.len() > 1_048_576 {
         return Err("hook marker exceeds size limit".into());
     }
@@ -99,6 +92,37 @@ pub fn read_markers(path: &Path) -> Result<Vec<HookMarker>, String> {
         }
     }
     Ok(markers)
+}
+
+/// Append one bounded, strict marker without shell interpolation. O_APPEND
+/// makes each small JSONL record a single append operation; readers ignore an
+/// interrupted final line rather than guessing about a partial event.
+pub fn write_marker(path: &Path, marker: &HookMarker) -> Result<(), String> {
+    if !valid_marker(marker) {
+        return Err("invalid hook marker".into());
+    }
+    check_parent(path)?;
+    if path.exists() {
+        checked_file(path, "hook marker", true)?;
+    }
+    let encoded = serde_json::to_vec(marker).map_err(|error| error.to_string())?;
+    if encoded.len() > 8192 {
+        return Err("hook marker exceeds size limit".into());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    // Recheck after open so a pre-existing symlink is never silently followed.
+    checked_file(path, "hook marker", true)?;
+    file.write_all(&encoded)
+        .map_err(|error| error.to_string())?;
+    file.write_all(b"\n").map_err(|error| error.to_string())?;
+    file.sync_data().map_err(|error| error.to_string())
 }
 pub fn correlate_marker<'a>(
     markers: &'a [HookMarker],
@@ -121,37 +145,68 @@ fn read_settings(settings: &Path) -> Result<serde_json::Value, String> {
     if !settings.exists() {
         return Ok(serde_json::json!({}));
     }
-    let meta = fs::symlink_metadata(settings).map_err(|e| e.to_string())?;
-    if !meta.file_type().is_file() {
-        return Err("Claude settings must be a regular file".into());
-    }
+    checked_file(settings, "Claude settings", true)?;
     serde_json::from_slice(&fs::read(settings).map_err(|e| e.to_string())?)
         .map_err(|e| format!("invalid Claude settings JSON: {e}"))
 }
 fn check_parent(settings: &Path) -> Result<(), String> {
     let parent = settings.parent().ok_or("settings lacks parent")?;
-    let meta = fs::metadata(parent).map_err(|e| e.to_string())?;
+    let meta = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    if !meta.file_type().is_dir() {
+        return Err("configuration parent is not a directory".into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if meta.mode() & OWNER_ONLY != 0 || meta.uid() != rustix::process::getuid().as_raw() {
-            return Err("Claude configuration directory must be owner-only".into());
+        if meta.mode() & 0o022 != 0 || meta.uid() != rustix::process::getuid().as_raw() {
+            return Err(
+                "Claude configuration directory must be owned and not group/world writable".into(),
+            );
         }
     }
     Ok(())
 }
-fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
-    let parent = path.parent().ok_or("settings lacks parent")?;
-    let temp = parent.join(format!(".watchme-settings-{}.tmp", std::process::id()));
-    fs::write(
-        &temp,
-        serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+fn checked_file(path: &Path, label: &str, private: bool) -> Result<fs::Metadata, String> {
+    let meta = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{label} is not a regular file"));
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+        use std::os::unix::fs::MetadataExt;
+        let bad_mode = if private {
+            meta.mode() & OWNER_ONLY != 0
+        } else {
+            meta.mode() & 0o022 != 0
+        };
+        if bad_mode || meta.uid() != rustix::process::getuid().as_raw() {
+            return Err(format!("{label} must be owner-only"));
+        }
     }
+    Ok(meta)
+}
+fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    let parent = path.parent().ok_or("settings lacks parent")?;
+    check_parent(path)?;
+    let body = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+    let temp = (0_u32..64)
+        .map(|attempt| {
+            parent.join(format!(
+                ".watchme-settings-{}-{attempt}.tmp",
+                std::process::id()
+            ))
+        })
+        .find(|candidate| !candidate.exists())
+        .ok_or("unable to allocate private settings temporary file")?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp).map_err(|error| error.to_string())?;
+    file.write_all(&body).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
     fs::rename(temp, path).map_err(|e| e.to_string())
 }

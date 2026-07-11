@@ -11,5 +11,6 @@ pub use identity::{
     TARGET_IDENTITY_SCHEMA_VERSION, TargetIdentity,
 };
 pub use state::{
-    ObservationSchedule, WATCHER_STATE_SCHEMA_VERSION, WatcherLifecycle, WatcherState,
+    ClaudeSessionReference, ObservationSchedule, WATCHER_STATE_SCHEMA_VERSION, WatcherLifecycle,
+    WatcherState,
 };
