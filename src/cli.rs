@@ -417,8 +417,8 @@ impl RegistrationClient for IpcRegistrationClient {
                     .spawn()
                     .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()))?;
                 let readiness =
-                    wait_for_readiness(&SystemWaitClock, DAEMON_STARTUP_TIMEOUT, || {
-                        request_daemon(&paths, &request)
+                    wait_for_readiness(&SystemWaitClock, DAEMON_STARTUP_TIMEOUT, |remaining| {
+                        request_daemon_with_timeout(&paths, &request, remaining)
                     });
                 match readiness {
                     Ok(response) => {
@@ -474,12 +474,13 @@ impl WaitClock for SystemWaitClock {
 fn wait_for_readiness<T, E>(
     clock: &impl WaitClock,
     timeout: Duration,
-    mut attempt: impl FnMut() -> Result<T, E>,
+    mut attempt: impl FnMut(Duration) -> Result<T, E>,
 ) -> Result<T, E> {
     let deadline = clock.now() + timeout;
     let mut backoff = INITIAL_STARTUP_BACKOFF;
     loop {
-        match attempt() {
+        let remaining = deadline.saturating_duration_since(clock.now());
+        match attempt(remaining) {
             Ok(value) => return Ok(value),
             Err(error) => {
                 let now = clock.now();
@@ -543,18 +544,38 @@ fn sanitize_daemon_stderr(stderr: &[u8]) -> String {
 }
 
 fn request_daemon(paths: &WatchmePaths, request: &Request) -> std::io::Result<Response> {
+    request_daemon_with_timeout(paths, request, Duration::from_secs(2))
+}
+
+fn request_daemon_with_timeout(
+    paths: &WatchmePaths,
+    request: &Request,
+    timeout: Duration,
+) -> std::io::Result<Response> {
     let socket = paths.runtime_dir().join("daemon.sock");
     local_runtime()
         .map_err(|failure| std::io::Error::other(failure.error))?
-        .block_on(async {
+        .block_on(within_attempt_deadline(timeout, async {
             let mut stream = tokio::net::UnixStream::connect(socket).await?;
-            write_request(&mut stream, request, Duration::from_secs(2))
+            write_request(&mut stream, request, timeout)
                 .await
                 .map_err(std::io::Error::other)?;
-            read_response(&mut stream, Duration::from_secs(2))
+            read_response(&mut stream, timeout)
                 .await
                 .map_err(std::io::Error::other)
-        })
+        }))
+}
+
+async fn within_attempt_deadline<T>(
+    timeout: Duration,
+    future: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "daemon readiness deadline elapsed",
+        )
+    })?
 }
 
 fn unavailable(command: Command) -> CliFailure {
@@ -661,7 +682,9 @@ mod tests {
         };
         let started = clock.now();
         let mut attempts = 0;
-        let result = wait_for_readiness(&clock, Duration::from_secs(2), || {
+        let mut budgets = Vec::new();
+        let result = wait_for_readiness(&clock, Duration::from_secs(2), |remaining| {
+            budgets.push(remaining);
             attempts += 1;
             Err::<(), _>(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -671,6 +694,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(attempts > 5);
+        assert_eq!(budgets[0], Duration::from_secs(2));
+        assert!(budgets.windows(2).all(|pair| pair[0] >= pair[1]));
         assert_eq!(clock.now().duration_since(started), Duration::from_secs(2));
         let sleeps = clock.sleeps.borrow();
         assert!(
@@ -683,6 +708,23 @@ mod tests {
                 .iter()
                 .all(|delay| *delay <= Duration::from_millis(200))
         );
+    }
+
+    #[test]
+    fn readiness_attempt_future_is_bounded_by_remaining_deadline() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let error = runtime
+            .block_on(within_attempt_deadline(
+                Duration::from_millis(25),
+                std::future::pending::<std::io::Result<()>>(),
+            ))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(150));
     }
 
     #[test]

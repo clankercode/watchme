@@ -215,26 +215,7 @@ pub async fn run_with_peer_provider(
     let _cleanup = SocketCleanup(socket_path);
     let state_path = paths.state_file("watchers.json")?;
     let registry = Registry::load(JsonStore::new(state_path)).map_err(io::Error::other)?;
-    let (scheduler, runner) = Scheduler::new(idle_grace, stay_resident);
-    for watcher in registry.list() {
-        if matches!(
-            watcher.lifecycle,
-            WatcherLifecycle::Stopped { .. } | WatcherLifecycle::TargetTerminated
-        ) {
-            continue;
-        }
-        scheduler
-            .send(SchedulerEvent::Register(watcher.watcher_id.clone()))
-            .map_err(io::Error::other)?;
-        if matches!(
-            watcher.lifecycle,
-            WatcherLifecycle::Paused | WatcherLifecycle::HumanRequired { .. }
-        ) {
-            scheduler
-                .send(SchedulerEvent::Pause(watcher.watcher_id))
-                .map_err(io::Error::other)?;
-        }
-    }
+    let (mut scheduler, runner) = scheduler_from_registry(&registry, idle_grace, stay_resident)?;
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let peer_credentials = std::sync::Arc::new(peer_credentials);
     let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
@@ -245,7 +226,21 @@ pub async fn run_with_peer_provider(
     let result = loop {
         let accepted = tokio::select! {
             result = &mut scheduler_task => {
-                break result.map(|_| ()).map_err(io::Error::other);
+                result.map_err(io::Error::other)?;
+                while connection_tasks.join_next().await.is_some() {}
+                if shutdown_receiver.try_recv().is_ok() {
+                    break Ok(());
+                }
+                let registry_guard = registry.lock().await;
+                if !has_active_watchers(&registry_guard) {
+                    break Ok(());
+                }
+                let (replacement, runner) =
+                    scheduler_from_registry(&registry_guard, idle_grace, stay_resident)?;
+                drop(registry_guard);
+                scheduler = replacement;
+                scheduler_task = tokio::spawn(runner.run());
+                continue;
             }
             Some(()) = shutdown_receiver.recv() => {
                 let _ = scheduler.send(SchedulerEvent::Shutdown);
@@ -285,6 +280,43 @@ pub async fn run_with_peer_provider(
         let _ = scheduler_task.await;
     }
     result
+}
+
+fn scheduler_from_registry(
+    registry: &Registry,
+    idle_grace: Duration,
+    stay_resident: bool,
+) -> io::Result<(SchedulerHandle, Scheduler)> {
+    let (scheduler, runner) = Scheduler::new(idle_grace, stay_resident);
+    for watcher in registry.list() {
+        if matches!(
+            watcher.lifecycle,
+            WatcherLifecycle::Stopped { .. } | WatcherLifecycle::TargetTerminated
+        ) {
+            continue;
+        }
+        scheduler
+            .send(SchedulerEvent::Register(watcher.watcher_id.clone()))
+            .map_err(io::Error::other)?;
+        if matches!(
+            watcher.lifecycle,
+            WatcherLifecycle::Paused | WatcherLifecycle::HumanRequired { .. }
+        ) {
+            scheduler
+                .send(SchedulerEvent::Pause(watcher.watcher_id))
+                .map_err(io::Error::other)?;
+        }
+    }
+    Ok((scheduler, runner))
+}
+
+fn has_active_watchers(registry: &Registry) -> bool {
+    registry.list().iter().any(|watcher| {
+        !matches!(
+            watcher.lifecycle,
+            WatcherLifecycle::Stopped { .. } | WatcherLifecycle::TargetTerminated
+        )
+    })
 }
 
 async fn service_connection<P: PeerCredentialProvider>(

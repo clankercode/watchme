@@ -544,6 +544,72 @@ async fn stalled_peer_does_not_block_status_or_shutdown() {
     task.await.unwrap().unwrap();
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn accepted_registration_crossing_idle_deadline_completes_before_idle_exit() {
+    let temp = TempDir::new().unwrap();
+    let paths =
+        WatchmePaths::resolve(temp.path(), None, None, Some(&temp.path().join("run"))).unwrap();
+    let daemon_paths = paths.clone();
+    let task = tokio::spawn(async move {
+        watchme::daemon::run(&daemon_paths, Duration::from_millis(100), false).await
+    });
+    let socket = paths.runtime_dir().join("daemon.sock");
+    while !socket.exists() {
+        tokio::task::yield_now().await;
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let request = encode_frame(&Request::Register {
+        watcher: Box::new(state("late", 73, 803)),
+    })
+    .unwrap();
+    stream
+        .write_all(&(request.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&request[..1]).await.unwrap();
+    tokio::time::advance(Duration::from_millis(110)).await;
+    tokio::task::yield_now().await;
+    stream.write_all(&request[1..]).await.unwrap();
+    let mut length = [0; 4];
+    stream.read_exact(&mut length).await.unwrap();
+    let mut response = vec![0; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut response).await.unwrap();
+    assert!(matches!(
+        decode_frame::<Response>(&response).unwrap(),
+        Response::Registered {
+            watcher_id,
+            existing: false,
+        } if watcher_id == "late"
+    ));
+    assert!(matches!(
+        ipc(
+            &socket,
+            Request::Status {
+                id: Some("late".into()),
+            },
+        )
+        .await,
+        Response::Status { watchers, .. } if watchers.len() == 1
+    ));
+    assert_eq!(
+        ipc(
+            &socket,
+            Request::Stop {
+                id: Some("late".into()),
+                all: false,
+            },
+        )
+        .await,
+        Response::Stopped
+    );
+    tokio::time::advance(Duration::from_millis(110)).await;
+    tokio::task::yield_now().await;
+    task.await.unwrap().unwrap();
+    assert!(!socket.exists());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn daemon_bounds_simultaneous_connections() {
     let temp = TempDir::new().unwrap();
