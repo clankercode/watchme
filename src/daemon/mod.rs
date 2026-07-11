@@ -397,7 +397,10 @@ async fn service_connection<P: PeerCredentialProvider>(
         return;
     }
     if shutdown {
-        let _ = shutdown_sender.send(()).await;
+        match shutdown_sender.try_send(()) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {}
+        }
     }
 }
 
