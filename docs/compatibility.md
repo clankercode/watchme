@@ -1,5 +1,39 @@
 # Compatibility
 
+## Claude Code
+
+Probe date: 2026-07-11 (Australia/Sydney). The local executable resolves to
+`/home/xertrov/.local/bin/claude` and reports `Claude Code 2.1.207`. Its
+read-only `--help` surface confirms interactive operation, `--continue`,
+`--resume`, session IDs, and JSON/stream JSON output modes. It also exposes
+`--include-hook-events` for stream JSON. The help probe itself did not alter
+provider credentials or account state.
+
+An isolated, temporary tmux probe then started `claude --bare` in a fresh
+0700 directory and sent the documented local slash command
+`/rate-limit-options`. On this host, an existing first-run fullscreen-renderer
+confirmation intercepted the command. The bounded capture showed that prompt,
+not a rate-limit menu; WatchMe sent no confirmation, cursor navigation, or
+account-changing input, and immediately destroyed the tmux server and the
+temporary directory. Therefore the rate-limit UI remains fixture-tested only
+on this version; no live-menu compatibility claim is made from the probe.
+
+WatchMe treats the local `StopFailure` hook, when installed, as structured
+evidence only after exact session-ID and transcript-path correlation. The
+hook installer safely merges a tagged `StopFailure` entry into an existing
+owner-only `~/.claude/settings.json`; it does not overwrite other hooks, and
+uninstall removes only its own tagged entry. Markers must be owner-owned,
+regular, bounded JSONL files. WatchMe never chooses a transcript merely
+because it is newest.
+
+The terminal fallback is intentionally narrower than the installed UI:
+two identical, trusted live captures are required before it recognizes the
+semantic label `Stop and wait for limit to reset`. It sends only minimal
+allowlisted cursor keys, then Enter, and never selects usage-credit, funding,
+upgrade, login, billing, or account actions. Claude's native retry UI always
+wins over WatchMe backoff. This support is fixture-tested, not a guarantee
+that every future Claude Code UI layout remains action-compatible.
+
 ## Herdr
 
 Probe date: 2026-07-11 (Australia/Sydney).

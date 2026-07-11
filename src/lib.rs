@@ -1,6 +1,8 @@
+pub mod agents;
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod hooks;
 pub mod ipc;
 pub mod model;
 pub mod mux;

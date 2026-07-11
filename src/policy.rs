@@ -202,5 +202,8 @@ fn safe_text(text: &str) -> bool {
         ]
         .iter()
         .any(|word| lower.contains(word))
-        && matches!(text, "/goal resume" | "continue" | "retry")
+        && matches!(
+            text,
+            "/goal resume" | "continue" | "retry" | "Continue exactly where you left off."
+        )
 }
