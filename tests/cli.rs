@@ -38,16 +38,12 @@ fn start_is_not_a_command() {
 #[test]
 fn administrative_commands_parse() {
     for arguments in [
-        &["status", "watcher-1"][..],
-        &["list"],
-        &["explain", "watcher-1"],
+        &["explain", "watcher-1"][..],
         &["snapshot", "watcher-1", "--redacted"],
         &["logs", "watcher-1", "--follow"],
-        &["stop", "--all"],
         &["doctor", "--strict"],
         &["providers"],
         &["config", "check"],
-        &["daemon", "status"],
     ] {
         Command::cargo_bin("watchme")
             .expect("binary exists")
@@ -58,6 +54,21 @@ fn administrative_commands_parse() {
             .stderr(predicate::eq(
                 "watchme: capability unavailable: this administrative capability is not implemented yet\n",
             ));
+    }
+
+    for arguments in [
+        &["status", "watcher-1"][..],
+        &["list"],
+        &["stop", "--all"],
+        &["daemon", "status"],
+        &["daemon", "stop"],
+    ] {
+        Command::cargo_bin("watchme")
+            .expect("binary exists")
+            .args(arguments)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("daemon unavailable"));
     }
 }
 
@@ -71,16 +82,14 @@ fn json_errors_are_versioned_envelopes() {
 
     assert!(!output.status.success());
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("valid JSON response");
-    assert_eq!(
-        envelope,
-        serde_json::json!({
-            "schema_version": "1.0",
-            "ok": false,
-            "error": {
-                "code": "capability_unavailable",
-                "message": "this administrative capability is not implemented yet"
-            }
-        })
+    assert_eq!(envelope["schema_version"], "1.0");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "retryable_integration");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("daemon unavailable")
     );
     assert!(output.stderr.is_empty());
 }

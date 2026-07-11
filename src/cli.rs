@@ -1,5 +1,12 @@
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use watchme::daemon;
+use watchme::ipc::protocol::{Request, Response};
+use watchme::ipc::{read_response, write_request};
+use watchme::paths::WatchmePaths;
 
 use crate::error::WatchmeError;
 
@@ -143,8 +150,124 @@ pub fn run() -> Result<(), CliFailure> {
     let cli = Cli::parse();
     match cli.command {
         None => register_current_context().map_err(Into::into),
+        Some(Command::Status(options)) => admin(Request::Status, options.json),
+        Some(Command::List(options)) => admin(Request::List, options.json),
+        Some(Command::Stop(options)) => admin(
+            Request::Stop {
+                id: options.id,
+                all: options.all,
+            },
+            false,
+        ),
+        Some(Command::Daemon {
+            command: DaemonCommand::Run,
+        }) => run_daemon(),
+        Some(Command::Daemon {
+            command: DaemonCommand::Status,
+        }) => admin(Request::Status, false),
+        Some(Command::Daemon {
+            command: DaemonCommand::Stop,
+        }) => admin(Request::Shutdown, false),
         Some(command) => Err(unavailable(command)),
     }
+}
+
+fn runtime_paths() -> Result<WatchmePaths, CliFailure> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| WatchmeError::Configuration("HOME is not set".into()))?;
+    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let state = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    WatchmePaths::resolve(
+        Path::new(&home),
+        config.as_deref(),
+        state.as_deref(),
+        runtime.as_deref(),
+    )
+    .map_err(|error| WatchmeError::Configuration(error.to_string()).into())
+}
+
+fn local_runtime() -> Result<tokio::runtime::Runtime, CliFailure> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()).into())
+}
+
+fn run_daemon() -> Result<(), CliFailure> {
+    let paths = runtime_paths()?;
+    local_runtime()?
+        .block_on(daemon::run(&paths, Duration::from_secs(30), false))
+        .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()).into())
+}
+
+fn admin(request: Request, json: bool) -> Result<(), CliFailure> {
+    let paths = runtime_paths()?;
+    let socket = paths.runtime_dir().join("daemon.sock");
+    let response = local_runtime()?
+        .block_on(async {
+            let mut stream = tokio::net::UnixStream::connect(socket).await?;
+            write_request(&mut stream, &request, Duration::from_secs(2))
+                .await
+                .map_err(std::io::Error::other)?;
+            read_response(&mut stream, Duration::from_secs(2))
+                .await
+                .map_err(std::io::Error::other)
+        })
+        .map_err(|error| CliFailure {
+            error: WatchmeError::RetryableIntegration(format!("daemon unavailable: {error}")),
+            json,
+        })?;
+    render_response(response, json)
+}
+
+fn render_response(response: Response, json: bool) -> Result<(), CliFailure> {
+    if json {
+        #[derive(Serialize)]
+        struct SuccessEnvelope<'a> {
+            schema_version: &'static str,
+            ok: bool,
+            response: &'a Response,
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&SuccessEnvelope {
+                schema_version: SCHEMA_VERSION,
+                ok: true,
+                response: &response
+            })
+            .expect("response is serializable")
+        );
+        return Ok(());
+    }
+    match response {
+        Response::Status { running, watchers } => println!(
+            "daemon: {}\nwatchers: {watchers}",
+            if running { "running" } else { "stopped" }
+        ),
+        Response::Watchers { watchers } if watchers.is_empty() => println!("no watchers"),
+        Response::Watchers { watchers } => {
+            for watcher in watchers {
+                println!("{}\t{:?}", watcher.watcher_id, watcher.lifecycle);
+            }
+        }
+        Response::Registered {
+            watcher_id,
+            existing,
+        } => println!(
+            "{} watcher {watcher_id}",
+            if existing { "existing" } else { "registered" }
+        ),
+        Response::Stopped => println!("stopped"),
+        Response::Error { code, message } => {
+            return Err(CliFailure {
+                error: WatchmeError::RetryableIntegration(format!("{code}: {message}")),
+                json,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn register_current_context() -> Result<(), WatchmeError> {
