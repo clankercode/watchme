@@ -311,9 +311,9 @@ fn daemon_run_honors_config_stay_resident_and_idle_grace() {
         temp: &tempfile::TempDir,
         stay_resident: bool,
     ) -> (std::process::Child, PathBuf) {
-        let config = temp.path().join(format!("config-{}", stay_resident));
-        let state = temp.path().join(format!("state-{}", stay_resident));
-        let runtime = temp.path().join(format!("run-{}", stay_resident));
+        let config = temp.path().join(format!("config-{stay_resident}"));
+        let state = temp.path().join(format!("state-{stay_resident}"));
+        let runtime = temp.path().join(format!("run-{stay_resident}"));
         fs::create_dir_all(config.join("watchme")).unwrap();
         fs::create_dir_all(state.join("watchme")).unwrap();
         fs::create_dir_all(&runtime).unwrap();
