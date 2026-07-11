@@ -95,6 +95,18 @@ impl Observer for GenericObserver {
                     herdr_after_sequence: None,
                 });
             }
+            if let Some(event) = tokio::task::spawn_blocking({
+                let watcher = watcher.clone();
+                move || crate::agents::codex::observe_codex_event(&watcher, now)
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            {
+                return Ok(ObservationResult {
+                    event: Some(event),
+                    herdr_after_sequence: None,
+                });
+            }
             if let crate::model::TargetIdentity::Multiplexer {
                 context: Some(context),
                 process,

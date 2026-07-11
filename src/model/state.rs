@@ -41,12 +41,44 @@ pub struct ClaudeSessionReference {
     pub transcript_binding: Option<TranscriptBinding>,
 }
 
+/// A Codex session reference binds a durable thread to an owner-only rollout or
+/// App Server snapshot. It is never filled by a newest-file search.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexSessionReference {
+    pub thread_id: String,
+    pub rollout_path: String,
+    pub process_start_time: u64,
+    pub process_cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_session: Option<String>,
+    /// Captured at registration. Missing bindings remain readable but are
+    /// ineligible for correlated rollout recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_binding: Option<CodexRolloutBinding>,
+    /// Optional App Server / structured state snapshot path. Prefer this over
+    /// rollout when present, owner-only, and under the bound CWD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_server_state_path: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptBinding {
     pub canonical_path: String,
     pub device: u64,
     pub inode: u64,
+}
+
+/// Identity of a Codex rollout JSONL file at registration time. Size and mtime
+/// participate so a replaced file at the same path fails closed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexRolloutBinding {
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub mtime_secs: i64,
 }
 impl ObservationSchedule {
     fn is_default(&self) -> bool {
@@ -84,6 +116,8 @@ pub struct WatcherState {
     pub last_observation: Option<crate::model::Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session: Option<ClaudeSessionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_session: Option<CodexSessionReference>,
 }
 
 impl WatcherState {
@@ -105,6 +139,7 @@ impl WatcherState {
             observation_schedule: ObservationSchedule::default(),
             last_observation: None,
             claude_session: None,
+            codex_session: None,
         }
     }
 
@@ -126,6 +161,26 @@ impl WatcherState {
             return Err("invalid trusted Claude session reference".into());
         }
         self.claude_session = Some(reference);
+        Ok(())
+    }
+
+    pub fn set_codex_session(&mut self, reference: CodexSessionReference) -> Result<(), String> {
+        if reference.thread_id.is_empty()
+            || reference.thread_id.len() > 256
+            || !std::path::Path::new(&reference.rollout_path).is_absolute()
+            || !std::path::Path::new(&reference.process_cwd).is_absolute()
+            || reference
+                .target_session
+                .as_deref()
+                .is_some_and(|session| session.is_empty() || session.len() > 256)
+            || reference
+                .app_server_state_path
+                .as_deref()
+                .is_some_and(|path| !std::path::Path::new(path).is_absolute())
+        {
+            return Err("invalid trusted Codex session reference".into());
+        }
+        self.codex_session = Some(reference);
         Ok(())
     }
 }
@@ -152,6 +207,8 @@ impl<'de> Deserialize<'de> for WatcherState {
             last_observation: Option<crate::model::Event>,
             #[serde(default)]
             claude_session: Option<ClaudeSessionReference>,
+            #[serde(default)]
+            codex_session: Option<CodexSessionReference>,
         }
         let wire = Wire::deserialize(deserializer)?;
         if wire.schema_version != WATCHER_STATE_SCHEMA_VERSION {
@@ -171,6 +228,7 @@ impl<'de> Deserialize<'de> for WatcherState {
         state.observation_schedule = wire.observation_schedule;
         state.last_observation = wire.last_observation;
         state.claude_session = wire.claude_session;
+        state.codex_session = wire.codex_session;
         Ok(state)
     }
 }

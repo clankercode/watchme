@@ -6,10 +6,13 @@ use std::os::unix::fs::PermissionsExt;
 
 use tempfile::tempdir;
 use watchme::agents::codex::{
-    CodexRecipes, CodexRecoveryPlan, capacity_backoff_seconds, classify_goal_snapshot,
-    correlated_rollout_event, normalize_structured_source, parse_fixture_record,
-    resume_candidate_event, structured_goal_event, trusted_goal_progress_event,
+    CodexRecipes, CodexRecoveryPlan, CodexSessionReference, capacity_backoff_seconds,
+    classify_goal_snapshot, correlated_rollout_event, mark_resume_sent,
+    normalize_structured_source, observe_codex_event, parse_fixture_record,
+    probe_structured_source, resume_candidate_event, structured_goal_event,
+    trusted_goal_progress_event,
 };
+use watchme::daemon::{GenericObserver, Observer};
 use watchme::model::{
     ActionKind, Condition, Event, EventCategory, EventSource, PolicyHint, ProcessIdentity,
     SourceKind, TargetIdentity, WatcherLifecycle, WatcherState,
@@ -463,6 +466,202 @@ fn human_required_capacity_lookalikes_produce_no_input_recipe() {
             );
         }
     }
+}
+
+#[test]
+fn capability_probe_prefers_app_server_snapshot_then_bound_rollout() {
+    let cwd = std::env::current_dir().unwrap();
+    let temp = tempfile::TempDir::new_in(&cwd).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let snapshot = temp.path().join("app-server-goal.json");
+    fs::write(
+        &snapshot,
+        r#"{"thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"blocked"},"runtime_status":{"type":"idle","active_flags":[]},"last_error":{"category":"capacity_block","terminal":true}}"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let rollout = temp.path().join("rollout.jsonl");
+    fs::write(
+        &rollout,
+        concat!(
+            r#"{"type":"codex.rollout.goal","thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"blocked"},"runtime_status":{"type":"idle","active_flags":[]},"last_error":{"category":"capacity_block","terminal":true}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut watcher = bound_codex_watcher(temp.path(), &rollout, "thr_demo");
+    watcher
+        .codex_session
+        .as_mut()
+        .unwrap()
+        .app_server_state_path = Some(snapshot.to_string_lossy().into());
+
+    let probed = probe_structured_source(&watcher).expect("probed source");
+    assert!(
+        probed.is_app_server(),
+        "App Server / structured snapshot must win over rollout"
+    );
+
+    watcher
+        .codex_session
+        .as_mut()
+        .unwrap()
+        .app_server_state_path = None;
+    let probed = probe_structured_source(&watcher).expect("rollout fallback");
+    assert!(probed.is_rollout());
+
+    // Ambiguous / rotated binding fails closed.
+    fs::remove_file(&rollout).unwrap();
+    fs::write(
+        &rollout,
+        concat!(
+            r#"{"type":"codex.rollout.goal","thread_id":"thr_demo","goal":{"status":"blocked"},"runtime_status":{"type":"idle","active_flags":[]},"last_error":{"category":"capacity_block","terminal":true}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        probe_structured_source(&watcher).is_none(),
+        "rotated rollout without matching binding must fail closed"
+    );
+}
+
+#[test]
+fn observe_codex_emits_capacity_block_then_resume_candidate_and_progress() {
+    let cwd = std::env::current_dir().unwrap();
+    let temp = tempfile::TempDir::new_in(&cwd).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let rollout = temp.path().join("rollout.jsonl");
+    fs::write(
+        &rollout,
+        concat!(
+            r#"{"type":"codex.rollout.goal","thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"blocked"},"runtime_status":{"type":"idle","active_flags":[]},"last_error":{"category":"capacity_block","terminal":true}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut watcher = bound_codex_watcher(temp.path(), &rollout, "thr_demo");
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let blocked = observe_codex_event(&watcher, now).expect("capacity observation");
+    assert_eq!(blocked.category, EventCategory::CapacityBlock);
+    assert_eq!(blocked.policy_hint, PolicyHint::WaitAllowed);
+    assert_eq!(blocked.metadata["codex_capacity_block"], true);
+    assert_eq!(blocked.source.source_id, "codex");
+
+    watcher.last_observation = Some(blocked);
+    watcher.lifecycle = WatcherLifecycle::Waiting {
+        until_unix_ms: 1,
+        reason: "capacity backoff".into(),
+    };
+    let later = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:05:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let candidate = observe_codex_event(&watcher, later).expect("resume candidate");
+    assert_eq!(candidate.category, EventCategory::WaitingForModel);
+    assert_eq!(candidate.metadata["codex_resume"], true);
+
+    watcher.last_observation = Some(candidate.clone());
+    let action = CodexRecipes::default().action_for(&watcher).unwrap();
+    assert_eq!(
+        action.kind,
+        ActionKind::SendText {
+            text: "/goal resume".into()
+        }
+    );
+    let fingerprint = action_fingerprint(&action);
+    mark_resume_sent(watcher.last_observation.as_mut().unwrap(), &fingerprint);
+    assert!(
+        CodexRecipes::default().action_for(&watcher).is_none(),
+        "exactly-once fingerprint must suppress a second resume"
+    );
+
+    let progress = trusted_goal_progress_event(
+        &watcher,
+        &candidate,
+        &serde_json::json!({
+            "thread_id": "thr_demo",
+            "goal": {"status": "active", "text": "Finish the refactor"},
+            "runtime_status": {"type": "active", "active_flags": []}
+        }),
+        "2026-07-12T00:06:00Z",
+    )
+    .expect("post-resume progress");
+    assert_eq!(progress.metadata["codex_post_resume_progress"], true);
+    assert_eq!(progress.category, EventCategory::Working);
+}
+
+#[tokio::test]
+async fn daemon_observer_emits_codex_capacity_block_from_bound_rollout() {
+    let cwd = std::env::current_dir().unwrap();
+    let temp = tempfile::TempDir::new_in(&cwd).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let rollout = temp.path().join("rollout.jsonl");
+    fs::write(
+        &rollout,
+        concat!(
+            r#"{"type":"codex.rollout.goal","thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"blocked"},"runtime_status":{"type":"idle","active_flags":[]},"last_error":{"category":"capacity_block","terminal":true}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let watcher = bound_codex_watcher(temp.path(), &rollout, "thr_demo");
+    let result = GenericObserver.observe(watcher).await.unwrap();
+    let event = result.event.expect("Codex observation");
+    assert_eq!(event.source.source_id, "codex");
+    assert_eq!(event.category, EventCategory::CapacityBlock);
+    assert_eq!(event.policy_hint, PolicyHint::WaitAllowed);
+}
+
+fn bound_codex_watcher(bound_cwd: &Path, rollout: &Path, thread_id: &str) -> WatcherState {
+    let mut process = ProcessIdentity::new(std::process::id(), 42);
+    process.executable = Some("codex".into());
+    let mut watcher = WatcherState::new(
+        "codex-bound".into(),
+        TargetIdentity::process(process),
+        WatcherLifecycle::Observing,
+        1,
+        1,
+    );
+    let binding = watchme::agents::codex::bind_rollout(rollout).expect("rollout bind");
+    // Bind the process CWD to the live process CWD so Linux /proc correlation
+    // succeeds, while the rollout remains under the owner-only bound subtree.
+    let live_cwd = std::env::current_dir().unwrap();
+    assert!(
+        rollout.starts_with(&live_cwd),
+        "test rollout must stay under the live process CWD"
+    );
+    let _ = bound_cwd;
+    watcher
+        .set_codex_session(CodexSessionReference {
+            thread_id: thread_id.into(),
+            rollout_path: rollout.to_string_lossy().into(),
+            process_start_time: 42,
+            process_cwd: live_cwd.to_string_lossy().into(),
+            target_session: None,
+            rollout_binding: Some(binding),
+            app_server_state_path: None,
+        })
+        .unwrap();
+    watcher
 }
 
 fn codex_watcher(category: EventCategory, hint: PolicyHint, terminal: bool) -> WatcherState {

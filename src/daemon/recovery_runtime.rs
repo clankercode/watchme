@@ -115,6 +115,8 @@ impl EvidenceReader for FreshTargetEvidence {
         let watcher = self.watcher()?;
         if let Some(progress) = fresh_claude_progress(&watcher, &baseline.event) {
             evidence.event = progress;
+        } else if let Some(progress) = fresh_codex_progress(&watcher, &baseline.event) {
+            evidence.event = progress;
         }
         Ok(evidence)
     }
@@ -148,6 +150,40 @@ fn fresh_claude_progress(
         watcher,
         baseline,
         &live_tail,
+        &observed.to_rfc3339(),
+    )
+}
+
+/// Post-resume Codex proof prefers the capability-probed App Server / rollout
+/// snapshot over screen text so `GOAL_ACTIVE_OR_PURSUING` can verify.
+fn fresh_codex_progress(
+    watcher: &crate::model::WatcherState,
+    baseline: &crate::model::Event,
+) -> Option<crate::model::Event> {
+    if baseline.metadata.get("codex_resume") != Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    let source = crate::agents::codex::probe_structured_source(watcher)?;
+    let structured = match source {
+        crate::agents::codex::ProbedCodexSource::AppServer { snapshot, .. } => {
+            serde_json::to_value(&snapshot).ok()?
+        }
+        crate::agents::codex::ProbedCodexSource::Rollout { path, thread_id } => {
+            let event = crate::agents::codex::correlated_rollout_event(watcher, &path, &thread_id)?;
+            serde_json::json!({
+                "thread_id": event.metadata.get("codex_thread_id")?.as_str()?,
+                "goal": {
+                    "status": event.metadata.get("goal_state")?.as_str()?,
+                },
+                "runtime_status": {"type": "active", "active_flags": []}
+            })
+        }
+    };
+    let observed: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    crate::agents::codex::trusted_goal_progress_event(
+        watcher,
+        baseline,
+        &structured,
         &observed.to_rfc3339(),
     )
 }
@@ -464,6 +500,16 @@ pub(super) fn execute_recovery_action_with_cancellation(
             .is_err()
         {
             return;
+        }
+        if let Some(mut event) = guard
+            .get(&watcher.watcher_id)
+            .and_then(|current| current.last_observation.clone())
+            .filter(|event| {
+                event.metadata.get("codex_resume") == Some(&serde_json::Value::Bool(true))
+            })
+        {
+            crate::agents::codex::mark_resume_sent(&mut event, &fingerprint);
+            let _ = guard.persist_observation_event(&watcher.watcher_id, event, now_ms());
         }
         guard.dispatch_snapshot(&watcher.watcher_id).ok()
     };

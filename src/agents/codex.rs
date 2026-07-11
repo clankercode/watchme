@@ -3,13 +3,15 @@
 //! privileged shell APIs; recovery is wait-then-literal `/goal resume` only.
 
 use crate::model::{
-    Action, ActionKind, Condition, Event, EventCategory, EventSource, PolicyHint, SourceKind,
-    WatcherState,
+    Action, ActionKind, CodexRolloutBinding, Condition, Event, EventCategory, EventSource,
+    PolicyHint, SourceKind, WatcherState,
 };
 use crate::recovery::engine::{BuiltinRecipes, RecipeProvider};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub use crate::model::{CodexRolloutBinding as RolloutBinding, CodexSessionReference};
 
 pub const DEFAULT_RESUME: &str = "/goal resume";
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -61,12 +63,28 @@ pub struct CodexFixtureRecord {
     pub expected_action: CodexRecoveryPlan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RolloutBinding {
-    pub device: u64,
-    pub inode: u64,
-    pub size: u64,
-    pub mtime_secs: i64,
+/// Capability-probed Codex structured source. Prefer App Server / typed state
+/// when locally bound; otherwise correlated rollout JSONL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProbedCodexSource {
+    AppServer {
+        snapshot: CodexGoalSnapshot,
+        path: PathBuf,
+    },
+    Rollout {
+        path: PathBuf,
+        thread_id: String,
+    },
+}
+
+impl ProbedCodexSource {
+    pub fn is_app_server(&self) -> bool {
+        matches!(self, Self::AppServer { .. })
+    }
+
+    pub fn is_rollout(&self) -> bool {
+        matches!(self, Self::Rollout { .. })
+    }
 }
 
 /// Classify a normalized goal/runtime snapshot. Structured goal status wins over
@@ -200,12 +218,12 @@ pub fn capacity_backoff_seconds(attempt: u32, entropy: u64, cap: u64) -> u64 {
     entropy % ceiling.saturating_add(1)
 }
 
-pub fn bind_rollout(path: &Path) -> Option<RolloutBinding> {
+pub fn bind_rollout(path: &Path) -> Option<CodexRolloutBinding> {
     let meta = std::fs::metadata(path).ok()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Some(RolloutBinding {
+        Some(CodexRolloutBinding {
             device: meta.dev(),
             inode: meta.ino(),
             size: meta.len(),
@@ -219,7 +237,7 @@ pub fn bind_rollout(path: &Path) -> Option<RolloutBinding> {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs() as i64;
-        Some(RolloutBinding {
+        Some(CodexRolloutBinding {
             device: 0,
             inode: 0,
             size: meta.len(),
@@ -228,7 +246,7 @@ pub fn bind_rollout(path: &Path) -> Option<RolloutBinding> {
     }
 }
 
-pub fn rollout_matches_binding(path: &Path, binding: &RolloutBinding) -> bool {
+pub fn rollout_matches_binding(path: &Path, binding: &CodexRolloutBinding) -> bool {
     bind_rollout(path).is_some_and(|current| current == *binding)
 }
 
@@ -251,7 +269,7 @@ pub fn correlated_rollout_event(
             == Some(path.to_string_lossy().as_ref())
         {
             let previous_binding = previous.metadata.get("codex_rollout_binding")?;
-            let previous_binding: RolloutBinding =
+            let previous_binding: CodexRolloutBinding =
                 serde_json::from_value(previous_binding.clone()).ok()?;
             if previous_binding != binding {
                 return None;
@@ -294,6 +312,162 @@ pub fn correlated_rollout_event(
         serde_json::to_value(&binding).ok()?,
     );
     Some(event)
+}
+
+/// Prefer App Server / structured snapshot when bound and owner-only; otherwise
+/// correlated rollout JSONL under the process CWD. Missing, ambiguous, rotated,
+/// or world-readable paths fail closed.
+pub fn probe_structured_source(watcher: &WatcherState) -> Option<ProbedCodexSource> {
+    let reference = watcher.codex_session.as_ref()?;
+    let process = match &watcher.target {
+        crate::model::TargetIdentity::Process { process }
+        | crate::model::TargetIdentity::Multiplexer { process, .. } => process,
+    };
+    if process.start_time != reference.process_start_time
+        || current_target_session(&watcher.target) != reference.target_session
+        || !process_cwd_matches(process.pid, &reference.process_cwd)
+    {
+        return None;
+    }
+    let cwd = Path::new(&reference.process_cwd);
+    if let Some(path) = reference.app_server_state_path.as_deref() {
+        let path = Path::new(path);
+        if owner_only_bound_regular(path, cwd).is_some()
+            && let Ok(bytes) = std::fs::read(path)
+            && bytes.len() <= 1_048_576
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(snapshot) = normalize_structured_source(&value, SourceKind::TypedApi)
+            && snapshot.thread_id == reference.thread_id
+        {
+            return Some(ProbedCodexSource::AppServer {
+                snapshot,
+                path: path.to_path_buf(),
+            });
+        }
+    }
+    let rollout = Path::new(&reference.rollout_path);
+    let binding = reference.rollout_binding.as_ref()?;
+    let path = owner_only_bound_regular(rollout, cwd)?;
+    if !rollout_matches_binding(&path, binding) {
+        return None;
+    }
+    Some(ProbedCodexSource::Rollout {
+        path,
+        thread_id: reference.thread_id.clone(),
+    })
+}
+
+/// Production observation entry: resume candidate after wait, else probed
+/// App Server / correlated rollout event.
+pub fn observe_codex_event(
+    watcher: &WatcherState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Event> {
+    if resume_candidate_event(watcher, now).is_some() {
+        // A capacity wait that elapsed still needs the durable goal to remain
+        // blocked before we re-emit a resume candidate; re-probe when possible.
+        if let Some(source) = probe_structured_source(watcher) {
+            match source {
+                ProbedCodexSource::AppServer { snapshot, .. } => {
+                    if matches!(
+                        classify_goal_snapshot(&snapshot),
+                        CodexRecoveryPlan::WaitThenGoalResume
+                    ) {
+                        return resume_candidate_event(watcher, now);
+                    }
+                    return structured_goal_event(watcher, &snapshot, SourceKind::TypedApi);
+                }
+                ProbedCodexSource::Rollout { path, thread_id } => {
+                    if let Some(event) = correlated_rollout_event(watcher, &path, &thread_id) {
+                        if event.category == EventCategory::CapacityBlock {
+                            return resume_candidate_event(watcher, now);
+                        }
+                        return Some(event);
+                    }
+                }
+            }
+        } else {
+            return resume_candidate_event(watcher, now);
+        }
+    }
+    match probe_structured_source(watcher)? {
+        ProbedCodexSource::AppServer { snapshot, .. } => {
+            structured_goal_event(watcher, &snapshot, SourceKind::TypedApi)
+        }
+        ProbedCodexSource::Rollout { path, thread_id } => {
+            correlated_rollout_event(watcher, &path, &thread_id)
+        }
+    }
+}
+
+/// Durable exactly-once marker written when a Codex `/goal resume` is committed.
+pub fn mark_resume_sent(event: &mut Event, fingerprint: &str) {
+    if fingerprint.is_empty() {
+        return;
+    }
+    event.metadata.insert(
+        "codex_resume_sent_fingerprint".into(),
+        serde_json::Value::String(fingerprint.into()),
+    );
+}
+
+fn current_target_session(target: &crate::model::TargetIdentity) -> Option<String> {
+    match target {
+        crate::model::TargetIdentity::Process { .. } => None,
+        crate::model::TargetIdentity::Multiplexer { session, .. } => session.clone(),
+    }
+}
+
+fn process_cwd_matches(pid: u32, expected: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(actual) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+            return false;
+        };
+        actual == Path::new(expected)
+            || std::fs::canonicalize(expected)
+                .ok()
+                .is_some_and(|path| path == actual)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        std::fs::canonicalize(expected)
+            .ok()
+            .is_some_and(|path| path.is_dir())
+    }
+}
+
+/// Resolve `path` only when it is a regular, owner-only file whose canonical
+/// location stays under the bound CWD. Symlinks that escape the binding fail.
+fn owner_only_bound_regular(path: &Path, cwd: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        if !meta.file_type().is_file() || meta.permissions().mode() & 0o077 != 0 {
+            return None;
+        }
+        let uid = rustix::process::getuid().as_raw();
+        if meta.uid() != uid {
+            return None;
+        }
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let cwd = std::fs::canonicalize(cwd).ok()?;
+        if !canonical.starts_with(&cwd) {
+            return None;
+        }
+        let opened = std::fs::metadata(&canonical).ok()?;
+        if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+            return None;
+        }
+        Some(canonical)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cwd;
+        path.is_file().then(|| path.to_path_buf())
+    }
 }
 
 pub fn structured_goal_event(

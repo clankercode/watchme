@@ -353,8 +353,10 @@ impl Registry {
                     && machine.current_fingerprint() != Some(event.evidence_fingerprint.as_str());
                 if machine.state() == RecoveryState::Recovered
                     && ((matches!(watcher.lifecycle, WatcherLifecycle::Waiting { .. })
-                        && event.metadata.get("claude_resume")
-                            == Some(&serde_json::Value::Bool(true)))
+                        && (event.metadata.get("claude_resume")
+                            == Some(&serde_json::Value::Bool(true))
+                            || event.metadata.get("codex_resume")
+                                == Some(&serde_json::Value::Bool(true))))
                         || fresh_claude_limit_after_menu)
                 {
                     machine
