@@ -1,0 +1,15 @@
+pub mod agents;
+pub mod claude_attachment;
+pub mod client;
+pub mod config;
+pub mod daemon;
+pub mod hooks;
+pub mod ipc;
+pub mod model;
+pub mod mux;
+pub mod observe;
+pub mod paths;
+pub mod policy;
+pub mod process;
+pub mod recovery;
+pub mod store;

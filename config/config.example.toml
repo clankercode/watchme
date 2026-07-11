@@ -1,0 +1,200 @@
+# WatchMe conservative example configuration.
+# Copy to $XDG_CONFIG_HOME/watchme/config.toml (usually ~/.config/watchme/config.toml).
+# All unsafe or account-mutating automation is intentionally absent.
+
+config_version = 1
+
+[daemon]
+idle_grace_seconds = 30
+stay_resident = false
+max_watchers = 128
+socket_request_timeout_seconds = 5
+
+[observation]
+poll_interval_seconds = 60
+poll_jitter_seconds = 5
+screen_confirm_samples = 2
+max_screen_lines = 120
+max_screen_bytes = 30000
+max_structured_record_bytes = 262144
+max_json_depth = 64
+adapter_error_backoff_seconds = [5, 15, 60, 300]
+
+[lifecycle]
+reexec_grace_seconds = 3
+relaunch_dead_agent = false
+stop_on_ambiguous_identity = true
+
+[recovery]
+enabled = true
+max_attempts_per_fingerprint = 3
+max_attempts_per_session_per_day = 8
+default_action_timeout_seconds = 120
+require_empty_composer_for_text = true
+cancel_on_human_intervention = true
+verify_every_action = true
+
+[recovery.rate_limits]
+enabled = true
+select_wait_option_by_label = true
+reset_margin_seconds = 75
+allow_low_confidence_fallback_wait = false
+fallback_wait_seconds = 18000
+max_resume_attempts_per_limit = 2
+resume_text = "Continue exactly where you left off."
+
+[recovery.overload]
+enabled = true
+backoff_seconds = [30, 60, 120, 240, 300]
+jitter_mode = "full"
+max_total_wait_seconds = 7200
+respect_native_retries = true
+
+[recovery.codex_goal]
+enabled = true
+resume_command = "/goal resume"
+max_attempts_per_fingerprint = 3
+cooldown_seconds = 300
+require_structured_goal_when_available = true
+
+[planning]
+enabled = true
+max_calls_per_event = 1
+allow_independent_second_opinion = false
+max_calls_per_session_per_day = 4
+max_concurrent_calls = 1
+timeout_seconds = 90
+max_output_bytes = 100000
+max_snapshot_bytes = 50000
+allow_unknown_provider_family = false
+allow_repository_context = false
+allow_network = false
+
+# Ordered planner IDs. These only become eligible when the executable and safe
+# capabilities are verified and the provider family differs from the failed one.
+planner_priority = ["codex", "claude", "hermes", "opencode", "pi"]
+
+[planning.planners.codex]
+enabled = true
+executable = "codex"
+provider_family = "openai"
+# Production implementation owns the exact safe argv template after capability probe.
+
+[planning.planners.claude]
+enabled = true
+executable = "claude"
+provider_family = "anthropic"
+
+[planning.planners.hermes]
+enabled = true
+executable = "hermes"
+# Hermes is a router: do not set a fixed family unless a provider/model is pinned.
+provider_family = "unknown"
+provider = ""
+model = ""
+
+[planning.planners.opencode]
+enabled = true
+executable = "opencode"
+provider_family = "unknown"
+model = ""
+
+[planning.planners.pi]
+enabled = false
+executable = "pi"
+provider_family = "unknown"
+# Pi has no built-in permission boundary; enable only with external confinement.
+
+[planning.planners.kimi]
+enabled = false
+executable = "kimi"
+provider_family = "moonshot"
+# Current print/AFK semantics require hardened isolation and capability verification.
+
+[planning.planners.openhands]
+enabled = false
+executable = "openhands"
+provider_family = "unknown"
+# Current headless mode is always-approve; host execution is disabled.
+
+[planning.planners.grok]
+enabled = false
+executable = "grok-build"
+provider_family = "xai"
+# Enable only after probing a safe noninteractive mode.
+
+[security]
+telemetry = false
+raw_evidence_persistence = false
+allow_remote_manifest_updates = false
+allow_project_config = false
+require_owner_only_paths = true
+reject_symlinks_for_state = true
+minimal_child_environment = true
+
+# Additional case-insensitive variable/header names to redact.
+extra_secret_names = [
+  "MY_INTERNAL_TOKEN",
+  "PRIVATE_API_KEY"
+]
+
+[retention]
+events_days = 14
+audit_days = 30
+snapshots_days = 3
+max_log_bytes = 10485760
+max_snapshot_files = 100
+
+[notifications]
+herdr = true
+desktop = true
+stderr = true
+notify_on_recovery = true
+notify_on_human_required = true
+notify_on_target_exit = false
+
+[manifests]
+bundled = true
+local_directory = "~/.config/watchme/manifests"
+remote_updates = false
+strict_unknown_versions = true
+
+[agents.claude]
+enabled = true
+deterministic_recovery = true
+ai_planning = true
+
+[agents.codex]
+enabled = true
+deterministic_recovery = true
+ai_planning = true
+
+[agents.opencode]
+enabled = true
+deterministic_recovery = false
+ai_planning = true
+
+[agents.pi]
+enabled = true
+deterministic_recovery = false
+ai_planning = true
+
+[agents.hermes]
+enabled = true
+deterministic_recovery = false
+ai_planning = true
+
+[agents.kimi]
+enabled = true
+deterministic_recovery = false
+ai_planning = false
+
+[agents.grok]
+enabled = true
+deterministic_recovery = false
+ai_planning = false
+
+[agents.openhands]
+enabled = true
+deterministic_recovery = false
+ai_planning = false

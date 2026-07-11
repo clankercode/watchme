@@ -1,0 +1,18 @@
+# Example Herdr-side bridge for WatchMe's local protocol.
+# This is illustrative until an upstream Herdr plugin API is available and probed.
+[watchme]
+enabled = true
+protocol = "watchme.herdr"
+schema_version = 1
+socket_mode = "0600"
+authenticate_peer_uid = true
+max_request_bytes = 262144
+
+[watchme.capabilities]
+process_info = true
+pane_read = true
+send_text = true
+send_keys = true
+agent_session = true
+agent_state_events = true
+notification = true

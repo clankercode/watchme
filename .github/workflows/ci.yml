@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  lint:
+    name: Format and Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.85 --profile minimal --component clippy,rustfmt
+      - name: Select Rust toolchain
+        run: rustup default 1.85
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked
+      - name: Test release reconciliation
+        run: scripts/test-reconcile-release.sh
+
+  test:
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+          - name: macOS x86_64
+            runner: macos-15-intel
+          - name: macOS aarch64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.85 --profile minimal
+      - name: Select Rust toolchain
+        run: rustup default 1.85
+      - name: Run tests
+        run: cargo test --all-features --locked
+      - name: Build release binary
+        run: cargo build --release --locked

@@ -1,0 +1,196 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+use serde_json::Value;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use tempfile::tempdir;
+
+#[test]
+fn bare_watchme_outside_agent_explains_shell_escape_and_doctor() {
+    Command::cargo_bin("watchme")
+        .expect("binary exists")
+        .env_remove("TMUX")
+        .env_remove("WATCHME_TEST_AGENT_CONTEXT")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("!watchme"))
+        .stderr(predicate::str::contains("watchme doctor"));
+}
+
+#[test]
+fn test_context_environment_variable_cannot_bypass_detection() {
+    Command::cargo_bin("watchme")
+        .expect("binary exists")
+        .env("WATCHME_TEST_AGENT_CONTEXT", "claude")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported context"))
+        .stderr(predicate::str::contains("!watchme"));
+}
+
+#[test]
+fn start_is_not_a_command() {
+    Command::cargo_bin("watchme")
+        .expect("binary exists")
+        .arg("start")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand 'start'"));
+}
+
+#[test]
+fn administrative_commands_parse() {
+    for arguments in [
+        &["explain", "watcher-1"][..],
+        &["snapshot", "watcher-1", "--redacted"],
+        &["logs", "watcher-1", "--follow"],
+        &["doctor", "--strict"],
+        &["providers"],
+        &["config", "check"],
+    ] {
+        Command::cargo_bin("watchme")
+            .expect("binary exists")
+            .args(arguments)
+            .assert()
+            .failure()
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::eq(
+                "watchme: capability unavailable: this administrative capability is not implemented yet\n",
+            ));
+    }
+
+    for arguments in [
+        &["status", "watcher-1"][..],
+        &["list"],
+        &["stop", "--all"],
+        &["pause", "watcher-1"],
+        &["resume", "watcher-1"],
+        &["daemon", "status"],
+        &["daemon", "stop"],
+    ] {
+        Command::cargo_bin("watchme")
+            .expect("binary exists")
+            .args(arguments)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("daemon unavailable"));
+    }
+}
+
+#[test]
+fn stop_requires_a_target() {
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .arg("stop")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires"));
+}
+
+#[test]
+fn administrative_target_ids_must_not_be_empty() {
+    for arguments in [
+        &["status", ""][..],
+        &["stop", ""],
+        &["pause", ""],
+        &["resume", ""],
+    ] {
+        Command::cargo_bin("watchme")
+            .unwrap()
+            .args(arguments)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("target ID must not be empty"));
+    }
+}
+
+#[test]
+fn json_errors_are_versioned_envelopes() {
+    let output = Command::cargo_bin("watchme")
+        .expect("binary exists")
+        .args(["list", "--json"])
+        .output()
+        .expect("command runs");
+
+    assert!(!output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("valid JSON response");
+    assert_eq!(envelope["schema_version"], "1.0");
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "retryable_integration");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("daemon unavailable")
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn stop_failure_hook_mode_writes_only_a_valid_marker() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let marker = temp.path().join("markers.jsonl");
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .args(["watchme-hook-stop-failure", "--marker", marker.to_str().unwrap()])
+        .write_stdin(r#"{"session_id":"s","transcript_path":"/tmp/t.jsonl","cwd":"/tmp","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"429 Too Many Requests","last_assistant_message":"API Error: Rate limit reached","future_claude_field":{"ok":true}}"#)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+    assert!(fs::read_to_string(marker).unwrap().contains("rate_limit"));
+}
+
+#[test]
+fn stop_failure_hook_rejects_malformed_or_secret_bearing_payloads() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = temp.path().join("markers.jsonl");
+    for payload in [
+        r#"{"session_id":"s","transcript_path":"/tmp/t.jsonl","hook_event_name":"Stop","error":"rate_limit"}"#,
+        r#"{"session_id":"s","transcript_path":"relative.jsonl","hook_event_name":"StopFailure","error":"rate_limit"}"#,
+        r#"{"session_id":"s","transcript_path":"/tmp/t.jsonl","hook_event_name":"StopFailure","error":"rate_limit","error_details":"Bearer secret-token"}"#,
+    ] {
+        Command::cargo_bin("watchme")
+            .unwrap()
+            .args([
+                "watchme-hook-stop-failure",
+                "--marker",
+                marker.to_str().unwrap(),
+            ])
+            .write_stdin(payload)
+            .assert()
+            .failure();
+    }
+    assert!(!marker.exists());
+}
+
+#[test]
+fn public_claude_hook_lifecycle_is_dry_run_safe_and_has_no_registration_alias() {
+    let temp = tempdir().unwrap();
+    let settings = temp.path().join("settings.json");
+    let marker = temp.path().join("watch me.jsonl");
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .args([
+            "hooks",
+            "install-claude",
+            "--settings",
+            settings.to_str().unwrap(),
+            "--marker",
+            marker.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would install Claude hook"))
+        .stdout(predicate::str::contains("--marker '"));
+    assert!(!settings.exists());
+}
