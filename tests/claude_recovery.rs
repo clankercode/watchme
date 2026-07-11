@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -6,9 +7,8 @@ use std::path::PathBuf;
 use chrono::{Datelike, FixedOffset, TimeZone, Timelike};
 use tempfile::tempdir;
 use watchme::agents::claude::{
-    ClaudeClass, ClaudeRecipes, DEFAULT_RESUME, classify_screen, classify_stop_failure,
-    correlated_hook_event, labelled_wait_menu, menu_keys, resume_candidate_event,
-    trusted_menu_event,
+    ClaudeClass, ClaudeRecipes, classify_screen, classify_stop_failure, correlated_hook_event,
+    labelled_wait_menu, menu_keys, resume_candidate_event, trusted_menu_event,
 };
 use watchme::daemon::{GenericObserver, Observer};
 use watchme::hooks::claude::{
@@ -74,6 +74,33 @@ fn resume_candidate_requires_wait_deadline_and_a_still_correlated_marker() {
 }
 
 #[test]
+fn resume_candidate_is_observation_only_without_a_ranked_claude_working_proof() {
+    let mut watcher = claude_watcher(EventCategory::UsageLimit, PolicyHint::WaitAllowed, true);
+    watcher.lifecycle = WatcherLifecycle::Waiting {
+        until_unix_ms: 1,
+        reason: "recovery wait scheduled".into(),
+    };
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let event = watcher.last_observation.as_mut().unwrap();
+    event.metadata.insert(
+        "claude_reset_at".into(),
+        serde_json::Value::String("2026-07-11T00:00:00Z".into()),
+    );
+    event.metadata.insert(
+        "claude_resume_margin_seconds".into(),
+        serde_json::Value::Number(0.into()),
+    );
+    watcher.last_observation = Some(resume_candidate_event(&watcher, now).unwrap());
+    assert_eq!(
+        watcher.last_observation.as_ref().unwrap().policy_hint,
+        PolicyHint::ObserveOnly
+    );
+    assert!(ClaudeRecipes::default().action_for(&watcher).is_none());
+}
+
+#[test]
 fn hook_marker_writer_is_append_only_and_rejects_unsafe_marker_paths() {
     let temp = tempdir().unwrap();
     #[cfg(unix)]
@@ -105,7 +132,6 @@ fn live_screen_menu_uses_label_never_option_number_and_requires_stability() {
     let menu = labelled_wait_menu(screen, screen).expect("stable menu");
     assert_eq!(menu.moves, 0);
     assert_eq!(menu_keys(&menu), ["ENTER"]);
-    assert_eq!(DEFAULT_RESUME, "Continue exactly where you left off.");
     assert_eq!(classify_screen(screen, screen), ClaudeClass::UsageLimit);
     assert!(labelled_wait_menu(screen, "Working... [stop]").is_none());
     assert!(
@@ -182,9 +208,11 @@ fn hook_merge_ingestion_and_remove_preserve_user_settings() {
     );
     let installed: serde_json::Value =
         serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
-    let command = installed["hooks"]["StopFailure"][0]["command"]
-        .as_str()
-        .unwrap();
+    let group = &installed["hooks"]["StopFailure"][0];
+    assert_eq!(group["matcher"], "rate_limit|overloaded|server_error");
+    assert_eq!(group["hooks"].as_array().unwrap().len(), 1);
+    assert_eq!(group["hooks"][0]["type"], "command");
+    let command = group["hooks"][0]["command"].as_str().unwrap();
     assert_eq!(
         command,
         format!(
@@ -215,6 +243,100 @@ fn hook_merge_ingestion_and_remove_preserve_user_settings() {
         fs::read_to_string(&settings)
             .unwrap()
             .contains("PreToolUse")
+    );
+}
+
+#[test]
+fn hook_lifecycle_preserves_other_stop_failure_matcher_groups() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let settings = temp.path().join("settings.json");
+    fs::write(
+        &settings,
+        r#"{"hooks":{"StopFailure":[{"matcher":"authentication_failed","hooks":[{"type":"command","command":"keep"}]}]}}"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&settings, fs::Permissions::from_mode(0o600)).unwrap();
+    let marker = temp.path().join("markers.jsonl");
+    assert!(install_stop_failure_hook(&settings, &marker).unwrap());
+    let installed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(
+        installed["hooks"]["StopFailure"].as_array().unwrap().len(),
+        2
+    );
+    assert!(remove_stop_failure_hook(&settings, &marker).unwrap());
+    let removed: serde_json::Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(removed["hooks"]["StopFailure"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        removed["hooks"]["StopFailure"][0]["matcher"],
+        "authentication_failed"
+    );
+}
+
+#[test]
+fn transcript_binding_accepts_append_but_rejects_replacement() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let transcript = temp.path().join("session.jsonl");
+    fs::write(&transcript, "{\"sessionId\":\"s\"}\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    let canonical = fs::canonicalize(&transcript).unwrap();
+    let binding = watchme::hooks::claude::bind_transcript(&canonical).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(b"{\"type\":\"assistant\"}\n")
+        .unwrap();
+    assert!(watchme::hooks::claude::transcript_matches_binding(
+        &transcript,
+        &canonical,
+        &binding
+    ));
+    let rotated = temp.path().join("session.old.jsonl");
+    fs::rename(&transcript, &rotated).unwrap();
+    fs::write(&transcript, "{\"sessionId\":\"s\"}\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!watchme::hooks::claude::transcript_matches_binding(
+        &transcript,
+        &canonical,
+        &binding
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_registration_discovers_only_the_open_standard_claude_transcript() {
+    let temp = tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let home = temp.path().join("home");
+    let transcript = home.join(".claude/projects/example/session-123.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::set_permissions(home.join(".claude"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(
+        home.join(".claude/projects"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(
+        &transcript,
+        "{\"sessionId\":\"session-123\",\"type\":\"user\"}\n",
+    )
+    .unwrap();
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    let proc_root = temp.path().join("proc");
+    let fd = proc_root.join("77/fd");
+    fs::create_dir_all(&fd).unwrap();
+    std::os::unix::fs::symlink(&transcript, fd.join("8")).unwrap();
+    assert_eq!(
+        watchme::claude_attachment::discover_linux_open_transcript_at(&proc_root, &home, 77),
+        Some(("session-123".into(), fs::canonicalize(&transcript).unwrap()))
     );
 }
 
@@ -271,7 +393,7 @@ fn marker_reader_prefers_the_newest_exact_marker_beyond_its_bounded_window() {
 }
 
 #[test]
-fn transcript_binding_rejects_copytruncate_and_replacement() {
+fn transcript_binding_rejects_replacement_without_treating_mutable_contents_as_identity() {
     let temp = tempdir().unwrap();
     #[cfg(unix)]
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -281,7 +403,7 @@ fn transcript_binding_rejects_copytruncate_and_replacement() {
     fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
     let binding = watchme::hooks::claude::bind_transcript(&transcript).unwrap();
     fs::write(&transcript, "different-length-evidence\n").unwrap();
-    assert!(!watchme::hooks::claude::transcript_matches_binding(
+    assert!(watchme::hooks::claude::transcript_matches_binding(
         &transcript,
         &transcript,
         &binding
@@ -427,6 +549,7 @@ fn correlated_hook_marker_becomes_claude_event_only_for_the_registered_process_a
             marker_path: marker_path.to_string_lossy().into(),
             process_start_time: 2,
             process_cwd: std::env::current_dir().unwrap().to_string_lossy().into(),
+            target_session: None,
             transcript_binding: Some(watchme::hooks::claude::bind_transcript(&transcript).unwrap()),
         })
         .unwrap();
@@ -475,6 +598,7 @@ async fn daemon_observer_prioritizes_a_correlated_claude_hook_over_generic_liven
             marker_path: marker_path.to_string_lossy().into(),
             process_start_time: 7,
             process_cwd: std::env::current_dir().unwrap().to_string_lossy().into(),
+            target_session: None,
             transcript_binding: Some(watchme::hooks::claude::bind_transcript(&transcript).unwrap()),
         })
         .unwrap();

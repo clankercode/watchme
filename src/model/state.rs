@@ -31,6 +31,10 @@ pub struct ClaudeSessionReference {
     pub marker_path: String,
     pub process_start_time: u64,
     pub process_cwd: String,
+    /// The registered multiplexer session, when present. It prevents a hook
+    /// marker from surviving a pane/session retarget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_session: Option<String>,
     /// Captured at registration. Legacy references without this proof remain
     /// readable but are intentionally ineligible for hook recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,11 +44,9 @@ pub struct ClaudeSessionReference {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptBinding {
+    pub canonical_path: String,
     pub device: u64,
     pub inode: u64,
-    pub length: u64,
-    pub changed_at_ns: i128,
-    pub head_digest: String,
 }
 impl ObservationSchedule {
     fn is_default(&self) -> bool {
@@ -116,6 +118,10 @@ impl WatcherState {
             || !std::path::Path::new(&reference.transcript_path).is_absolute()
             || !std::path::Path::new(&reference.marker_path).is_absolute()
             || !std::path::Path::new(&reference.process_cwd).is_absolute()
+            || reference
+                .target_session
+                .as_deref()
+                .is_some_and(|session| session.is_empty() || session.len() > 256)
         {
             return Err("invalid trusted Claude session reference".into());
         }

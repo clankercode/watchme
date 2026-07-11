@@ -315,12 +315,8 @@ fn hook_stop_failure(options: HookStopFailure) -> Result<(), WatchmeError> {
             "Claude hook payload exceeds size limit".into(),
         ));
     }
-    let marker =
-        serde_json::from_slice::<watchme::hooks::claude::HookMarker>(&payload).map_err(|_| {
-            WatchmeError::PolicyDenied(
-                "Claude hook payload is not a valid StopFailure marker".into(),
-            )
-        })?;
+    let marker = watchme::hooks::claude::parse_stop_failure_payload(&payload)
+        .map_err(WatchmeError::PolicyDenied)?;
     watchme::hooks::claude::write_marker(&options.marker, &marker)
         .map_err(|_| WatchmeError::PolicyDenied("Claude hook marker path is unsafe".into()))
 }
@@ -557,7 +553,7 @@ impl RegistrationContextDetector for ProductionContextDetector {
                 0,
                 unix_time_ms(),
             );
-            crate::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
+            watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
             return Ok(ResolvedRegistration { watcher });
         }
 
@@ -597,7 +593,7 @@ impl RegistrationContextDetector for ProductionContextDetector {
                 0,
                 unix_time_ms(),
             );
-            crate::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
+            watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
             return Ok(ResolvedRegistration { watcher });
         }
         let watcher_id = format!(
@@ -611,7 +607,7 @@ impl RegistrationContextDetector for ProductionContextDetector {
             0,
             unix_time_ms(),
         );
-        crate::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
+        watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
         Ok(ResolvedRegistration { watcher })
     }
 }

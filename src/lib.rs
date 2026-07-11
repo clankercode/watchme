@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod claude_attachment;
 pub mod client;
 pub mod config;
 pub mod daemon;

@@ -19,12 +19,16 @@ temporary directory. Therefore the rate-limit UI remains fixture-tested only
 on this version; no live-menu compatibility claim is made from the probe.
 
 WatchMe treats the local `StopFailure` hook, when installed, as structured
-evidence only after exact session-ID and transcript-path correlation. The
-hook installer safely merges a tagged `StopFailure` entry into an existing
-owner-only `~/.claude/settings.json`; it does not overwrite other hooks, and
-uninstall removes only its own tagged entry. Markers must be owner-owned,
-regular, bounded JSONL files. WatchMe never chooses a transcript merely
-because it is newest.
+evidence only after exact session-ID, transcript-path, device/inode, process
+start-time, CWD, and target-session correlation. The hook installer safely
+merges a documented `StopFailure` matcher group and command handler into an
+existing owner-only `~/.claude/settings.json`; it does not overwrite other
+groups, and uninstall removes only that exact handler. Markers must be
+owner-owned, regular, bounded JSONL files. WatchMe never chooses a transcript
+merely because it is newest. Linux registration can instead correlate the
+one owner-private standard Claude transcript already open by the target
+process; macOS has no equivalent automatic open-file proof and therefore
+requires the explicit supported correlation values or disables hook recovery.
 
 Install or remove this optional integration explicitly with
 `watchme hooks install-claude` and `watchme hooks remove-claude`.
@@ -38,19 +42,16 @@ transcript, marker, resolved agent PID/start-time, and canonical CWD
 environment correlation. If that proof is unavailable WatchMe simply does
 not enable hook recovery for that watcher.
 
-The terminal fallback is intentionally narrower than the installed UI:
-two identical, trusted live captures are required before it recognizes the
-semantic label `Stop and wait for limit to reset`. It sends only minimal
-allowlisted cursor keys, then Enter, and never selects usage-credit, funding,
-upgrade, login, billing, or account actions. Claude's native retry UI always
-wins over WatchMe backoff. This support is fixture-tested, not a guarantee
-that every future Claude Code UI layout remains action-compatible.
-
-After a correlated reset wait is persisted, WatchMe waits through the parsed
-margin, rechecks the same target/session evidence, then sends its fixed
-resume text once through the normal durable action transaction. It verifies a
-fresh working state before recording success; intervention, changed identity,
-missing evidence, or an unparseable reset requires a human instead.
+The terminal fallback is observation-only on Claude Code 2.1.207. The local
+`/rate-limit-options` probe did not establish a versioned, out-of-band renderer
+boundary that can distinguish current UI chrome from terminal content, so
+WatchMe does not content-search a pane and will not send menu keys. It also
+does not automatically send a post-reset resume message: the current hook
+evidence has higher provenance than generic working/liveness observations, so
+such a side effect could not be verified honestly. A future adapter may enable
+either action only after supplying a versioned trusted boundary or an equally
+ranked structured Claude working proof. Until then, changed identity, missing
+evidence, or an elapsed reset remains a human hand-off.
 
 ## Herdr
 

@@ -2,6 +2,8 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
 #[test]
@@ -137,16 +139,37 @@ fn stop_failure_hook_mode_writes_only_a_valid_marker() {
     Command::cargo_bin("watchme")
         .unwrap()
         .args(["watchme-hook-stop-failure", "--marker", marker.to_str().unwrap()])
-        .write_stdin(r#"{"session_id":"s","transcript_path":"/tmp/t.jsonl","error_type":"rate_limit_error","detail":"resets in 10 minutes"}"#)
+        .write_stdin(r#"{"session_id":"s","transcript_path":"/tmp/t.jsonl","cwd":"/tmp","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"429 Too Many Requests","last_assistant_message":"API Error: Rate limit reached","future_claude_field":{"ok":true}}"#)
         .assert()
         .success()
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::is_empty());
-    assert!(
-        fs::read_to_string(marker)
+    assert!(fs::read_to_string(marker).unwrap().contains("rate_limit"));
+}
+
+#[test]
+fn stop_failure_hook_rejects_malformed_or_secret_bearing_payloads() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = temp.path().join("markers.jsonl");
+    for payload in [
+        r#"{"session_id":"s","transcript_path":"/tmp/t.jsonl","hook_event_name":"Stop","error":"rate_limit"}"#,
+        r#"{"session_id":"s","transcript_path":"relative.jsonl","hook_event_name":"StopFailure","error":"rate_limit"}"#,
+        r#"{"session_id":"s","transcript_path":"/tmp/t.jsonl","hook_event_name":"StopFailure","error":"rate_limit","error_details":"Bearer secret-token"}"#,
+    ] {
+        Command::cargo_bin("watchme")
             .unwrap()
-            .contains("rate_limit_error")
-    );
+            .args([
+                "watchme-hook-stop-failure",
+                "--marker",
+                marker.to_str().unwrap(),
+            ])
+            .write_stdin(payload)
+            .assert()
+            .failure();
+    }
+    assert!(!marker.exists());
 }
 
 #[test]

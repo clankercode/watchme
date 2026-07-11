@@ -185,8 +185,6 @@ pub fn menu_keys(menu: &WaitMenu) -> Vec<&'static str> {
         .collect()
 }
 
-pub const DEFAULT_RESUME: &str = "Continue exactly where you left off.";
-
 /// Convert only an exactly correlated, owner-private StopFailure marker into a
 /// normalized event.  Missing, rotated, partial, or untrusted marker files are
 /// not evidence and therefore produce no action.
@@ -199,6 +197,7 @@ pub fn correlated_hook_event(watcher: &WatcherState) -> Option<Event> {
     };
     if process.start_time != reference.process_start_time
         || !process_cwd_matches(process.pid, &reference.process_cwd)
+        || current_target_session(&watcher.target) != reference.target_session
         || !crate::hooks::claude::transcript_matches_binding(
             std::path::Path::new(&reference.transcript_path),
             std::path::Path::new(&reference.transcript_path),
@@ -277,6 +276,13 @@ pub fn correlated_hook_event(watcher: &WatcherState) -> Option<Event> {
     Some(event)
 }
 
+fn current_target_session(target: &crate::model::TargetIdentity) -> Option<String> {
+    match target {
+        crate::model::TargetIdentity::Process { .. } => None,
+        crate::model::TargetIdentity::Multiplexer { session, .. } => session.clone(),
+    }
+}
+
 /// Creates a distinct, correlated resume candidate only after the persisted
 /// reset time and margin. It is deliberately not a terminal-menu heuristic:
 /// the action transaction still revalidates target, user intervention, and
@@ -324,7 +330,12 @@ pub fn resume_candidate_event(
     event.observed_at = now.to_rfc3339();
     event.category = EventCategory::WaitingForModel;
     event.terminal = false;
-    event.policy_hint = PolicyHint::DeterministicActionAllowed;
+    // A StopFailure marker has hook rank 7.  There is currently no equally
+    // trustworthy Claude "working" proof available after reset, so a generic
+    // lower-ranked liveness observation could never verify an input action.
+    // Keep the elapsed-reset signal observable, but fail closed rather than
+    // sending text whose outcome cannot be proven.
+    event.policy_hint = PolicyHint::ObserveOnly;
     event.evidence_fingerprint = crate::observe::evidence_fingerprint(
         "claude_resume",
         &previous.evidence_fingerprint,
@@ -454,13 +465,6 @@ impl RecipeProvider for ClaudeRecipes {
             EventCategory::TransientOverload if event.terminal => {
                 Some(overload_wait(event, watcher.revision))
             }
-            EventCategory::WaitingForModel
-                if event.policy_hint == PolicyHint::DeterministicActionAllowed
-                    && event.metadata.get("claude_resume")
-                        == Some(&serde_json::Value::Bool(true)) =>
-            {
-                Some(resume_action(event))
-            }
             // Internal Claude retry, auth/billing/safety, credit exhaustion,
             // malformed hook data, and unrecognised events require observation
             // or a human rather than a generic speculative recovery.
@@ -544,34 +548,6 @@ fn overload_wait(event: &crate::model::Event, revision: u64) -> Action {
     action.expected_outcomes = vec![Condition {
         kind: "WAIT_STATE_RECORDED".into(),
         value: None,
-    }];
-    action
-}
-
-fn resume_action(event: &crate::model::Event) -> Action {
-    let mut action = Action::send_text(
-        "claude.resume_once",
-        DEFAULT_RESUME,
-        "reset wait revalidated by fresh Claude evidence",
-        event.evidence_fingerprint.clone(),
-    );
-    action.preconditions.extend([
-        Condition {
-            kind: "PROCESS_ALIVE".into(),
-            value: None,
-        },
-        Condition {
-            kind: "NO_HUMAN_INTERVENTION".into(),
-            value: None,
-        },
-        Condition {
-            kind: "COMPOSER_EMPTY".into(),
-            value: None,
-        },
-    ]);
-    action.expected_outcomes = vec![Condition {
-        kind: "AGENT_STATE_IS".into(),
-        value: Some(serde_json::Value::String("WORKING".into())),
     }];
     action
 }

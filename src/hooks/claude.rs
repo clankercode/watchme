@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const OWNER_ONLY: u32 = 0o077;
 const WATCHME_MARKER: &str = "watchme_stop_failure_v1";
+const STOP_FAILURE_MATCHER: &str = "rate_limit|overloaded|server_error";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,26 +39,29 @@ pub fn install_stop_failure_hook(settings: &Path, marker: &Path) -> Result<bool,
         .entry("hooks")
         .or_insert_with(|| serde_json::json!({}));
     let object = hooks.as_object_mut().ok_or("Claude hooks must be object")?;
-    let entries = object
+    let groups = object
         .entry("StopFailure")
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .ok_or("StopFailure hook must be array")?;
-    if entries.iter().any(|item| {
-        item.get("watchme_marker")
-            .and_then(serde_json::Value::as_str)
-            == Some(WATCHME_MARKER)
-    }) {
+    if groups
+        .iter()
+        .any(|group| group_owns_watchme(group, &command))
+    {
         return Ok(false);
     }
-    entries.push(serde_json::json!({"watchme_marker":WATCHME_MARKER,"command":command}));
+    groups.push(serde_json::json!({
+        "matcher": STOP_FAILURE_MATCHER,
+        "hooks": [{"type":"command", "command": command}],
+    }));
     atomic_json(settings, &root)?;
     Ok(true)
 }
 
-pub fn remove_stop_failure_hook(settings: &Path, _marker: &Path) -> Result<bool, String> {
+pub fn remove_stop_failure_hook(settings: &Path, marker: &Path) -> Result<bool, String> {
+    let command = stop_failure_command(marker)?;
     let mut root = read_settings(settings)?;
-    let Some(entries) = root
+    let Some(groups) = root
         .get_mut("hooks")
         .and_then(serde_json::Value::as_object_mut)
         .and_then(|hooks| hooks.get_mut("StopFailure"))
@@ -65,13 +69,28 @@ pub fn remove_stop_failure_hook(settings: &Path, _marker: &Path) -> Result<bool,
     else {
         return Ok(false);
     };
-    let old = entries.len();
-    entries.retain(|item| {
-        item.get("watchme_marker")
+    let mut changed = false;
+    groups.retain_mut(|group| {
+        if group
+            .get("watchme_marker")
             .and_then(serde_json::Value::as_str)
-            != Some(WATCHME_MARKER)
+            == Some(WATCHME_MARKER)
+        {
+            changed = true;
+            return false;
+        }
+        let Some(handlers) = group
+            .get_mut("hooks")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return true;
+        };
+        let before = handlers.len();
+        handlers.retain(|handler| !handler_owns_watchme(handler, &command));
+        changed |= handlers.len() != before;
+        !handlers.is_empty()
     });
-    if entries.len() == old {
+    if !changed {
         return Ok(false);
     }
     atomic_json(settings, &root)?;
@@ -130,22 +149,18 @@ pub fn transcript_matches_reference(path: &Path, expected: &Path) -> bool {
 pub fn bind_transcript(path: &Path) -> Result<crate::model::TranscriptBinding, String> {
     use std::os::unix::fs::MetadataExt;
     let metadata = checked_file(path, "Claude transcript", true)?;
-    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
     let opened = file.metadata().map_err(|error| error.to_string())?;
     if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
         return Err("Claude transcript changed while opening".into());
     }
-    let mut prefix = vec![0_u8; usize::try_from(metadata.len().min(4096)).unwrap_or(4096)];
-    use std::io::Read as _;
-    file.read_exact(&mut prefix)
-        .map_err(|error| error.to_string())?;
     Ok(crate::model::TranscriptBinding {
+        canonical_path: fs::canonicalize(path)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .into(),
         device: metadata.dev(),
         inode: metadata.ino(),
-        length: metadata.len(),
-        changed_at_ns: i128::from(metadata.ctime()) * 1_000_000_000
-            + i128::from(metadata.ctime_nsec()),
-        head_digest: sha256_hex(&prefix),
     })
 }
 
@@ -154,15 +169,127 @@ pub fn transcript_matches_binding(
     expected: &Path,
     binding: &crate::model::TranscriptBinding,
 ) -> bool {
-    if !transcript_matches_reference(path, expected) {
+    let Ok(canonical) = fs::canonicalize(path) else {
+        return false;
+    };
+    if canonical != expected || canonical.to_string_lossy() != binding.canonical_path {
         return false;
     }
-    bind_transcript(path).is_ok_and(|current| current == *binding)
+    bind_transcript(&canonical).is_ok_and(|current| {
+        current.device == binding.device
+            && current.inode == binding.inode
+            && current.canonical_path == binding.canonical_path
+    })
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
+/// Parse the documented Claude Code StopFailure payload. Unknown fields are
+/// deliberately ignored for forward compatibility; only bounded, non-secret
+/// fields that WatchMe persists become a local marker.
+pub fn parse_stop_failure_payload(payload: &[u8]) -> Result<HookMarker, String> {
+    let value: serde_json::Value = serde_json::from_slice(payload)
+        .map_err(|_| "Claude hook payload is not valid JSON".to_owned())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Claude hook payload must be an object".to_owned())?;
+    let session_id = required_string(object, "session_id", 256)?;
+    let transcript_path = required_string(object, "transcript_path", 4096)?;
+    let error_type = required_string(object, "error", 128)?;
+    if object
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+        != Some("StopFailure")
+    {
+        return Err("Claude hook payload is not StopFailure".into());
+    }
+    if let Some(cwd) = optional_string(object, "cwd", 4096)? {
+        if !Path::new(cwd).is_absolute() {
+            return Err("Claude hook cwd must be absolute".into());
+        }
+    }
+    let _ = optional_string(object, "permission_mode", 128)?;
+    if !Path::new(transcript_path).is_absolute()
+        || contains_line_control(session_id)
+        || contains_line_control(transcript_path)
+        || !error_type
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("Claude hook payload contains invalid identity fields".into());
+    }
+    let detail = optional_string(object, "error_details", 4096)?
+        .or(optional_string(object, "last_assistant_message", 4096)?)
+        .unwrap_or("StopFailure");
+    if contains_secret_like(detail) || contains_line_control(detail) {
+        return Err("Claude hook payload detail is unsafe to persist".into());
+    }
+    Ok(HookMarker {
+        session_id: session_id.into(),
+        transcript_path: transcript_path.into(),
+        error_type: error_type.into(),
+        detail: detail.into(),
+    })
+}
+
+fn required_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    max: usize,
+) -> Result<&'a str, String> {
+    optional_string(object, field, max)?.ok_or_else(|| format!("Claude hook payload lacks {field}"))
+}
+
+fn optional_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    max: usize,
+) -> Result<Option<&'a str>, String> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("Claude hook payload field {field} must be a string"))?;
+    if text.is_empty() || text.len() > max {
+        return Err(format!(
+            "Claude hook payload field {field} is out of bounds"
+        ));
+    }
+    Ok(Some(text))
+}
+
+fn contains_line_control(text: &str) -> bool {
+    text.chars().any(|character| character.is_control())
+}
+
+fn contains_secret_like(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "bearer ",
+        "api_key",
+        "api key",
+        "authorization:",
+        "password",
+        "secret",
+        "sk-",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn group_owns_watchme(group: &serde_json::Value, command: &str) -> bool {
+    group
+        .get("hooks")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|handlers| {
+            handlers
+                .iter()
+                .any(|handler| handler_owns_watchme(handler, command))
+        })
+}
+
+fn handler_owns_watchme(handler: &serde_json::Value, command: &str) -> bool {
+    handler.get("type").and_then(serde_json::Value::as_str) == Some("command")
+        && handler.get("command").and_then(serde_json::Value::as_str) == Some(command)
 }
 
 /// Append one bounded, strict marker without shell interpolation. O_APPEND
