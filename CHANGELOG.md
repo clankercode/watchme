@@ -1,10 +1,18 @@
 # Changelog
 
+## 0.1.4 — 2026-07-12
+
+### Fixed
+
+- Replace absolute host `include_str!` fixture paths in `tests/observation_policy.rs` with in-repo `fixtures/` paths so CI can compile.
+
 ## 0.1.3 — 2026-07-12
 
 ### Fixed
 
 - Finish Clippy `uninlined_format_args` cleanup in CLI tests under Rust 1.88.
+
+Note: `v0.1.3` still failed CI on absolute Downloads fixture includes; use `v0.1.4`.
 
 ## 0.1.2 — 2026-07-12
 
