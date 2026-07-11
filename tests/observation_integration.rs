@@ -508,3 +508,68 @@ fn herdr_pane() -> Value {
             "process_group_id":null,"session_leader_id":null,"tty":"/dev/pts/8",
             "parent_digest":null}})
 }
+
+#[tokio::test]
+async fn generic_observer_herdr_empty_events_uses_bounded_sanitized_unknown_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let recorded = methods.clone();
+    let server = thread::spawn(move || {
+        for connection in listener.incoming().take(6) {
+            let mut connection = connection.unwrap();
+            let mut line = String::new();
+            BufReader::new(connection.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let method = request["method"].as_str().unwrap().to_owned();
+            recorded
+                .lock()
+                .unwrap()
+                .push((method.clone(), request["params"].clone()));
+            let result = match method.as_str() {
+                "pane_info" => herdr_pane(),
+                "agent_state_events" => json!({"state":"blocked","events":[]}),
+                "pane_read" => json!({"text":"\u{001b}]52;c;secret\u{0007}BLOCKED", "bytes":21,
+                    "truncated":false}),
+                _ => unreachable!(),
+            };
+            let response = json!({"schema_version":1,"protocol":"watchme.herdr",
+                "request_id":request["request_id"],"method":request["method"],
+                "ok":true,"result":result});
+            connection
+                .write_all(&serde_json::to_vec(&response).unwrap())
+                .unwrap();
+            connection.write_all(b"\n").unwrap();
+        }
+    });
+    let watcher = WatcherState::new(
+        "h".into(),
+        TargetIdentity::herdr(
+            socket.to_string_lossy().into_owned(),
+            "server-1".into(),
+            "ws".into(),
+            "tab".into(),
+            "pane".into(),
+            "/dev/pts/8".into(),
+            herdr_process(),
+        ),
+        WatcherLifecycle::Observing,
+        0,
+        0,
+    );
+    let event = GenericObserver.observe(watcher).await.unwrap().unwrap();
+    assert_eq!(event.category, EventCategory::Unknown);
+    assert_eq!(event.monotonic_sequence, None);
+    server.join().unwrap();
+    let methods = methods.lock().unwrap();
+    let (_, params) = methods
+        .iter()
+        .find(|(method, _)| method == "pane_read")
+        .unwrap();
+    assert_eq!(params["max_lines"], 80);
+    assert_eq!(params["max_bytes"], 32 * 1024);
+}
