@@ -1,0 +1,44 @@
+schema_version = "1.0"
+id = "hermes"
+manifest_version = "2026.07.12.1"
+updated_at = "2026-07-12T00:00:00Z"
+min_watchme_version = "0.1.0"
+description = "Hermes multi-provider agent; observation-only until provider family is verified."
+support_tier = "observation_only"
+aliases = ["hermes-agent"]
+deterministic_recoveries = []
+planner_recipes = []
+
+[version_range]
+unknown_version_policy = "observation_only"
+
+[[process_matchers]]
+kind = "executable_basename"
+pattern = "hermes"
+weight = 60
+case_sensitive = false
+
+[[process_matchers]]
+kind = "executable_basename"
+pattern = "hermes-agent"
+weight = 55
+case_sensitive = false
+
+[provider_resolution]
+mode = "unknown"
+unknown_is_independent = false
+
+[[screen_rules]]
+id = "hermes-working"
+state = "working"
+category = "working"
+priority = 10
+confidence = 0.4
+region = "bottom_5"
+requires_stable_samples = 2
+visible_blocker = false
+allow_action = false
+
+[[screen_rules.conditions]]
+kind = "contains_literal"
+value = "Working"

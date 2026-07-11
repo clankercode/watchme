@@ -210,3 +210,9 @@ fn safe_text(text: &str) -> bool {
             "/goal resume" | "continue" | "retry" | "Continue exactly where you left off."
         )
 }
+
+/// Shared allowlist used by adapters and manifest validation. Manifests cannot
+/// introduce send-text literals outside this compiled set.
+pub fn is_safe_send_text(text: &str) -> bool {
+    safe_text(text)
+}

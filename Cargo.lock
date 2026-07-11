@@ -1006,6 +1006,7 @@ dependencies = [
  "libproc",
  "predicates",
  "proptest",
+ "regex",
  "rustix",
  "serde",
  "serde_json",

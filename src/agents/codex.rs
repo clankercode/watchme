@@ -847,12 +847,24 @@ fn hash64(value: &str) -> u64 {
     })
 }
 
-/// Tries Claude recipes, then Codex, preserving Claude's Builtin fallthrough for
-/// non-Claude wait-allowed observations that Codex does not claim.
-#[derive(Default)]
+/// Tries Claude recipes, then Codex, then manifest-driven recoveries, preserving
+/// Claude's Builtin fallthrough for non-Claude wait-allowed observations that
+/// Codex and manifests do not claim.
 pub struct CompositeRecipes {
     claude: crate::agents::claude::ClaudeRecipes,
     codex: CodexRecipes,
+    manifests: crate::agents::manifest::ManifestRecipes,
+}
+
+impl Default for CompositeRecipes {
+    fn default() -> Self {
+        Self {
+            claude: crate::agents::claude::ClaudeRecipes::default(),
+            codex: CodexRecipes::default(),
+            manifests: crate::agents::manifest::ManifestRecipes::bundled()
+                .unwrap_or_else(|_| crate::agents::manifest::ManifestRecipes::empty()),
+        }
+    }
 }
 
 impl RecipeProvider for CompositeRecipes {
@@ -868,5 +880,6 @@ impl RecipeProvider for CompositeRecipes {
         self.claude
             .action_for(watcher)
             .or_else(|| self.codex.action_for(watcher))
+            .or_else(|| self.manifests.action_for(watcher))
     }
 }
