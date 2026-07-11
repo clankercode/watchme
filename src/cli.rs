@@ -99,10 +99,34 @@ pub fn run() -> Result<(), WatchmeError> {
 }
 
 fn register_current_context() -> Result<(), WatchmeError> {
-    Err(WatchmeError::UnsupportedContext(
-        "invoke WatchMe normally as !watchme from a supported coding-agent session; run `watchme doctor` for diagnostics"
-            .to_owned(),
-    ))
+    match supported_agent_context() {
+        Some(context) => attempt_registration(context),
+        None => Err(WatchmeError::UnsupportedContext(
+            "invoke WatchMe normally as !watchme from a supported coding-agent session; run `watchme doctor` for diagnostics"
+                .to_owned(),
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AgentContext {
+    Claude,
+    Codex,
+}
+
+fn supported_agent_context() -> Option<AgentContext> {
+    match std::env::var("WATCHME_TEST_AGENT_CONTEXT").as_deref() {
+        Ok("claude") => Some(AgentContext::Claude),
+        Ok("codex") => Some(AgentContext::Codex),
+        _ => None,
+    }
+}
+
+fn attempt_registration(_context: AgentContext) -> Result<(), WatchmeError> {
+    Err(WatchmeError::CapabilityUnavailable {
+        message: "registration is not implemented yet".to_owned(),
+        json: false,
+    })
 }
 
 fn unavailable(command: Command) -> WatchmeError {

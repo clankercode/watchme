@@ -7,10 +7,24 @@ fn bare_watchme_outside_agent_explains_shell_escape_and_doctor() {
     Command::cargo_bin("watchme")
         .expect("binary exists")
         .env_remove("TMUX")
+        .env_remove("WATCHME_TEST_AGENT_CONTEXT")
         .assert()
         .failure()
         .stderr(predicate::str::contains("!watchme"))
         .stderr(predicate::str::contains("watchme doctor"));
+}
+
+#[test]
+fn bare_watchme_in_supported_context_reaches_registration_boundary() {
+    Command::cargo_bin("watchme")
+        .expect("binary exists")
+        .env("WATCHME_TEST_AGENT_CONTEXT", "claude")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "capability unavailable: registration is not implemented yet",
+        ))
+        .stderr(predicate::str::contains("!watchme").not());
 }
 
 #[test]
