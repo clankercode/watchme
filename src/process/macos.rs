@@ -33,7 +33,19 @@ impl<S> VerifiedMacInspector<S> {
 impl<S: MacProcessSource> VerifiedMacInspector<S> {
     fn verified_record(&self, pid: u32) -> Result<ProcessRecord, ProcessError> {
         let before = self.source.start_time(pid)?;
-        let bytes = self.source.ps_record(pid)?;
+        let bytes = match self.source.ps_record(pid) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return match self.source.start_time(pid) {
+                    Err(ProcessError::Disappeared(_)) => Err(ProcessError::Disappeared(pid)),
+                    Ok(after) if after != before => Err(ProcessError::Disappeared(pid)),
+                    Ok(_) => Err(ProcessError::Inspection(format!(
+                        "ps metadata command failed for PID {pid} while identity remained stable"
+                    ))),
+                    Err(error) => Err(error),
+                };
+            }
+        };
         if bytes.len() > MAX_PS_OUTPUT_BYTES {
             return Err(ProcessError::Inspection(
                 "ps output exceeds size limit".into(),
@@ -71,8 +83,10 @@ pub struct SystemMacProcessSource;
 #[cfg(target_os = "macos")]
 impl MacProcessSource for SystemMacProcessSource {
     fn start_time(&self, pid: u32) -> Result<u64, ProcessError> {
-        let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid as i32, 0)
-            .map_err(|_| ProcessError::Disappeared(pid))?;
+        let info = match libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid as i32, 0) {
+            Ok(info) => info,
+            Err(_) => return classify_libproc_failure(pid),
+        };
         info.pbi_start_tvsec
             .checked_mul(1_000_000)
             .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
@@ -111,6 +125,22 @@ impl MacProcessSource for SystemMacProcessSource {
             .split_ascii_whitespace()
             .filter_map(|field| field.parse().ok())
             .collect())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn classify_libproc_failure(pid: u32) -> Result<u64, ProcessError> {
+    let Some(pid_value) = rustix::process::Pid::from_raw(pid as i32) else {
+        return Err(ProcessError::Disappeared(pid));
+    };
+    match rustix::process::test_kill_process(pid_value) {
+        Err(rustix::io::Errno::SRCH) => Err(ProcessError::Disappeared(pid)),
+        Ok(()) | Err(rustix::io::Errno::PERM) => Err(ProcessError::Inspection(format!(
+            "libproc BSD info unavailable for existing PID {pid}"
+        ))),
+        Err(_) => Err(ProcessError::Inspection(format!(
+            "libproc BSD info and PID existence checks failed for PID {pid}"
+        ))),
     }
 }
 

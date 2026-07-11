@@ -286,6 +286,49 @@ struct PartiallyBrokenMacSource {
     broken: ProcessError,
 }
 
+struct FailingMacSource {
+    starts: std::cell::RefCell<Vec<Result<u64, ProcessError>>>,
+}
+
+struct ExitedCompetitorSource {
+    competitor_start_reads: std::cell::Cell<u8>,
+}
+
+impl MacProcessSource for ExitedCompetitorSource {
+    fn start_time(&self, pid: u32) -> Result<u64, ProcessError> {
+        if pid == 43 {
+            let reads = self.competitor_start_reads.get();
+            self.competitor_start_reads.set(reads + 1);
+            if reads > 0 {
+                return Err(ProcessError::Disappeared(pid));
+            }
+        }
+        Ok(100)
+    }
+    fn ps_record(&self, pid: u32) -> Result<Vec<u8>, ProcessError> {
+        if pid == 43 {
+            Err(ProcessError::Inspection("ps exited nonzero".into()))
+        } else {
+            Ok(b"42 7 40 30 1000 ttys004 /opt/claude".to_vec())
+        }
+    }
+    fn list_pids(&self) -> Result<Vec<u32>, ProcessError> {
+        Ok(vec![42, 43])
+    }
+}
+
+impl MacProcessSource for FailingMacSource {
+    fn start_time(&self, _pid: u32) -> Result<u64, ProcessError> {
+        self.starts.borrow_mut().remove(0)
+    }
+    fn ps_record(&self, _pid: u32) -> Result<Vec<u8>, ProcessError> {
+        Err(ProcessError::Inspection("ps exited nonzero".into()))
+    }
+    fn list_pids(&self) -> Result<Vec<u32>, ProcessError> {
+        Ok(vec![42])
+    }
+}
+
 impl MacProcessSource for PartiallyBrokenMacSource {
     fn start_time(&self, _pid: u32) -> Result<u64, ProcessError> {
         Ok(100)
@@ -370,10 +413,44 @@ fn macos_enumeration_propagates_malformed_or_permission_errors_but_omits_disappe
         let inspector = VerifiedMacInspector::new(PartiallyBrokenMacSource { broken });
         assert!(inspector.processes_on_tty("/dev/ttys004").is_err());
     }
-    let inspector = VerifiedMacInspector::new(PartiallyBrokenMacSource {
-        broken: ProcessError::Disappeared(43),
+    let inspector = VerifiedMacInspector::new(ExitedCompetitorSource {
+        competitor_start_reads: std::cell::Cell::new(0),
     });
     assert_eq!(inspector.processes_on_tty("/dev/ttys004").unwrap().len(), 1);
+}
+
+#[test]
+fn macos_classifies_absence_libproc_and_ps_failures_conservatively() {
+    let absent = VerifiedMacInspector::new(FailingMacSource {
+        starts: std::cell::RefCell::new(vec![Err(ProcessError::Disappeared(42))]),
+    });
+    assert_eq!(absent.inspect(42), Err(ProcessError::Disappeared(42)));
+
+    let permission = VerifiedMacInspector::new(FailingMacSource {
+        starts: std::cell::RefCell::new(vec![Err(ProcessError::Inspection(
+            "libproc unavailable for existing PID".into(),
+        ))]),
+    });
+    assert!(matches!(
+        permission.inspect(42),
+        Err(ProcessError::Inspection(_))
+    ));
+
+    let exited_during_ps = VerifiedMacInspector::new(FailingMacSource {
+        starts: std::cell::RefCell::new(vec![Ok(1_000_001), Err(ProcessError::Disappeared(42))]),
+    });
+    assert_eq!(
+        exited_during_ps.inspect(42),
+        Err(ProcessError::Disappeared(42))
+    );
+
+    let same_pid = VerifiedMacInspector::new(FailingMacSource {
+        starts: std::cell::RefCell::new(vec![Ok(1_000_001), Ok(1_000_001)]),
+    });
+    assert!(matches!(
+        same_pid.inspect(42),
+        Err(ProcessError::Inspection(_))
+    ));
 }
 
 #[test]
