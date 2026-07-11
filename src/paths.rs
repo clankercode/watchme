@@ -34,10 +34,7 @@ impl WatchmePaths {
         Ok(Self {
             config_dir: config_root.join("watchme"),
             state_dir: state_root.join("watchme"),
-            runtime_dir: runtime_dir.map_or_else(
-                || state_root.join("watchme/run"),
-                |path| path.join("watchme"),
-            ),
+            runtime_dir: runtime_dir.map_or_else(runtime_fallback, |path| path.join("watchme")),
         })
     }
 
@@ -76,6 +73,13 @@ impl WatchmePaths {
     pub fn validate_managed_path(&self, path: &Path) -> io::Result<()> {
         reject_symlink_components(path)
     }
+}
+
+fn runtime_fallback() -> PathBuf {
+    PathBuf::from(format!(
+        "/tmp/watchme-{}",
+        rustix::process::geteuid().as_raw()
+    ))
 }
 
 fn reject_symlink_components(path: &Path) -> io::Result<()> {

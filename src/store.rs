@@ -151,5 +151,63 @@ fn write_temporary(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    let directory = match File::open(path) {
+        Ok(directory) => directory,
+        Err(error) if is_unsupported_directory_sync(&error) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match directory.sync_all() {
+        Err(error) if is_unsupported_directory_sync(&error) => Ok(()),
+        result => result,
+    }
+}
+
+fn is_unsupported_directory_sync(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    const UNSUPPORTED_RAW_ERROR: i32 = 95;
+    #[cfg(target_os = "macos")]
+    const UNSUPPORTED_RAW_ERROR: i32 = 45;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const UNSUPPORTED_RAW_ERROR: i32 = i32::MIN;
+    matches!(error.raw_os_error(), Some(22) | Some(UNSUPPORTED_RAW_ERROR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unsupported_directory_sync;
+    use std::io;
+
+    #[test]
+    fn directory_sync_ignores_only_explicitly_unsupported_errors() {
+        assert!(is_unsupported_directory_sync(&io::Error::from(
+            io::ErrorKind::Unsupported
+        )));
+        assert!(is_unsupported_directory_sync(
+            &io::Error::from_raw_os_error(22)
+        ));
+        #[cfg(target_os = "linux")]
+        assert!(is_unsupported_directory_sync(
+            &io::Error::from_raw_os_error(95)
+        ));
+        #[cfg(target_os = "macos")]
+        assert!(is_unsupported_directory_sync(
+            &io::Error::from_raw_os_error(45)
+        ));
+    }
+
+    #[test]
+    fn directory_sync_propagates_permission_and_io_failures() {
+        assert!(!is_unsupported_directory_sync(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_unsupported_directory_sync(&io::Error::from(
+            io::ErrorKind::Other
+        )));
+        assert!(!is_unsupported_directory_sync(
+            &io::Error::from_raw_os_error(5)
+        ));
+    }
 }

@@ -6,22 +6,23 @@ use std::path::Path;
 
 use tempfile::TempDir;
 use watchme::config::Config;
-use watchme::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
+use watchme::model::{
+    PROCESS_IDENTITY_SCHEMA_VERSION, ProcessIdentity, TargetIdentity, WatcherLifecycle,
+    WatcherState,
+};
 use watchme::paths::WatchmePaths;
 use watchme::store::{JsonStore, LoadOutcome};
 
 fn process() -> ProcessIdentity {
-    ProcessIdentity {
-        pid: 42,
-        start_time: 1_234_567,
-        executable: Some("/usr/bin/codex".into()),
-        argv_digest: Some("sha256:abc".into()),
-        uid: Some(1000),
-        process_group_id: Some(40),
-        session_leader_id: Some(40),
-        tty: Some("/dev/pts/2".into()),
-        parent_digest: Some("sha256:def".into()),
-    }
+    let mut identity = ProcessIdentity::new(42, 1_234_567);
+    identity.executable = Some("/usr/bin/codex".into());
+    identity.argv_digest = Some("sha256:abc".into());
+    identity.uid = Some(1000);
+    identity.process_group_id = Some(40);
+    identity.session_leader_id = Some(40);
+    identity.tty = Some("/dev/pts/2".into());
+    identity.parent_digest = Some("sha256:def".into());
+    identity
 }
 
 fn state() -> WatcherState {
@@ -51,7 +52,10 @@ fn xdg_paths_use_safe_fallbacks_and_explicit_overrides() {
     );
     assert_eq!(
         fallback.runtime_dir(),
-        Path::new("/home/alice/.local/state/watchme/run")
+        Path::new(&format!(
+            "/tmp/watchme-{}",
+            rustix::process::geteuid().as_raw()
+        ))
     );
 
     let overridden = WatchmePaths::resolve(
@@ -67,6 +71,33 @@ fn xdg_paths_use_safe_fallbacks_and_explicit_overrides() {
         overridden.runtime_dir(),
         Path::new("/run/user/1000/watchme")
     );
+}
+
+#[test]
+fn runtime_fallback_is_owner_only() {
+    let temp = TempDir::new().unwrap();
+    let paths = WatchmePaths::resolve(temp.path(), None, None, None).unwrap();
+    paths.create_owner_only().unwrap();
+    assert_eq!(
+        fs::metadata(paths.runtime_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[test]
+fn process_identity_has_a_locked_current_schema_version() {
+    let identity = ProcessIdentity::new(7, 99);
+    assert_eq!(identity.schema_version(), PROCESS_IDENTITY_SCHEMA_VERSION);
+    let encoded = serde_json::to_value(&identity).unwrap();
+    assert_eq!(encoded["schema_version"], PROCESS_IDENTITY_SCHEMA_VERSION);
+
+    let mut unsupported = encoded;
+    unsupported["schema_version"] = serde_json::json!(999);
+    assert!(serde_json::from_value::<ProcessIdentity>(unsupported).is_err());
 }
 
 #[test]
@@ -147,6 +178,53 @@ fn state_round_trips_and_atomic_replacement_does_not_change_inode_contents_partw
             .to_string_lossy()
             .contains(".tmp")
     }));
+}
+
+#[test]
+fn every_lifecycle_and_multiplexer_identity_round_trips_through_atomic_store() {
+    let temp = TempDir::new().unwrap();
+    let store = JsonStore::new(temp.path().join("state.json"));
+    let lifecycles = [
+        WatcherLifecycle::Registered,
+        WatcherLifecycle::Observing,
+        WatcherLifecycle::Recovering {
+            evidence_fingerprint: "sha256:evidence".into(),
+        },
+        WatcherLifecycle::Waiting {
+            until_unix_ms: 123_456,
+            reason: "native retry".into(),
+        },
+        WatcherLifecycle::HumanRequired {
+            reason: "ambiguous target".into(),
+        },
+        WatcherLifecycle::TargetTerminated,
+        WatcherLifecycle::Stopped {
+            reason: "requested".into(),
+        },
+    ];
+
+    for (revision, lifecycle) in lifecycles.into_iter().enumerate() {
+        let expected = WatcherState {
+            schema_version: 1,
+            watcher_id: format!("watcher-{revision}"),
+            target: TargetIdentity::Multiplexer {
+                version: 1,
+                provider: "tmux".into(),
+                server: "/tmp/tmux-1000/default".into(),
+                pane: "%3".into(),
+                process: process(),
+                session: Some("work:1.2".into()),
+            },
+            lifecycle,
+            revision: revision as u64,
+            updated_at_unix_ms: 555_000 + revision as u64,
+        };
+        store.write(&expected).unwrap();
+        assert_eq!(
+            store.load::<WatcherState>().unwrap(),
+            LoadOutcome::Present(expected)
+        );
+    }
 }
 
 #[test]
