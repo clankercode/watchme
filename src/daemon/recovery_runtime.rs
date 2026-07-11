@@ -769,8 +769,7 @@ mod tests {
         let tmux = Tmux::for_socket_name(socket.clone(), Duration::from_secs(2));
         let deadline = Instant::now() + Duration::from_secs(5);
         let identity = loop {
-            if let Ok(candidate) =
-                tmux.resolve_selector(&TmuxSelector::parse("recovery").unwrap())
+            if let Ok(candidate) = tmux.resolve_selector(&TmuxSelector::parse("recovery").unwrap())
             {
                 if tmux
                     .capture_tail(&candidate, 8, 1_024)
@@ -924,8 +923,7 @@ mod tests {
         let tmux = Tmux::for_socket_name(socket.clone(), Duration::from_secs(2));
         let deadline = Instant::now() + Duration::from_secs(5);
         let identity = loop {
-            if let Ok(candidate) =
-                tmux.resolve_selector(&TmuxSelector::parse("recovery").unwrap())
+            if let Ok(candidate) = tmux.resolve_selector(&TmuxSelector::parse("recovery").unwrap())
             {
                 if tmux
                     .capture_tail(&candidate, 8, 1_024)

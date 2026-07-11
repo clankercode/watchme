@@ -1,3 +1,9 @@
+## 0.1.7 — 2026-07-12
+
+### Fixed
+
+- Apply rustfmt so CI Format check passes.
+
 # Changelog
 
 ## 0.1.6 — 2026-07-12

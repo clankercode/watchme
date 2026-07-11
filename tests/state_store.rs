@@ -50,10 +50,7 @@ fn xdg_paths_use_safe_fallbacks_and_explicit_overrides() {
     );
     let expected_runtime = fs::canonicalize("/tmp")
         .unwrap_or_else(|_| Path::new("/tmp").to_path_buf())
-        .join(format!(
-            "watchme-{}",
-            rustix::process::geteuid().as_raw()
-        ));
+        .join(format!("watchme-{}", rustix::process::geteuid().as_raw()));
     assert_eq!(fallback.runtime_dir(), expected_runtime);
 
     let overridden = WatchmePaths::resolve(
@@ -499,7 +496,11 @@ fn managed_paths_and_store_reject_symlinked_ancestors() {
     // canonical path. JsonStore still refuses unresolved symlink ancestors.
     let paths = WatchmePaths::resolve(&linked, None, None, None).unwrap();
     paths.create_owner_only().unwrap();
-    assert!(paths.config_dir().starts_with(fs::canonicalize(&real).unwrap()));
+    assert!(
+        paths
+            .config_dir()
+            .starts_with(fs::canonicalize(&real).unwrap())
+    );
 
     let nested = linked.join("state.json");
     assert!(JsonStore::new(nested).write(&state()).is_err());

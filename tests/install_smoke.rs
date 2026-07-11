@@ -99,7 +99,10 @@ fn isolated_prefix_install_smoke_and_uninstall_preserves_unrelated() {
             cfg!(target_os = "macos"),
             "non-symlink WatchMe alias is only expected on Darwin case-insensitive volumes"
         );
-        assert!(alias.is_file(), "collapsed WatchMe must still be the binary");
+        assert!(
+            alias.is_file(),
+            "collapsed WatchMe must still be the binary"
+        );
         assert_eq!(
             fs::canonicalize(&alias).unwrap(),
             fs::canonicalize(&bin).unwrap()
