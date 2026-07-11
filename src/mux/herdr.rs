@@ -53,6 +53,7 @@ pub struct Herdr {
     context: HerdrContext,
     timeout: Duration,
     next_request: std::sync::Arc<AtomicU64>,
+    evidence_provider: std::sync::Arc<dyn ConnectedSocketEvidenceProvider>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,6 +166,14 @@ struct WirePane {
 
 impl Herdr {
     pub fn new(context: HerdrContext, timeout: Duration) -> Result<Self, MuxError> {
+        Self::new_with_evidence_provider(context, timeout, std::sync::Arc::new(SystemEvidence))
+    }
+
+    pub fn new_with_evidence_provider(
+        context: HerdrContext,
+        timeout: Duration,
+        evidence_provider: std::sync::Arc<dyn ConnectedSocketEvidenceProvider>,
+    ) -> Result<Self, MuxError> {
         if timeout.is_zero() {
             return Err(MuxError::Protocol("timeout must be non-zero".into()));
         }
@@ -173,6 +182,7 @@ impl Herdr {
             context,
             timeout,
             next_request: std::sync::Arc::new(AtomicU64::new(1)),
+            evidence_provider,
         })
     }
 
@@ -322,6 +332,7 @@ impl Herdr {
         encoded.push(b'\n');
         let deadline = started.checked_add(self.timeout).ok_or(MuxError::Timeout)?;
         let socket_path = self.context.socket_path.clone();
+        let evidence_provider = std::sync::Arc::clone(&self.evidence_provider);
         let transport = move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_io()
@@ -337,7 +348,12 @@ impl Herdr {
                         let mut stream = tokio::net::UnixStream::connect(&socket_path)
                             .await
                             .map_err(map_io)?;
-                        verify_connected_socket(&stream, Path::new(&socket_path), socket_identity)?;
+                        verify_connected_socket(
+                            &stream,
+                            Path::new(&socket_path),
+                            socket_identity,
+                            evidence_provider.as_ref(),
+                        )?;
                         stream.write_all(&encoded).await.map_err(map_io)?;
                         let mut bytes = Vec::new();
                         loop {
@@ -382,16 +398,25 @@ impl Herdr {
                 "response contract or request ID mismatch".into(),
             ));
         }
-        if !response.ok {
+        if response.ok {
+            if response.error.is_some() {
+                return Err(MuxError::Protocol(
+                    "successful response must omit error".into(),
+                ));
+            }
+            return response.result.ok_or_else(|| {
+                MuxError::Protocol("successful response must contain non-null result".into())
+            });
+        }
+        if response.result.is_some() {
             return Err(MuxError::Protocol(
-                response
-                    .error
-                    .unwrap_or_else(|| "request failed without an error".into()),
+                "failed response must omit result".into(),
             ));
         }
-        response
-            .result
-            .ok_or_else(|| MuxError::Protocol("successful response omitted result".into()))
+        let error = response.error.ok_or_else(|| {
+            MuxError::Protocol("failed response must contain non-null error".into())
+        })?;
+        Err(MuxError::Protocol(error))
     }
 }
 
@@ -612,6 +637,64 @@ struct SocketIdentity {
     inode: u64,
 }
 
+#[derive(Debug)]
+pub struct ConnectedSocketEvidence {
+    pub path_device: u64,
+    pub path_inode: u64,
+    pub peer_uid: Result<u32, String>,
+}
+
+pub trait ConnectedSocketEvidenceProvider: std::fmt::Debug + Send + Sync {
+    fn evidence(&self, stream: &tokio::net::UnixStream, path: &Path) -> ConnectedSocketEvidence;
+}
+
+#[derive(Debug)]
+struct SystemEvidence;
+
+impl ConnectedSocketEvidenceProvider for SystemEvidence {
+    fn evidence(&self, stream: &tokio::net::UnixStream, path: &Path) -> ConnectedSocketEvidence {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => ConnectedSocketEvidence {
+                path_device: metadata.dev(),
+                path_inode: metadata.ino(),
+                peer_uid: stream
+                    .peer_cred()
+                    .map(|credentials| credentials.uid())
+                    .map_err(|error| error.to_string()),
+            },
+            Err(error) => ConnectedSocketEvidence {
+                path_device: 0,
+                path_inode: 0,
+                peer_uid: Err(format!("socket metadata query failed: {error}")),
+            },
+        }
+    }
+}
+
+impl ConnectedSocketEvidence {
+    pub fn validate(
+        &self,
+        expected_device: u64,
+        expected_inode: u64,
+        expected_uid: u32,
+    ) -> Result<(), MuxError> {
+        if self.path_device != expected_device || self.path_inode != expected_inode {
+            return Err(MuxError::UnsafeSocket(
+                "socket identity changed while connecting".into(),
+            ));
+        }
+        let peer_uid = self.peer_uid.as_ref().map_err(|error| {
+            MuxError::UnsafeSocket(format!("peer credential query failed: {error}"))
+        })?;
+        if *peer_uid != expected_uid {
+            return Err(MuxError::UnsafeSocket(
+                "connected Herdr peer has a different UID".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn validate_socket(path: &Path) -> Result<SocketIdentity, MuxError> {
     if !path.is_absolute() {
         return Err(MuxError::UnsafeSocket("path is not absolute".into()));
@@ -641,23 +724,11 @@ fn verify_connected_socket(
     stream: &tokio::net::UnixStream,
     path: &Path,
     expected: SocketIdentity,
+    evidence_provider: &dyn ConnectedSocketEvidenceProvider,
 ) -> Result<(), MuxError> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
-    if metadata.dev() != expected.device || metadata.ino() != expected.inode {
-        return Err(MuxError::UnsafeSocket(
-            "socket identity changed while connecting".into(),
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let credentials = rustix::net::sockopt::socket_peercred(stream)
-            .map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
-        if credentials.uid != rustix::process::geteuid() {
-            return Err(MuxError::UnsafeSocket(
-                "connected Herdr peer has a different UID".into(),
-            ));
-        }
-    }
-    Ok(())
+    evidence_provider.evidence(stream, path).validate(
+        expected.device,
+        expected.inode,
+        rustix::process::geteuid().as_raw(),
+    )
 }

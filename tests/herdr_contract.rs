@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use watchme::mux::herdr::{Herdr, HerdrContext, SocketMetadata};
+use watchme::mux::herdr::{
+    ConnectedSocketEvidence, ConnectedSocketEvidenceProvider, Herdr, HerdrContext, SocketMetadata,
+};
 use watchme::mux::{
     ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, SymbolicKey,
 };
@@ -422,4 +424,128 @@ async fn synchronous_adapter_is_safe_inside_daemon_runtime() {
         spawn_fake(move |request, _| Some(response(&request, pane_result(pid, 77))));
     let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
     assert_eq!(herdr.current_target().unwrap().process.pid, pid);
+}
+
+#[test]
+fn connected_socket_evidence_fails_closed_on_replacement_credentials_and_query_errors() {
+    let accepted = ConnectedSocketEvidence {
+        path_device: 10,
+        path_inode: 20,
+        peer_uid: Ok(1000),
+    };
+    assert!(accepted.validate(10, 20, 1000).is_ok());
+    for evidence in [
+        ConnectedSocketEvidence {
+            path_device: 10,
+            path_inode: 21,
+            peer_uid: Ok(1000),
+        },
+        ConnectedSocketEvidence {
+            path_device: 10,
+            path_inode: 20,
+            peer_uid: Ok(1001),
+        },
+        ConnectedSocketEvidence {
+            path_device: 10,
+            path_inode: 20,
+            peer_uid: Err("unsupported".into()),
+        },
+    ] {
+        assert!(matches!(
+            evidence.validate(10, 20, 1000),
+            Err(MuxError::UnsafeSocket(_))
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct FixedEvidence(ConnectedSocketEvidence);
+
+impl ConnectedSocketEvidenceProvider for FixedEvidence {
+    fn evidence(&self, _: &tokio::net::UnixStream, _: &std::path::Path) -> ConnectedSocketEvidence {
+        ConnectedSocketEvidence {
+            path_device: self.0.path_device,
+            path_inode: self.0.path_inode,
+            peer_uid: self.0.peer_uid.clone(),
+        }
+    }
+}
+
+#[test]
+fn adapter_rejects_injected_connected_replacement_peer_mismatch_and_query_failure() {
+    let pid = std::process::id();
+    for kind in ["inode", "uid", "query"] {
+        let (_directory, socket, _) =
+            spawn_fake(move |request, _| Some(response(&request, pane_result(pid, 77))));
+        let metadata = std::fs::metadata(&socket).unwrap();
+        let evidence = ConnectedSocketEvidence {
+            path_device: metadata.dev(),
+            path_inode: if kind == "inode" {
+                metadata.ino() + 1
+            } else {
+                metadata.ino()
+            },
+            peer_uid: match kind {
+                "uid" => Ok(u32::MAX),
+                "query" => Err("credential API unavailable".into()),
+                _ => Ok(rustix::process::geteuid().as_raw()),
+            },
+        };
+        let herdr = Herdr::new_with_evidence_provider(
+            context(socket),
+            Duration::from_millis(200),
+            Arc::new(FixedEvidence(evidence)),
+        )
+        .unwrap();
+        assert!(matches!(
+            herdr.current_target(),
+            Err(MuxError::UnsafeSocket(_))
+        ));
+    }
+}
+
+#[test]
+fn response_success_and_error_are_an_exact_non_null_union() {
+    let pid = std::process::id();
+    type ResponseMutation = Box<dyn Fn(&mut Value) + Send>;
+    let mutations: Vec<ResponseMutation> = vec![
+        Box::new(|reply| reply["error"] = json!("must not coexist")),
+        Box::new(|reply| {
+            reply["ok"] = json!(false);
+            reply["error"] = json!("denied");
+        }),
+        Box::new(|reply| {
+            reply.as_object_mut().unwrap().remove("result");
+        }),
+        Box::new(|reply| reply["result"] = Value::Null),
+        Box::new(|reply| {
+            reply["ok"] = json!(false);
+            reply.as_object_mut().unwrap().remove("result");
+        }),
+        Box::new(|reply| {
+            reply["ok"] = json!(false);
+            reply.as_object_mut().unwrap().remove("result");
+            reply["error"] = Value::Null;
+        }),
+    ];
+    for mutate in mutations {
+        let (_directory, socket, _) = spawn_fake(move |request, _| {
+            let mut reply = response(&request, pane_result(pid, 77));
+            mutate(&mut reply);
+            Some(reply)
+        });
+        let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+        assert!(matches!(herdr.current_target(), Err(MuxError::Protocol(_))));
+    }
+    let (_directory, socket, _) = spawn_fake(move |request, _| {
+        let mut reply = response(&request, pane_result(pid, 77));
+        reply["ok"] = json!(false);
+        reply.as_object_mut().unwrap().remove("result");
+        reply["error"] = json!("denied");
+        Some(reply)
+    });
+    let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+    assert!(
+        matches!(herdr.current_target(), Err(MuxError::Protocol(message)) if message == "denied")
+    );
 }
