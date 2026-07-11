@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::model::{TargetIdentity, WatcherLifecycle, WatcherState};
+use crate::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
 use crate::store::{JsonStore, LoadOutcome, StoreError};
 
 #[derive(Debug, Error)]
@@ -125,6 +125,29 @@ impl Registry {
 
     pub fn get(&self, id: &str) -> Option<&WatcherState> {
         self.watchers.get(id)
+    }
+
+    pub fn retarget_process(
+        &mut self,
+        id: &str,
+        process: ProcessIdentity,
+        now: u64,
+    ) -> Result<(), RegistryError> {
+        let mut updated = self.watchers.clone();
+        let watcher = updated
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::Unknown(id.into()))?;
+        match &mut watcher.target {
+            TargetIdentity::Process { process: target }
+            | TargetIdentity::Multiplexer {
+                process: target, ..
+            } => *target = process,
+        }
+        watcher.revision = next_revision(watcher)?;
+        watcher.updated_at_unix_ms = now;
+        self.persist_watchers(&updated)?;
+        self.watchers = updated;
+        Ok(())
     }
     pub fn list(&self) -> Vec<WatcherState> {
         self.watchers.values().cloned().collect()

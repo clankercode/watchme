@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "shell-wrapper-claude",
+      "processes": [
+        { "pid": 70, "ppid": 60, "exe": "watchme", "tty": "/dev/pts/4" },
+        { "pid": 60, "ppid": 50, "exe": "bash", "tty": "/dev/pts/4" },
+        { "pid": 50, "ppid": 40, "exe": "env", "tty": "/dev/pts/4" },
+        { "pid": 40, "ppid": 1, "exe": "claude", "tty": "/dev/pts/4" }
+      ],
+      "expected_pid": 40
+    },
+    {
+      "name": "ambiguous-broken-ancestry",
+      "processes": [
+        { "pid": 31, "ppid": 1, "exe": "claude", "tty": "/dev/pts/4" },
+        { "pid": 32, "ppid": 1, "exe": "codex", "tty": "/dev/pts/4" }
+      ],
+      "error": "ambiguous"
+    }
+  ]
+}

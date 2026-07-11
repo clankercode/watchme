@@ -13,10 +13,12 @@ use crate::ipc::protocol::{Request, Response};
 use crate::ipc::{bind_owner_only, read_request, write_response};
 use crate::model::WatcherLifecycle;
 use crate::paths::WatchmePaths;
+use crate::process::{LifecycleDecision, LifecycleMonitor, ProcessInspector};
 use crate::store::JsonStore;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_CONNECTIONS: usize = 32;
+const PROCESS_REEXEC_GRACE_MS: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,6 +224,7 @@ pub async fn run_with_peer_provider(
     let (shutdown_sender, mut shutdown_receiver) = tokio::sync::mpsc::channel(1);
     let mut connection_tasks = tokio::task::JoinSet::new();
     let mut scheduler_task = tokio::spawn(runner.run());
+    let lifecycle_task = tokio::spawn(run_lifecycle_monitor(registry.clone(), scheduler.clone()));
     let timeout = Duration::from_secs(2);
     let result = loop {
         let accepted = tokio::select! {
@@ -279,7 +282,70 @@ pub async fn run_with_peer_provider(
         scheduler_task.abort();
         let _ = scheduler_task.await;
     }
+    lifecycle_task.abort();
+    let _ = lifecycle_task.await;
     result
+}
+
+async fn run_lifecycle_monitor(
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+    scheduler: SchedulerHandle,
+) {
+    #[cfg(target_os = "linux")]
+    let inspector = crate::process::linux::LinuxProcessInspector::default();
+    #[cfg(target_os = "macos")]
+    let inspector = crate::process::macos::MacOsProcessInspector;
+    let mut monitors = std::collections::BTreeMap::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let mut registry_guard = registry.lock().await;
+        monitor_process_lifecycles(&mut registry_guard, &scheduler, &inspector, &mut monitors);
+    }
+}
+
+fn monitor_process_lifecycles(
+    registry: &mut Registry,
+    scheduler: &SchedulerHandle,
+    inspector: &dyn ProcessInspector,
+    monitors: &mut std::collections::BTreeMap<String, LifecycleMonitor>,
+) {
+    let now = now_ms();
+    for watcher in registry.list() {
+        if matches!(
+            watcher.lifecycle,
+            WatcherLifecycle::Stopped { .. } | WatcherLifecycle::TargetTerminated
+        ) {
+            monitors.remove(&watcher.watcher_id);
+            continue;
+        }
+        let identity = match &watcher.target {
+            crate::model::TargetIdentity::Process { process }
+            | crate::model::TargetIdentity::Multiplexer { process, .. } => process.clone(),
+        };
+        let monitor = monitors
+            .entry(watcher.watcher_id.clone())
+            .or_insert_with(|| {
+                LifecycleMonitor::with_reexec_grace(identity, PROCESS_REEXEC_GRACE_MS)
+            });
+        match monitor.observe(inspector, now) {
+            LifecycleDecision::Alive | LifecycleDecision::Grace => {}
+            LifecycleDecision::ReexecAccepted(identity) => {
+                let _ = registry.retarget_process(&watcher.watcher_id, identity, now);
+            }
+            LifecycleDecision::Terminate => {
+                if registry
+                    .transition(&watcher.watcher_id, WatcherLifecycle::TargetTerminated, now)
+                    .is_ok()
+                {
+                    let _ = scheduler.send(SchedulerEvent::Stop(watcher.watcher_id.clone()));
+                }
+                monitors.remove(&watcher.watcher_id);
+            }
+        }
+    }
 }
 
 fn scheduler_from_registry(

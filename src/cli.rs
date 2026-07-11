@@ -9,6 +9,7 @@ use watchme::daemon;
 use watchme::ipc::protocol::{Request, Response};
 use watchme::ipc::{read_response, write_request};
 use watchme::paths::WatchmePaths;
+use watchme::process::{CandidateHints, ProcessInspector, ProcessResolver};
 
 use crate::error::WatchmeError;
 
@@ -366,16 +367,20 @@ fn register_with_detector(
     client: &impl RegistrationClient,
 ) -> Result<(), WatchmeError> {
     match detector.detect() {
-        Some(registration) => client.register(registration),
-        None => Err(WatchmeError::UnsupportedContext(
-            "invoke WatchMe normally as !watchme from a supported coding-agent session; run `watchme doctor` for diagnostics"
-                .to_owned(),
-        )),
+        Ok(registration) => client.register(registration),
+        Err(error) => Err(error),
     }
 }
 
+fn unsupported_registration_context() -> WatchmeError {
+    WatchmeError::UnsupportedContext(
+            "invoke WatchMe normally as !watchme from a supported coding-agent session; run `watchme doctor` for diagnostics"
+                .to_owned(),
+        )
+}
+
 trait RegistrationContextDetector {
-    fn detect(&self) -> Option<ResolvedRegistration>;
+    fn detect(&self) -> Result<ResolvedRegistration, WatchmeError>;
 }
 
 trait RegistrationClient {
@@ -385,10 +390,50 @@ trait RegistrationClient {
 struct ProductionContextDetector;
 
 impl RegistrationContextDetector for ProductionContextDetector {
-    fn detect(&self) -> Option<ResolvedRegistration> {
-        // Process ancestry verification is introduced in the discovery milestone.
-        None
+    fn detect(&self) -> Result<ResolvedRegistration, WatchmeError> {
+        #[cfg(target_os = "linux")]
+        let inspector = watchme::process::linux::LinuxProcessInspector::default();
+        #[cfg(target_os = "macos")]
+        let inspector = watchme::process::macos::MacOsProcessInspector;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return Err(unsupported_registration_context());
+
+        let current_pid = std::process::id();
+        let current = inspector
+            .inspect(current_pid)
+            .map_err(|_| unsupported_registration_context())?;
+        let tty = current.tty.ok_or_else(unsupported_registration_context)?;
+        let hints = CandidateHints {
+            tty: Some(tty),
+            process_group_id: current.process_group_id,
+            session_leader_id: current.session_leader_id,
+            uid: current.uid,
+            executable_hint: None,
+        };
+        let resolved = ProcessResolver::default()
+            .resolve(&inspector, current_pid, &hints)
+            .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+        let watcher_id = format!(
+            "process-{}-{}",
+            resolved.identity.pid, resolved.identity.start_time
+        );
+        Ok(ResolvedRegistration {
+            watcher: watchme::model::WatcherState::new(
+                watcher_id,
+                watchme::model::TargetIdentity::process(resolved.identity),
+                watchme::model::WatcherLifecycle::Registered,
+                0,
+                unix_time_ms(),
+            ),
+        })
     }
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 struct IpcRegistrationClient;
@@ -602,8 +647,8 @@ mod tests {
     struct FixedContextDetector;
 
     impl RegistrationContextDetector for FixedContextDetector {
-        fn detect(&self) -> Option<ResolvedRegistration> {
-            Some(ResolvedRegistration {
+        fn detect(&self) -> Result<ResolvedRegistration, WatchmeError> {
+            Ok(ResolvedRegistration {
                 watcher: watchme::model::WatcherState::new(
                     "watcher-1".into(),
                     watchme::model::TargetIdentity::process(watchme::model::ProcessIdentity::new(
