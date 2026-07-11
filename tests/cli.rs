@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use tempfile::tempdir;
 
 #[test]
@@ -47,7 +48,6 @@ fn administrative_commands_parse() {
         &["logs", "watcher-1", "--follow"],
         &["doctor", "--strict"],
         &["providers"],
-        &["config", "check"],
     ] {
         Command::cargo_bin("watchme")
             .expect("binary exists")
@@ -76,6 +76,108 @@ fn administrative_commands_parse() {
             .failure()
             .stderr(predicate::str::contains("daemon unavailable"));
     }
+}
+
+#[test]
+fn config_path_prints_xdg_resolved_config_file() {
+    let temp = tempdir().unwrap();
+    let config_home = temp.path().join("config");
+    let expected = config_home.join("watchme").join("config.toml");
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temp.path().join("run"))
+        .args(["config", "path"])
+        .assert()
+        .success()
+        .stdout(predicate::eq(format!("{}\n", expected.display())))
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn config_check_accepts_defaults_and_valid_file_and_rejects_unknown_fields() {
+    let temp = tempdir().unwrap();
+    let config_home = temp.path().join("config");
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("run");
+    let watchme_config = config_home.join("watchme");
+    fs::create_dir_all(&watchme_config).unwrap();
+
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["config", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("configuration ok"))
+        .stderr(predicate::str::is_empty());
+
+    let config_file = watchme_config.join("config.toml");
+    fs::write(
+        &config_file,
+        fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.example.toml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["config", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("configuration ok"));
+
+    fs::write(&config_file, "mystery = true\n").unwrap();
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["config", "check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("configuration"));
+}
+
+#[test]
+fn config_show_prints_redacted_configuration() {
+    let temp = tempdir().unwrap();
+    let config_home = temp.path().join("config");
+    fs::create_dir_all(config_home.join("watchme")).unwrap();
+    fs::write(
+        config_home.join("watchme/config.toml"),
+        concat!(
+            "config_version = 1\n",
+            "[security]\n",
+            "extra_secret_names = [\"MY_INTERNAL_TOKEN\"]\n",
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("XDG_RUNTIME_DIR", temp.path().join("run"))
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config_version"))
+        .stdout(predicate::str::contains("MY_INTERNAL_TOKEN"))
+        .stdout(predicate::str::contains("redacted").or(predicate::str::contains("observation")))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]

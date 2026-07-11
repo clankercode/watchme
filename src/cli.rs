@@ -6,6 +6,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use watchme::client::ResolvedRegistration;
+use watchme::config::Config;
 use watchme::daemon;
 use watchme::ipc::protocol::{Request, Response};
 use watchme::ipc::{read_response, write_request};
@@ -240,7 +241,31 @@ pub fn run() -> Result<(), CliFailure> {
         Some(Command::Daemon {
             command: DaemonCommand::Stop,
         }) => admin(Request::Shutdown, false),
+        Some(Command::Config { command }) => config_command(command).map_err(Into::into),
         Some(command) => Err(unavailable(command)),
+    }
+}
+
+fn config_command(command: ConfigCommand) -> Result<(), WatchmeError> {
+    let paths = runtime_paths().map_err(|failure| failure.error)?;
+    let config_path = paths.config_dir().join("config.toml");
+    match command {
+        ConfigCommand::Path => {
+            println!("{}", config_path.display());
+            Ok(())
+        }
+        ConfigCommand::Check => {
+            Config::load_layers([config_path.as_path()])
+                .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+            println!("configuration ok");
+            Ok(())
+        }
+        ConfigCommand::Show => {
+            let config = Config::load_layers([config_path.as_path()])
+                .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+            print!("{}", config.render_redacted_toml());
+            Ok(())
+        }
     }
 }
 

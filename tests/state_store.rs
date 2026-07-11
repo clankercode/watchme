@@ -186,6 +186,127 @@ fn configuration_layers_over_conservative_defaults_and_rejects_unknown_keys() {
 }
 
 #[test]
+fn documented_example_config_loads_under_strict_typed_model() {
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.example.toml");
+    let config = Config::load_layers([example.as_path()]).expect("example config must load");
+    assert_eq!(config.config_version, 1);
+    assert_eq!(config.observation.screen_confirm_samples, 2);
+    assert_eq!(config.observation.max_screen_lines, 120);
+    assert_eq!(config.daemon.max_watchers, 128);
+    assert!(config.recovery.enabled);
+    assert_eq!(config.recovery.max_attempts_per_fingerprint, 3);
+    assert_eq!(config.recovery.rate_limits.reset_margin_seconds, 75);
+    assert_eq!(
+        config.recovery.overload.backoff_seconds,
+        vec![30, 60, 120, 240, 300]
+    );
+    assert_eq!(config.recovery.codex_goal.resume_command, "/goal resume");
+    assert!(!config.security.telemetry);
+    assert_eq!(
+        config.security.extra_secret_names,
+        vec!["MY_INTERNAL_TOKEN".to_owned(), "PRIVATE_API_KEY".to_owned()]
+    );
+    assert_eq!(config.planning.planner_priority.len(), 5);
+    assert_eq!(
+        config
+            .planning
+            .planners
+            .get("codex")
+            .unwrap()
+            .provider_family,
+        "openai"
+    );
+    assert!(config.agents.get("claude").unwrap().deterministic_recovery);
+    assert!(
+        !config
+            .agents
+            .get("opencode")
+            .unwrap()
+            .deterministic_recovery
+    );
+    assert_eq!(
+        config.manifests.local_directory,
+        "~/.config/watchme/manifests"
+    );
+    assert_eq!(config.retention.events_days, 14);
+    assert!(config.notifications.herdr);
+}
+
+#[test]
+fn configuration_defaults_match_conservative_example_semantics() {
+    let defaults = Config::default();
+    assert_eq!(defaults.config_version, 1);
+    assert_eq!(defaults.daemon.idle_grace_seconds, 30);
+    assert!(!defaults.daemon.stay_resident);
+    assert_eq!(defaults.observation.poll_interval_seconds, 60);
+    assert_eq!(defaults.observation.poll_jitter_seconds, 5);
+    assert_eq!(defaults.observation.screen_confirm_samples, 2);
+    assert_eq!(defaults.observation.max_screen_bytes, 30_000);
+    assert_eq!(
+        defaults.observation.adapter_error_backoff_seconds,
+        vec![5, 15, 60, 300]
+    );
+    assert!(!defaults.lifecycle.relaunch_dead_agent);
+    assert!(defaults.lifecycle.stop_on_ambiguous_identity);
+    assert!(defaults.recovery.enabled);
+    assert!(defaults.recovery.require_empty_composer_for_text);
+    assert!(defaults.recovery.verify_every_action);
+    assert!(
+        !defaults
+            .recovery
+            .rate_limits
+            .allow_low_confidence_fallback_wait
+    );
+    assert_eq!(defaults.recovery.rate_limits.fallback_wait_seconds, 18_000);
+    assert_eq!(defaults.recovery.overload.jitter_mode, "full");
+    assert!(defaults.planning.enabled);
+    assert!(!defaults.planning.allow_network);
+    assert!(!defaults.planning.allow_repository_context);
+    assert!(!defaults.security.allow_project_config);
+    assert!(defaults.security.require_owner_only_paths);
+    assert!(defaults.security.reject_symlinks_for_state);
+    assert_eq!(defaults.retention.snapshots_days, 3);
+    assert!(defaults.notifications.notify_on_human_required);
+    assert!(!defaults.notifications.notify_on_target_exit);
+    assert!(defaults.manifests.bundled);
+    assert!(!defaults.manifests.remote_updates);
+}
+
+#[test]
+fn configuration_rejects_unknown_nested_fields_and_unsupported_versions() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("bad.toml");
+
+    fs::write(&path, "[observation]\nunexpected_field = 1\n").unwrap();
+    assert!(Config::load_layers([path.as_path()]).is_err());
+
+    fs::write(&path, "[daemon]\nmystery = true\n").unwrap();
+    assert!(Config::load_layers([path.as_path()]).is_err());
+
+    fs::write(&path, "[recovery.rate_limits]\nextra = 1\n").unwrap();
+    assert!(Config::load_layers([path.as_path()]).is_err());
+
+    fs::write(&path, "[planning.planners.codex]\nweird = true\n").unwrap();
+    assert!(Config::load_layers([path.as_path()]).is_err());
+
+    fs::write(&path, "[agents.claude]\nbonus = false\n").unwrap();
+    assert!(Config::load_layers([path.as_path()]).is_err());
+
+    fs::write(&path, "config_version = 999\n").unwrap();
+    assert!(Config::load_layers([path.as_path()]).is_err());
+}
+
+#[test]
+fn configuration_show_redacts_secret_like_values() {
+    let mut config = Config::default();
+    config.security.extra_secret_names = vec!["MY_INTERNAL_TOKEN".to_owned()];
+    let show = config.render_redacted_toml();
+    assert!(show.starts_with("# redacted configuration\n"));
+    assert!(show.contains("MY_INTERNAL_TOKEN"));
+    assert!(!show.to_ascii_lowercase().contains("password="));
+}
+
+#[test]
 fn configuration_ignores_only_missing_files_and_reports_broken_symlinks() {
     let temp = TempDir::new().unwrap();
     let missing = temp.path().join("missing.toml");
