@@ -86,6 +86,15 @@ impl ActionRecord {
 pub trait ActionStore: Send + Sync {
     fn claim_prepared(&self, target: &str, record: ActionRecord) -> Result<bool, String>;
     fn append(&self, target: &str, record: ActionRecord) -> Result<(), String>;
+    /// Atomically persists the uncertainty audit fact and the terminal human
+    /// hand-off. A failure leaves the prior active record intact so restart
+    /// recovery can fail closed instead of blindly retrying input.
+    fn escalate_uncertain(
+        &self,
+        target: &str,
+        record: ActionRecord,
+        reason: &str,
+    ) -> Result<ActionRecord, String>;
     fn active(&self, target: &str) -> Result<Option<ActionRecord>, String>;
     fn audit(&self, target: &str) -> Result<Vec<ActionRecord>, String>;
 }
@@ -350,12 +359,18 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
         record.output = Some(output_summary(&output));
         record = match self.persist(
             target,
-            record,
+            record.clone(),
             ActionPhase::Sent,
             "executor completed action unit",
         ) {
             Ok(record) => record,
-            Err(error) => return Err(TransactionError::Uncertain(error.to_string())),
+            Err(error) => {
+                return self.uncertain(
+                    target,
+                    record,
+                    format!("could not durably record a possible side effect: {error}"),
+                );
+            }
         };
         if !receipt_outcomes_hold(&output, &action.expected_outcomes) {
             return self.uncertain(
@@ -374,12 +389,20 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
         }
         record = match self.persist(
             target,
-            record,
+            record.clone(),
             ActionPhase::Verifying,
             "polling canonical expected outcomes",
         ) {
             Ok(record) => record,
-            Err(error) => return Err(TransactionError::Uncertain(error.to_string())),
+            Err(error) => {
+                return self.uncertain(
+                    target,
+                    record,
+                    format!(
+                        "could not durably begin verification after possible side effect: {error}"
+                    ),
+                );
+            }
         };
         let deadline = self
             .clock
@@ -454,14 +477,9 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
         record: ActionRecord,
         reason: String,
     ) -> Result<ActionRecord, TransactionError> {
-        let uncertain = record.next(ActionPhase::Uncertain, &reason);
-        if self.store.append(target, uncertain.clone()).is_ok() {
-            let human = uncertain.next(
-                ActionPhase::HumanRequired,
-                "possible side effect requires human review",
-            );
-            let _ = self.store.append(target, human);
-        }
+        self.store
+            .escalate_uncertain(target, record, &reason)
+            .map_err(TransactionError::Store)?;
         Err(TransactionError::Uncertain(reason))
     }
     fn revalidate(

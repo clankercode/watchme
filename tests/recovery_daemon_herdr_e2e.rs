@@ -130,6 +130,7 @@ fn spawn_fake_herdr(
     process: ProcessIdentity,
     change_after_send: bool,
     working_after_send: bool,
+    send_delay: Duration,
 ) -> FakeHerdr {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("herdr.sock");
@@ -169,6 +170,9 @@ fn spawn_fake_herdr(
                 }),
                 "send_keys" => {
                     committed.store(true, Ordering::SeqCst);
+                    if !send_delay.is_zero() {
+                        thread::sleep(send_delay);
+                    }
                     json!({"accepted":true})
                 }
                 method => panic!("unexpected Herdr method {method}"),
@@ -218,11 +222,15 @@ async fn wait_for_socket(socket: &Path) {
 }
 
 async fn ipc(socket: &Path, request: Request) -> Response {
+    ipc_with_timeout(socket, request, Duration::from_secs(1)).await
+}
+
+async fn ipc_with_timeout(socket: &Path, request: Request, timeout: Duration) -> Response {
     let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
-    watchme::ipc::write_request(&mut stream, &request, Duration::from_secs(1))
+    watchme::ipc::write_request(&mut stream, &request, timeout)
         .await
         .unwrap();
-    watchme::ipc::read_response(&mut stream, Duration::from_secs(1))
+    watchme::ipc::read_response(&mut stream, timeout)
         .await
         .unwrap()
 }
@@ -277,7 +285,7 @@ async fn daemon_runs_schema_faithful_herdr_recipe_and_persists_provenance_and_re
     )
     .unwrap();
     let process = target_process();
-    let herdr = spawn_fake_herdr(process.clone(), false, false);
+    let herdr = spawn_fake_herdr(process.clone(), false, false, Duration::ZERO);
     let daemon = start_daemon(
         paths.clone(),
         Arc::new(ConcreteHerdrRecipe {
@@ -404,7 +412,7 @@ async fn post_side_effect_herdr_adapter_error_becomes_durable_human_required_and
     )
     .unwrap();
     let process = target_process();
-    let herdr = spawn_fake_herdr(process.clone(), true, false);
+    let herdr = spawn_fake_herdr(process.clone(), true, false, Duration::ZERO);
     let daemon = start_daemon(
         paths.clone(),
         Arc::new(ConcreteHerdrRecipe {
@@ -505,7 +513,7 @@ async fn input_recovery_waits_for_a_fresh_herdr_observation_before_succeeding() 
     )
     .unwrap();
     let process = target_process();
-    let herdr = spawn_fake_herdr(process.clone(), false, true);
+    let herdr = spawn_fake_herdr(process.clone(), false, true, Duration::ZERO);
     let daemon = start_daemon(
         paths.clone(),
         Arc::new(ConcreteHerdrRecipe {
@@ -569,4 +577,107 @@ async fn input_recovery_waits_for_a_fresh_herdr_observation_before_succeeding() 
         Response::Stopped
     );
     daemon.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_waits_for_slow_recovery_to_reach_terminal_ledger_without_future_input() {
+    let temp = TempDir::new().unwrap();
+    let paths = WatchmePaths::resolve(
+        temp.path(),
+        Some(&temp.path().join("config")),
+        Some(&temp.path().join("state")),
+        Some(&temp.path().join("run")),
+    )
+    .unwrap();
+    let process = target_process();
+    let herdr = spawn_fake_herdr(process.clone(), false, false, Duration::from_millis(1_250));
+    let daemon = start_daemon(
+        paths.clone(),
+        Arc::new(ConcreteHerdrRecipe {
+            kind: ActionKind::SendKeys {
+                keys: vec!["ENTER".into()],
+            },
+            expected_working: false,
+        }),
+    )
+    .await;
+    let daemon_socket = paths.runtime_dir().join("daemon.sock");
+    wait_for_socket(&daemon_socket).await;
+    assert!(matches!(
+        ipc(
+            &daemon_socket,
+            Request::Register {
+                watcher: Box::new(watcher(herdr.path.clone(), process, "slow-shutdown")),
+            },
+        )
+        .await,
+        Response::Registered { .. }
+    ));
+    assert_eq!(
+        ipc(
+            &daemon_socket,
+            Request::WakeObservation {
+                id: "slow-shutdown".into(),
+                event_fingerprint: "1234567890abcdef".into(),
+            },
+        )
+        .await,
+        Response::Acknowledged
+    );
+    for _ in 0..200 {
+        if herdr
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "send_keys")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        herdr
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "send_keys")
+    );
+
+    let mut shutdown = Box::pin(ipc_with_timeout(
+        &daemon_socket,
+        Request::Shutdown,
+        Duration::from_secs(5),
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut shutdown)
+            .await
+            .is_err()
+    );
+    assert_eq!(shutdown.await, Response::Stopped);
+    daemon.await.unwrap().unwrap();
+
+    let actions = JsonActionStore::load(paths.state_file("actions.json").unwrap()).unwrap();
+    let audit = actions.audit("slow-shutdown").unwrap();
+    assert_eq!(audit.last().unwrap().phase, ActionPhase::HumanRequired);
+    let sends_at_stop = herdr
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["method"] == "send_keys")
+        .count();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        herdr
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "send_keys")
+            .count(),
+        sends_at_stop,
+        "no recovery input may occur after shutdown completes"
+    );
 }

@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::recovery::transaction::{ActionRecord, ActionStore};
+use crate::recovery::transaction::{ActionPhase, ActionRecord, ActionStore};
 use crate::store::{JsonStore, LoadOutcome};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -108,6 +108,42 @@ impl ActionStore for JsonActionStore {
             .map_err(|error| error.to_string())?;
         ledger.state = next;
         Ok(())
+    }
+
+    fn escalate_uncertain(
+        &self,
+        target: &str,
+        record: ActionRecord,
+        reason: &str,
+    ) -> Result<ActionRecord, String> {
+        let mut ledger = self.0.lock().map_err(|_| "action ledger lock poisoned")?;
+        let current = ledger
+            .state
+            .active
+            .get(target)
+            .ok_or("target has no active transaction")?;
+        if current.idempotency_key != record.idempotency_key
+            || current.action_id != record.action_id
+        {
+            return Err("action transaction CAS mismatch".into());
+        }
+        let uncertain = record.next(ActionPhase::Uncertain, reason);
+        let human = uncertain.next(
+            ActionPhase::HumanRequired,
+            format!("possible side effect requires human review: {reason}"),
+        );
+        let mut next = ledger.state.clone();
+        next.audit
+            .entry(target.into())
+            .or_default()
+            .extend([uncertain, human.clone()]);
+        next.active.remove(target);
+        ledger
+            .store
+            .write(&next)
+            .map_err(|error| error.to_string())?;
+        ledger.state = next;
+        Ok(human)
     }
 
     fn active(&self, target: &str) -> Result<Option<ActionRecord>, String> {

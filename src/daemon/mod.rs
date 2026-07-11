@@ -6,7 +6,7 @@ pub mod scheduler;
 
 pub use observation::classify_herdr_state;
 use observation::observation_event;
-use recovery_runtime::{RuntimeComposerSafety, execute_recovery_action};
+use recovery_runtime::{RuntimeComposerSafety, execute_recovery_action_with_cancellation};
 use runtime_services::{
     DaemonRuntimeServices, SystemRecoveryClock, recover_durable_actions_after_restart,
     recover_stale_durable_actions, target_process_is_alive,
@@ -29,6 +29,98 @@ use crate::store::JsonStore;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
+
+const RECOVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// Owns every blocking recovery transaction until it reaches a terminal
+/// ledger state. Cancellation is cooperative because a mux request can be
+/// in a kernel read when shutdown begins; in that case the daemon stays alive
+/// until the worker has observed cancellation and finished fail-closed.
+struct RecoverySupervisor {
+    accepting: std::sync::atomic::AtomicBool,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    jobs: std::sync::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>,
+}
+
+impl RecoverySupervisor {
+    fn new() -> Self {
+        Self {
+            accepting: std::sync::atomic::AtomicBool::new(true),
+            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            jobs: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn schedule(&self, watcher_id: String, job: impl FnOnce() + Send + 'static) {
+        let mut jobs = self.jobs.lock().expect("recovery job registry poisoned");
+        if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        jobs.retain(|(_, handle)| !handle.is_finished());
+        jobs.push((watcher_id, tokio::task::spawn_blocking(job)));
+    }
+
+    fn begin_shutdown(&self) {
+        self.accepting
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.cancellation
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn wait_for_terminal_jobs(&self, registry: std::sync::Arc<tokio::sync::Mutex<Registry>>) {
+        self.begin_shutdown();
+        let jobs = std::mem::take(&mut *self.jobs.lock().expect("recovery job registry poisoned"));
+        for (watcher_id, mut job) in jobs {
+            if tokio::time::timeout(RECOVERY_SHUTDOWN_GRACE, &mut job)
+                .await
+                .is_err()
+            {
+                // The worker cannot be safely killed after a possible mux
+                // side effect. Persist the human hand-off, then retain this
+                // daemon until the cooperative worker reaches its terminal
+                // transaction state.
+                let _ = registry.lock().await.transition(
+                    &watcher_id,
+                    WatcherLifecycle::HumanRequired {
+                        reason: "recovery cancellation exceeded shutdown grace".into(),
+                    },
+                    now_ms(),
+                );
+                let _ = job.await;
+            }
+        }
+    }
+}
+
+struct ShutdownSignal {
+    acknowledged: tokio::sync::oneshot::Sender<()>,
+    response_written: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn acknowledge_shutdown_requests(
+    first: ShutdownSignal,
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ShutdownSignal>,
+    timeout: Duration,
+) {
+    // Let concurrently accepted IPC tasks enqueue their already-requested
+    // shutdown before we acknowledge any of them. This keeps repeated
+    // shutdown requests idempotent without leaving a second client blocked.
+    tokio::task::yield_now().await;
+    let mut signals = vec![first];
+    while let Ok(signal) = receiver.try_recv() {
+        signals.push(signal);
+    }
+    let responses = signals
+        .into_iter()
+        .map(|signal| {
+            let _ = signal.acknowledged.send(());
+            signal.response_written
+        })
+        .collect::<Vec<_>>();
+    for response_written in responses {
+        let _ = tokio::time::timeout(timeout, response_written).await;
+    }
+}
 
 type DaemonRecoveryEngine = crate::recovery::engine::RecoveryEngine<
     crate::recovery::action_store::JsonActionStore,
@@ -519,7 +611,7 @@ pub async fn run_with_components(
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let peer_credentials = std::sync::Arc::new(peer_credentials);
     let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
-    let (shutdown_sender, mut shutdown_receiver) = tokio::sync::mpsc::channel(1);
+    let (shutdown_sender, mut shutdown_receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut connection_tasks = tokio::task::JoinSet::new();
     let mut scheduler_task = tokio::spawn(runner.run());
     let lifecycle_task = tokio::spawn(run_lifecycle_monitor(registry.clone(), scheduler.clone()));
@@ -527,6 +619,7 @@ pub async fn run_with_components(
         crate::recovery::action_store::JsonActionStore::load(paths.state_file("actions.json")?)
             .map_err(io::Error::other)?;
     let recovery_engine = std::sync::Arc::new(DaemonRecoveryEngine::new(action_store, recipes));
+    let recovery_supervisor = std::sync::Arc::new(RecoverySupervisor::new());
     let recovery_owner = crate::recovery::transaction::OwnerIdentity {
         pid: _lock.identity().pid,
         process_start_time: _lock.identity().start_time,
@@ -537,23 +630,31 @@ pub async fn run_with_components(
         ),
     };
     recover_durable_actions_after_restart(&recovery_engine);
-    let observation_task = tokio::spawn(run_observation_monitor_with_recovery(
+    let mut observation_task = Some(tokio::spawn(run_observation_monitor_with_recovery(
         registry.clone(),
         observer,
         recovery_engine,
         recovery_owner,
-    ));
+        recovery_supervisor.clone(),
+    )));
     let timeout = Duration::from_secs(2);
     let result = loop {
         let accepted = tokio::select! {
             result = &mut scheduler_task => {
                 result.map_err(io::Error::other)?;
-                while connection_tasks.join_next().await.is_some() {}
-                if shutdown_receiver.try_recv().is_ok() {
+                while connection_tasks.try_join_next().is_some() {}
+                if let Ok(signal) = shutdown_receiver.try_recv() {
+                    recovery_supervisor.begin_shutdown();
+                    if let Some(task) = observation_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    recovery_supervisor.wait_for_terminal_jobs(registry.clone()).await;
+                    acknowledge_shutdown_requests(signal, &mut shutdown_receiver, timeout).await;
                     break Ok(());
                 }
                 let registry_guard = registry.lock().await;
-                if !has_active_watchers(&registry_guard) {
+                if !has_active_watchers(&registry_guard) && connection_tasks.is_empty() {
                     break Ok(());
                 }
                 let (replacement, runner) =
@@ -563,8 +664,15 @@ pub async fn run_with_components(
                 scheduler_task = tokio::spawn(runner.run());
                 continue;
             }
-            Some(()) = shutdown_receiver.recv() => {
+            Some(signal) = shutdown_receiver.recv() => {
                 let _ = scheduler.send(SchedulerEvent::Shutdown);
+                recovery_supervisor.begin_shutdown();
+                if let Some(task) = observation_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                recovery_supervisor.wait_for_terminal_jobs(registry.clone()).await;
+                acknowledge_shutdown_requests(signal, &mut shutdown_receiver, timeout).await;
                 break Ok(());
             }
             result = listener.accept() => match result {
@@ -602,8 +710,12 @@ pub async fn run_with_components(
     }
     lifecycle_task.abort();
     let _ = lifecycle_task.await;
-    observation_task.abort();
-    let _ = observation_task.await;
+    if let Some(task) = observation_task
+        && !task.is_finished()
+    {
+        task.abort();
+        let _ = task.await;
+    }
     result
 }
 
@@ -625,6 +737,7 @@ async fn run_observation_monitor_with_recovery(
     observer: std::sync::Arc<dyn Observer>,
     recovery: std::sync::Arc<DaemonRecoveryEngine>,
     owner: crate::recovery::transaction::OwnerIdentity,
+    recovery_supervisor: std::sync::Arc<RecoverySupervisor>,
 ) {
     run_observation_loop(
         registry,
@@ -633,6 +746,7 @@ async fn run_observation_monitor_with_recovery(
         0,
         Some(recovery),
         Some(owner),
+        Some(recovery_supervisor),
     )
     .await
 }
@@ -642,7 +756,7 @@ pub async fn run_observation_monitor_with_clock(
     clock: std::sync::Arc<dyn ObservationClock>,
     max_iterations: usize,
 ) {
-    run_observation_loop(registry, observer, clock, max_iterations, None, None).await
+    run_observation_loop(registry, observer, clock, max_iterations, None, None, None).await
 }
 
 async fn run_observation_loop(
@@ -652,6 +766,7 @@ async fn run_observation_loop(
     max_iterations: usize,
     recovery: Option<std::sync::Arc<DaemonRecoveryEngine>>,
     owner: Option<crate::recovery::transaction::OwnerIdentity>,
+    recovery_supervisor: Option<std::sync::Arc<RecoverySupervisor>>,
 ) {
     let mut iterations = 0;
     let mut runtime_due = std::collections::BTreeMap::<String, u64>::new();
@@ -754,13 +869,18 @@ async fn run_observation_loop(
                     .as_ref()
                     .and_then(|_| guard.get(&watcher.watcher_id).cloned());
                 drop(guard);
-                if let (Some(engine), Some(owner), Some(current)) =
-                    (recovery.as_ref(), owner.as_ref(), current)
-                {
+                if let (Some(engine), Some(owner), Some(current), Some(supervisor)) = (
+                    recovery.as_ref(),
+                    owner.as_ref(),
+                    current,
+                    recovery_supervisor.as_ref(),
+                ) {
                     let engine = engine.clone();
                     let registry = registry.clone();
                     let owner = owner.clone();
-                    let recovery_task = tokio::task::spawn_blocking(move || {
+                    let cancellation = supervisor.cancellation.clone();
+                    let watcher_id = current.watcher_id.clone();
+                    supervisor.schedule(watcher_id, move || {
                         // `Herdr` deliberately rejects synchronous protocol calls
                         // while a Tokio runtime is entered.  Keep the complete
                         // recovery transaction on a native worker, rather than
@@ -769,7 +889,13 @@ async fn run_observation_loop(
                             scope
                                 .spawn(|| {
                                     recover_stale_durable_actions(&engine);
-                                    execute_recovery_action(registry, engine, current, owner)
+                                    execute_recovery_action_with_cancellation(
+                                        registry,
+                                        engine,
+                                        current,
+                                        owner,
+                                        cancellation,
+                                    )
                                 })
                                 .join()
                         });
@@ -777,7 +903,6 @@ async fn run_observation_loop(
                     // Verification intentionally runs alongside later
                     // observation ticks: input progress is only trusted once
                     // a fresh, durably committed observation confirms it.
-                    drop(recovery_task);
                 }
             }
         }
@@ -919,7 +1044,7 @@ async fn service_connection<P: PeerCredentialProvider>(
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
     scheduler: SchedulerHandle,
     peer_credentials: std::sync::Arc<P>,
-    shutdown_sender: tokio::sync::mpsc::Sender<()>,
+    shutdown_sender: tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
     timeout: Duration,
 ) {
     match peer_credentials.effective_uid(&stream) {
@@ -979,7 +1104,35 @@ async fn service_connection<P: PeerCredentialProvider>(
         .await;
         return;
     }
-    let (response, shutdown) = {
+    if matches!(request, Request::Shutdown) {
+        let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
+        let (written, response_written) = tokio::sync::oneshot::channel();
+        if shutdown_sender
+            .send(ShutdownSignal {
+                acknowledged,
+                response_written,
+            })
+            .is_err()
+        {
+            let _ = write_response(
+                &mut stream,
+                &Response::Error {
+                    code: "daemon_stopping".into(),
+                    message: "daemon shutdown coordinator is unavailable".into(),
+                },
+                timeout,
+            )
+            .await;
+            return;
+        }
+        if acknowledgement.await.is_err() {
+            return;
+        }
+        let _ = write_response(&mut stream, &Response::Stopped, timeout).await;
+        let _ = written.send(());
+        return;
+    }
+    let (response, _) = {
         let mut registry = registry.lock().await;
         handle_request(&mut registry, &scheduler, request)
     };
@@ -989,13 +1142,6 @@ async fn service_connection<P: PeerCredentialProvider>(
     });
     if let Err(error) = write_response(&mut stream, &response, timeout).await {
         eprintln!("watchme daemon: IPC response failed: {error}");
-        return;
-    }
-    if shutdown {
-        match shutdown_sender.try_send(()) {
-            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {}
-        }
     }
 }
 
@@ -1685,6 +1831,7 @@ mod recovery_runtime_tests {
             1,
             Some(engine.clone()),
             Some(owner),
+            Some(std::sync::Arc::new(RecoverySupervisor::new())),
         )
         .await;
 
@@ -1780,6 +1927,7 @@ mod recovery_runtime_tests {
             1,
             Some(engine.clone()),
             Some(owner),
+            Some(std::sync::Arc::new(RecoverySupervisor::new())),
         )
         .await;
 

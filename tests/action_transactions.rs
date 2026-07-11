@@ -128,6 +128,28 @@ impl ActionStore for MemoryStore {
         }
         Ok(())
     }
+    fn escalate_uncertain(
+        &self,
+        target: &str,
+        record: ActionRecord,
+        reason: &str,
+    ) -> Result<ActionRecord, String> {
+        let mut state = self.0.lock().unwrap();
+        if state.fail_on_append == Some(state.audit.len()) {
+            return Err("injected store failure".into());
+        }
+        if state.active.as_deref() != Some(target) {
+            return Err("lost active claim".into());
+        }
+        let uncertain = record.next(ActionPhase::Uncertain, reason);
+        let human = uncertain.next(
+            ActionPhase::HumanRequired,
+            format!("possible side effect requires human review: {reason}"),
+        );
+        state.audit.extend([uncertain, human.clone()]);
+        state.active = None;
+        Ok(human)
+    }
     fn active(&self, target: &str) -> Result<Option<ActionRecord>, String> {
         let state = self.0.lock().unwrap();
         Ok((state.active.as_deref() == Some(target))
@@ -388,6 +410,40 @@ fn failure_after_possible_side_effect_is_uncertain_and_never_retryable() {
 }
 
 #[test]
+fn atomic_uncertainty_failure_leaves_no_blind_retryable_active_record() {
+    let store = MemoryStore::default();
+    // The failure is injected exactly where the atomic escalation would persist.
+    store.0.lock().unwrap().fail_on_append = Some(2);
+    let reader = evidence(vec![
+        live(EventCategory::BlockedGoal, &"b".repeat(64), 0.8);
+        3
+    ]);
+    let executor = Executor::default();
+    *executor.result.lock().unwrap() = Some(Err(ExecutionError::PossibleSideEffect(
+        "send status unknown".into(),
+    )));
+    let result = Transaction::new(&store, &reader, &executor, &TestClock::default()).run(
+        "target",
+        owner(),
+        send_action(),
+        context(),
+    );
+    assert!(matches!(result, Err(TransactionError::Store(_))));
+    // A failed durable escalation must still prevent a restart from attempting input.
+    assert!(store.active("target").unwrap().is_some());
+    store.0.lock().unwrap().fail_on_append = None;
+    let restarted = Transaction::new(&store, &reader, &Executor::default(), &TestClock::default())
+        .recover_after_restart("target")
+        .unwrap()
+        .unwrap();
+    assert_eq!(restarted.phase, ActionPhase::HumanRequired);
+    assert_eq!(
+        store.audit("target").unwrap().last().unwrap().phase,
+        ActionPhase::HumanRequired
+    );
+}
+
+#[test]
 fn immediate_checks_detect_second_composer_identity_evidence_and_human_changes() {
     for changed in ["composer", "identity", "evidence", "human"] {
         let first = live(EventCategory::BlockedGoal, &"b".repeat(64), 0.8);
@@ -523,7 +579,17 @@ fn store_failure_after_send_is_never_reported_failed_or_success() {
     ]);
     let result = Transaction::new(&store, &reader, &Executor::default(), &TestClock::default())
         .run("target", owner(), send_action(), context());
-    assert!(matches!(result, Err(TransactionError::Uncertain(_))));
+    assert!(matches!(result, Err(TransactionError::Store(_))));
+    assert!(store.active("target").unwrap().is_some());
+    store.0.lock().unwrap().fail_on_append = None;
+    assert_eq!(
+        Transaction::new(&store, &reader, &Executor::default(), &TestClock::default())
+            .recover_after_restart("target")
+            .unwrap()
+            .unwrap()
+            .phase,
+        ActionPhase::HumanRequired
+    );
 }
 
 #[test]

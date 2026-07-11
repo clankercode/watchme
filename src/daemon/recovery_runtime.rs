@@ -131,6 +131,7 @@ struct DaemonActionExecutor {
     services: DaemonRuntimeServices,
     evidence: FreshTargetEvidence,
     snapshot: DispatchSnapshot,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     before_mux_dispatch: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
@@ -148,9 +149,20 @@ impl DaemonActionExecutor {
             evidence: FreshTargetEvidence::new(registry.clone(), snapshot.clone()),
             registry,
             snapshot,
+            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             before_mux_dispatch: None,
         }
+    }
+
+    fn with_cancellation(
+        registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+        snapshot: DispatchSnapshot,
+        cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let mut executor = Self::new(registry, snapshot);
+        executor.cancellation = cancellation;
+        executor
     }
 
     #[cfg(test)]
@@ -183,6 +195,17 @@ impl DaemonActionExecutor {
         Ok(())
     }
 
+    fn cancellation_requested(&self) -> bool {
+        self.cancellation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn reject_if_cancelled(&self) -> Result<(), ExecutionError> {
+        if self.cancellation_requested() {
+            return Err(ExecutionError::Unsafe("recovery cancellation requested"));
+        }
+        Ok(())
+    }
+
     fn locked_snapshot_watcher(
         &self,
     ) -> Result<tokio::sync::MutexGuard<'_, Registry>, ExecutionError> {
@@ -197,6 +220,7 @@ impl DaemonActionExecutor {
 impl ActionExecutor for DaemonActionExecutor {
     fn execute(&self, action: &crate::model::Action) -> Result<ExecutionOutput, ExecutionError> {
         use crate::model::ActionKind;
+        self.reject_if_cancelled()?;
         match &action.kind {
             ActionKind::SendText { .. } | ActionKind::SendKeys { .. } => {
                 self.confirm_live_evidence()?;
@@ -207,6 +231,11 @@ impl ActionExecutor for DaemonActionExecutor {
                 let guard = self.locked_snapshot_watcher()?;
                 let result = execute_mux_action(self.snapshot.watcher(), action);
                 drop(guard);
+                if self.cancellation_requested() {
+                    return Err(ExecutionError::PossibleSideEffect(
+                        "recovery cancellation arrived after multiplexer dispatch".into(),
+                    ));
+                }
                 result
             }
             ActionKind::Capture { source, max_lines } => {
@@ -214,6 +243,7 @@ impl ActionExecutor for DaemonActionExecutor {
                 let guard = self.locked_snapshot_watcher()?;
                 let result = execute_capture(self.snapshot.watcher(), source, *max_lines);
                 drop(guard);
+                self.reject_if_cancelled()?;
                 result
             }
             ActionKind::Notify { .. } => Err(ExecutionError::Unsafe(
@@ -322,12 +352,32 @@ fn capture_herdr_structured_state(
         .map_err(|error| ExecutionError::Integration(error.to_string()))
 }
 
+#[cfg(test)]
 pub(super) fn execute_recovery_action(
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
     engine: std::sync::Arc<super::DaemonRecoveryEngine>,
     watcher: crate::model::WatcherState,
     owner: OwnerIdentity,
 ) {
+    execute_recovery_action_with_cancellation(
+        registry,
+        engine,
+        watcher,
+        owner,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+}
+
+pub(super) fn execute_recovery_action_with_cancellation(
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+    engine: std::sync::Arc<super::DaemonRecoveryEngine>,
+    watcher: crate::model::WatcherState,
+    owner: OwnerIdentity,
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let Some(action) = engine.proposed_action(&watcher) else {
         return;
     };
@@ -363,11 +413,22 @@ pub(super) fn execute_recovery_action(
     let Some(dispatch) = dispatch else { return };
     let current = dispatch.watcher().clone();
     let evidence = FreshTargetEvidence::new(registry.clone(), dispatch.clone());
-    let executor = DaemonActionExecutor::new(registry.clone(), dispatch);
+    let executor =
+        DaemonActionExecutor::with_cancellation(registry.clone(), dispatch, cancellation);
     match engine.execute(&current, owner, &evidence, &executor, &clock) {
         Ok(Some(record))
             if record.phase == crate::recovery::transaction::ActionPhase::Succeeded =>
         {
+            if executor.cancellation_requested() {
+                let _ = registry.blocking_lock().transition(
+                    &current.watcher_id,
+                    WatcherLifecycle::HumanRequired {
+                        reason: "recovery cancellation followed a completed side effect".into(),
+                    },
+                    now_ms(),
+                );
+                return;
+            }
             let _ = crate::recovery::coordinator::RecoveryCoordinator::new(
                 &mut registry.blocking_lock(),
             )
