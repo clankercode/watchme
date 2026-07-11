@@ -549,7 +549,9 @@ fn socket_policy_rejects_aliases_types_owners_and_writable_modes() {
     let _nested_listener = UnixListener::bind(&nested).unwrap();
     let parent_alias = directory.path().join("parent-alias");
     symlink(&real_parent, &parent_alias).unwrap();
-    assert!(matches!(
+    // Directory aliases are resolved and then bound by device/inode; only a
+    // leaf socket symlink is refused as an unsafe alias.
+    assert!(
         Herdr::new(
             context(
                 parent_alias
@@ -558,9 +560,9 @@ fn socket_policy_rejects_aliases_types_owners_and_writable_modes() {
                     .into_owned()
             ),
             Duration::from_millis(50)
-        ),
-        Err(MuxError::UnsafeSocket(_))
-    ));
+        )
+        .is_ok()
+    );
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o622)).unwrap();
     assert!(matches!(
         Herdr::new(

@@ -1,3 +1,9 @@
+## 0.1.12 — 2026-07-12
+
+### Fixed
+
+- Accept Herdr sockets under macOS `/var` by rejecting only leaf path aliases and binding the resolved device/inode; directory aliases are resolved once at connect.
+
 ## 0.1.11 — 2026-07-12
 
 ### Fixed

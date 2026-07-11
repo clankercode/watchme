@@ -176,14 +176,17 @@ impl Herdr {
     }
 
     pub fn new_with_evidence_provider(
-        context: HerdrContext,
+        mut context: HerdrContext,
         timeout: Duration,
         evidence_provider: std::sync::Arc<dyn ConnectedSocketEvidenceProvider>,
     ) -> Result<Self, MuxError> {
         if timeout.is_zero() {
             return Err(MuxError::Protocol("timeout must be non-zero".into()));
         }
-        validate_socket(Path::new(&context.socket_path))?;
+        let identity = validate_socket(Path::new(&context.socket_path))?;
+        // Persist the physical path so later connects do not re-traverse macOS
+        // `/var` → `/private/var` aliases that fail a strict path equality check.
+        context.socket_path = identity.canonical_path;
         Ok(Self {
             context,
             timeout,
@@ -751,10 +754,11 @@ fn map_io(error: std::io::Error) -> MuxError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SocketIdentity {
     device: u64,
     inode: u64,
+    canonical_path: String,
 }
 
 #[derive(Debug)]
@@ -819,15 +823,18 @@ fn validate_socket(path: &Path) -> Result<SocketIdentity, MuxError> {
     if !path.is_absolute() {
         return Err(MuxError::UnsafeSocket("path is not absolute".into()));
     }
-    let canonical =
-        fs::canonicalize(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
-    if canonical.as_path() != path {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
+    // Reject only a leaf alias. Intermediate directory symlinks (macOS `/var`,
+    // or a parent dir link) are resolved and then bound by device/inode so a
+    // later replacement still fails closed.
+    if metadata.file_type().is_symlink() {
         return Err(MuxError::UnsafeSocket(
             "socket path contains a symlink or alias".into(),
         ));
     }
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
+    let canonical =
+        fs::canonicalize(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
     SocketMetadata {
         uid: metadata.uid(),
         mode: metadata.mode(),
@@ -837,6 +844,7 @@ fn validate_socket(path: &Path) -> Result<SocketIdentity, MuxError> {
     Ok(SocketIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
+        canonical_path: canonical.to_string_lossy().into_owned(),
     })
 }
 
