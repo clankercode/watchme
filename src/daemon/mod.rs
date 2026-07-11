@@ -16,6 +16,8 @@ use crate::paths::WatchmePaths;
 use crate::store::JsonStore;
 use serde::{Deserialize, Serialize};
 
+pub const MAX_CONNECTIONS: usize = 32;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonIdentity {
@@ -177,7 +179,7 @@ pub async fn run(
     .await
 }
 
-pub trait PeerCredentialProvider {
+pub trait PeerCredentialProvider: Send + Sync + 'static {
     fn effective_uid(&self, stream: &tokio::net::UnixStream) -> io::Result<u32>;
 }
 
@@ -212,7 +214,7 @@ pub async fn run_with_peer_provider(
     let listener = tokio::net::UnixListener::from_std(listener)?;
     let _cleanup = SocketCleanup(socket_path);
     let state_path = paths.state_file("watchers.json")?;
-    let mut registry = Registry::load(JsonStore::new(state_path)).map_err(io::Error::other)?;
+    let registry = Registry::load(JsonStore::new(state_path)).map_err(io::Error::other)?;
     let (scheduler, runner) = Scheduler::new(idle_grace, stay_resident);
     for watcher in registry.list() {
         if matches!(
@@ -233,86 +235,137 @@ pub async fn run_with_peer_provider(
                 .map_err(io::Error::other)?;
         }
     }
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
+    let peer_credentials = std::sync::Arc::new(peer_credentials);
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let (shutdown_sender, mut shutdown_receiver) = tokio::sync::mpsc::channel(1);
+    let mut connection_tasks = tokio::task::JoinSet::new();
     let mut scheduler_task = tokio::spawn(runner.run());
     let timeout = Duration::from_secs(2);
-    loop {
+    let result = loop {
         let accepted = tokio::select! {
             result = &mut scheduler_task => {
-                result.map_err(io::Error::other)?;
-                return Ok(());
+                break result.map(|_| ()).map_err(io::Error::other);
             }
-            result = listener.accept() => result?,
+            Some(()) = shutdown_receiver.recv() => {
+                let _ = scheduler.send(SchedulerEvent::Shutdown);
+                break Ok(());
+            }
+            result = listener.accept() => match result {
+                Ok(accepted) => accepted,
+                Err(error) => break Err(error),
+            },
         };
-        let (mut stream, _) = accepted;
-        match peer_credentials.effective_uid(&stream) {
-            Ok(uid) if uid == rustix::process::geteuid().as_raw() => {}
-            Ok(_) => {
-                eprintln!("watchme daemon: denied IPC peer with mismatched effective UID");
-                continue;
-            }
-            Err(error) => {
-                eprintln!("watchme daemon: could not validate IPC peer: {error}");
-                continue;
-            }
-        }
-        let request = match read_request(&mut stream, timeout).await {
-            Ok(request) => request,
-            Err(error) => {
-                eprintln!("watchme daemon: rejected IPC request: {error}");
-                let _ = write_response(
-                    &mut stream,
-                    &Response::Error {
-                        code: "invalid_request".into(),
-                        message: error.to_string(),
-                    },
-                    timeout,
-                )
-                .await;
-                continue;
-            }
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            continue;
         };
-        if request_has_empty_target(&request) {
-            let _ = write_response(
-                &mut stream,
-                &Response::Error {
-                    code: "invalid_target".into(),
-                    message: "target ID must not be empty".into(),
-                },
+        let (stream, _) = accepted;
+        let registry = registry.clone();
+        let scheduler = scheduler.clone();
+        let peer_credentials = peer_credentials.clone();
+        let shutdown_sender = shutdown_sender.clone();
+        connection_tasks.spawn(async move {
+            let _permit = permit;
+            service_connection(
+                stream,
+                registry,
+                scheduler,
+                peer_credentials,
+                shutdown_sender,
                 timeout,
             )
             .await;
-            continue;
+        });
+        while connection_tasks.try_join_next().is_some() {}
+    };
+    connection_tasks.abort_all();
+    while connection_tasks.join_next().await.is_some() {}
+    if !scheduler_task.is_finished() {
+        scheduler_task.abort();
+        let _ = scheduler_task.await;
+    }
+    result
+}
+
+async fn service_connection<P: PeerCredentialProvider>(
+    mut stream: tokio::net::UnixStream,
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+    scheduler: SchedulerHandle,
+    peer_credentials: std::sync::Arc<P>,
+    shutdown_sender: tokio::sync::mpsc::Sender<()>,
+    timeout: Duration,
+) {
+    match peer_credentials.effective_uid(&stream) {
+        Ok(uid) if uid == rustix::process::geteuid().as_raw() => {}
+        Ok(_) => {
+            eprintln!("watchme daemon: denied IPC peer with mismatched effective UID");
+            return;
         }
-        if matches!(
-            request,
-            Request::Stop {
-                id: None,
-                all: false
-            }
-        ) {
+        Err(error) => {
+            eprintln!("watchme daemon: could not validate IPC peer: {error}");
+            return;
+        }
+    }
+    let request = match read_request(&mut stream, timeout).await {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("watchme daemon: rejected IPC request: {error}");
             let _ = write_response(
                 &mut stream,
                 &Response::Error {
                     code: "invalid_request".into(),
-                    message: "stop requires a watcher ID or --all".into(),
+                    message: error.to_string(),
                 },
                 timeout,
             )
             .await;
-            continue;
+            return;
         }
-        let (response, shutdown) = handle_request(&mut registry, &scheduler, request);
-        let response = response.unwrap_or_else(|error| Response::Error {
-            code: "daemon_error".into(),
-            message: error.to_string(),
-        });
-        if let Err(error) = write_response(&mut stream, &response, timeout).await {
-            eprintln!("watchme daemon: IPC response failed: {error}");
-            continue;
+    };
+    if request_has_empty_target(&request) {
+        let _ = write_response(
+            &mut stream,
+            &Response::Error {
+                code: "invalid_target".into(),
+                message: "target ID must not be empty".into(),
+            },
+            timeout,
+        )
+        .await;
+        return;
+    }
+    if matches!(
+        request,
+        Request::Stop {
+            id: None,
+            all: false
         }
-        if shutdown {
-            return Ok(());
-        }
+    ) {
+        let _ = write_response(
+            &mut stream,
+            &Response::Error {
+                code: "invalid_request".into(),
+                message: "stop requires a watcher ID or --all".into(),
+            },
+            timeout,
+        )
+        .await;
+        return;
+    }
+    let (response, shutdown) = {
+        let mut registry = registry.lock().await;
+        handle_request(&mut registry, &scheduler, request)
+    };
+    let response = response.unwrap_or_else(|error| Response::Error {
+        code: "daemon_error".into(),
+        message: error.to_string(),
+    });
+    if let Err(error) = write_response(&mut stream, &response, timeout).await {
+        eprintln!("watchme daemon: IPC response failed: {error}");
+        return;
+    }
+    if shutdown {
+        let _ = shutdown_sender.send(()).await;
     }
 }
 
@@ -428,10 +481,7 @@ fn handle_request(
                 }),
             false,
         ),
-        Request::Shutdown => {
-            let _ = scheduler.send(SchedulerEvent::Shutdown);
-            (Ok(Response::Stopped), true)
-        }
+        Request::Shutdown => (Ok(Response::Stopped), true),
     }
 }
 

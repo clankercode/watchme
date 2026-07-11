@@ -12,6 +12,10 @@ pub enum RegistryError {
     Store(#[from] StoreError),
     #[error("unknown watcher {0}")]
     Unknown(String),
+    #[error("watcher ID collision: {0}")]
+    IdCollision(String),
+    #[error("watcher revision overflow: {0}")]
+    RevisionOverflow(String),
     #[error("corrupt watcher registry quarantined at {0}")]
     Corrupt(String),
 }
@@ -63,7 +67,7 @@ impl Registry {
                 watcher.lifecycle = WatcherLifecycle::HumanRequired {
                     reason: "target revalidation required after daemon restart".into(),
                 };
-                watcher.revision += 1;
+                watcher.revision = next_revision(watcher)?;
                 replay_transitioned = true;
             }
         }
@@ -80,6 +84,12 @@ impl Registry {
         &mut self,
         watcher: WatcherState,
     ) -> Result<RegistrationOutcome, RegistryError> {
+        if let Some(existing) = self.watchers.get(&watcher.watcher_id) {
+            if stable_target_eq(&existing.target, &watcher.target) {
+                return Ok(RegistrationOutcome::Existing(existing.watcher_id.clone()));
+            }
+            return Err(RegistryError::IdCollision(watcher.watcher_id));
+        }
         if let Some(existing) = self
             .watchers
             .values()
@@ -106,7 +116,7 @@ impl Registry {
             .get_mut(id)
             .ok_or_else(|| RegistryError::Unknown(id.into()))?;
         watcher.lifecycle = lifecycle;
-        watcher.revision += 1;
+        watcher.revision = next_revision(watcher)?;
         watcher.updated_at_unix_ms = now;
         self.persist_watchers(&updated)?;
         self.watchers = updated;
@@ -130,6 +140,13 @@ impl Registry {
         })?;
         Ok(())
     }
+}
+
+fn next_revision(watcher: &WatcherState) -> Result<u64, RegistryError> {
+    watcher
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| RegistryError::RevisionOverflow(watcher.watcher_id.clone()))
 }
 
 fn stable_target_eq(left: &TargetIdentity, right: &TargetIdentity) -> bool {

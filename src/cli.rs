@@ -118,6 +118,10 @@ enum DaemonCommand {
 }
 
 const SCHEMA_VERSION: &str = "1.0";
+const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+const INITIAL_STARTUP_BACKOFF: Duration = Duration::from_millis(20);
+const MAX_STARTUP_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_DAEMON_DIAGNOSTIC_BYTES: usize = 512;
 
 fn parse_target_id(value: &str) -> Result<String, String> {
     if value.is_empty() {
@@ -400,25 +404,142 @@ impl RegistrationClient for IpcRegistrationClient {
             Err(_) => {
                 let executable = std::env::current_exe()
                     .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()))?;
-                ProcessCommand::new(executable)
+                paths
+                    .create_owner_only()
+                    .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()))?;
+                let (diagnostic_file, diagnostic_path) = open_startup_diagnostic(&paths)
+                    .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()))?;
+                let mut child = ProcessCommand::new(executable)
                     .args(["daemon", "run"])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::from(diagnostic_file))
                     .spawn()
                     .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()))?;
-                for _ in 0..50 {
-                    std::thread::sleep(Duration::from_millis(10));
-                    if let Ok(response) = request_daemon(&paths, &request) {
-                        return render_response(response, false).map_err(|failure| failure.error);
+                let readiness =
+                    wait_for_readiness(&SystemWaitClock, DAEMON_STARTUP_TIMEOUT, || {
+                        request_daemon(&paths, &request)
+                    });
+                match readiness {
+                    Ok(response) => {
+                        render_response(response, false).map_err(|failure| failure.error)
+                    }
+                    Err(error) => {
+                        let diagnostic = child_failure_diagnostic(&mut child, &diagnostic_path);
+                        Err(WatchmeError::RetryableIntegration(format!(
+                            "daemon did not become ready: {error}{diagnostic}"
+                        )))
                     }
                 }
-                Err(WatchmeError::RetryableIntegration(
-                    "daemon did not become ready".into(),
-                ))
             }
         }
     }
+}
+
+fn open_startup_diagnostic(paths: &WatchmePaths) -> std::io::Result<(std::fs::File, PathBuf)> {
+    let path = paths.runtime_dir().join("daemon-startup.log");
+    let file = rustix::fs::open(
+        &path,
+        rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::TRUNC
+            | rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_bits_truncate(0o600),
+    )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from)?;
+    rustix::fs::fchmod(&file, rustix::fs::Mode::from_bits_truncate(0o600))
+        .map_err(std::io::Error::from)?;
+    Ok((file, path))
+}
+
+trait WaitClock {
+    fn now(&self) -> std::time::Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemWaitClock;
+
+impl WaitClock for SystemWaitClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+fn wait_for_readiness<T, E>(
+    clock: &impl WaitClock,
+    timeout: Duration,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let deadline = clock.now() + timeout;
+    let mut backoff = INITIAL_STARTUP_BACKOFF;
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let now = clock.now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                clock.sleep(backoff.min(deadline.duration_since(now)));
+                backoff = (backoff * 2).min(MAX_STARTUP_BACKOFF);
+            }
+        }
+    }
+}
+
+fn child_failure_diagnostic(child: &mut std::process::Child, path: &Path) -> String {
+    let status = match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+            child.wait().ok()
+        }
+    };
+    let mut stderr = Vec::new();
+    if let Ok(mut file) = std::fs::File::open(path) {
+        use std::io::Read as _;
+        let _ = file
+            .by_ref()
+            .take((MAX_DAEMON_DIAGNOSTIC_BYTES + 1) as u64)
+            .read_to_end(&mut stderr);
+    }
+    let diagnostic = sanitize_daemon_stderr(&stderr);
+    match (status, diagnostic.is_empty()) {
+        (Some(status), false) => format!("; child {status}: {diagnostic}"),
+        (Some(status), true) => format!("; child {status}"),
+        (None, false) => format!("; child diagnostic: {diagnostic}"),
+        (None, true) => String::new(),
+    }
+}
+
+fn sanitize_daemon_stderr(stderr: &[u8]) -> String {
+    let source = String::from_utf8_lossy(&stderr[..stderr.len().min(MAX_DAEMON_DIAGNOSTIC_BYTES)]);
+    let mut sanitized = String::new();
+    for line in source.lines() {
+        if !sanitized.is_empty() {
+            sanitized.push('\n');
+        }
+        let lower = line.to_ascii_lowercase();
+        if ["token", "secret", "password", "credential", "api_key"]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            sanitized.push_str("[redacted]");
+        } else {
+            sanitized.extend(line.chars().filter(|character| !character.is_control()));
+        }
+        if sanitized.len() >= MAX_DAEMON_DIAGNOSTIC_BYTES {
+            sanitized.truncate(MAX_DAEMON_DIAGNOSTIC_BYTES);
+            break;
+        }
+    }
+    sanitized
 }
 
 fn request_daemon(paths: &WatchmePaths, request: &Request) -> std::io::Result<Response> {
@@ -455,6 +576,7 @@ fn unavailable(command: Command) -> CliFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     struct FixedContextDetector;
 
@@ -513,5 +635,81 @@ mod tests {
             assert_eq!(value["error"]["code"], expected_code);
             assert_eq!(value["error"]["message"], "x");
         }
+    }
+
+    struct FakeWaitClock {
+        now: Cell<std::time::Instant>,
+        sleeps: RefCell<Vec<Duration>>,
+    }
+
+    impl WaitClock for FakeWaitClock {
+        fn now(&self) -> std::time::Instant {
+            self.now.get()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.borrow_mut().push(duration);
+            self.now.set(self.now.get() + duration);
+        }
+    }
+
+    #[test]
+    fn startup_readiness_uses_bounded_deadline_and_backoff() {
+        let clock = FakeWaitClock {
+            now: Cell::new(std::time::Instant::now()),
+            sleeps: RefCell::new(Vec::new()),
+        };
+        let started = clock.now();
+        let mut attempts = 0;
+        let result = wait_for_readiness(&clock, Duration::from_secs(2), || {
+            attempts += 1;
+            Err::<(), _>(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not ready",
+            ))
+        });
+
+        assert!(result.is_err());
+        assert!(attempts > 5);
+        assert_eq!(clock.now().duration_since(started), Duration::from_secs(2));
+        let sleeps = clock.sleeps.borrow();
+        assert!(
+            sleeps[..sleeps.len() - 1]
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+        assert!(
+            sleeps
+                .iter()
+                .all(|delay| *delay <= Duration::from_millis(200))
+        );
+    }
+
+    #[test]
+    fn daemon_stderr_diagnostics_are_bounded_and_redact_secret_lines() {
+        let diagnostic = sanitize_daemon_stderr(
+            b"failed to bind runtime socket\nAPI_TOKEN=super-secret\npassword=hunter2\n",
+        );
+        assert_eq!(
+            diagnostic,
+            "failed to bind runtime socket\n[redacted]\n[redacted]"
+        );
+        assert!(diagnostic.len() <= MAX_DAEMON_DIAGNOSTIC_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_startup_diagnostic_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths =
+            WatchmePaths::resolve(temp.path(), None, None, Some(&temp.path().join("run"))).unwrap();
+        paths.create_owner_only().unwrap();
+        let (_file, path) = open_startup_diagnostic(&paths).unwrap();
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

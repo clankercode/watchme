@@ -14,7 +14,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use watchme::daemon::registry::{RegistrationOutcome, Registry};
 use watchme::daemon::scheduler::{Scheduler, SchedulerEvent};
-use watchme::daemon::{DaemonLock, ProcessProbe};
+use watchme::daemon::{DaemonLock, MAX_CONNECTIONS, ProcessProbe};
 use watchme::ipc::protocol::{MAX_FRAME_BYTES, Request, Response, decode_frame, encode_frame};
 use watchme::ipc::{bind_owner_only, validate_peer_uid};
 use watchme::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
@@ -108,6 +108,47 @@ fn registry_deduplicates_persists_transitions_and_replays_as_revalidation_requir
         matches!(watcher.lifecycle, WatcherLifecycle::HumanRequired { ref reason } if reason.contains("revalidation"))
     );
     assert_eq!(watcher.revision, 2);
+}
+
+#[test]
+fn registry_rejects_id_collision_without_overwriting_persisted_target() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("watchers.json");
+    let mut registry = Registry::load(JsonStore::new(path.clone())).unwrap();
+    registry.register(state("same-id", 42, 900)).unwrap();
+    assert!(matches!(
+        registry.register(state("same-id", 43, 901)),
+        Err(watchme::daemon::registry::RegistryError::IdCollision(id)) if id == "same-id"
+    ));
+
+    let persisted = Registry::load(JsonStore::new(path)).unwrap();
+    assert_eq!(persisted.list().len(), 1);
+    assert_eq!(
+        persisted.get("same-id").unwrap().target,
+        state("ignored", 42, 900).target
+    );
+}
+
+#[test]
+fn replay_revision_overflow_fails_closed_without_panicking() {
+    let temp = TempDir::new().unwrap();
+    let store = JsonStore::new(temp.path().join("watchers.json"));
+    store
+        .write(&serde_json::json!({
+            "version": 1,
+            "watchers": [WatcherState::new(
+                "overflow".into(),
+                TargetIdentity::process(ProcessIdentity::new(44, 902)),
+                WatcherLifecycle::Registered,
+                u64::MAX,
+                1,
+            )]
+        }))
+        .unwrap();
+    assert!(matches!(
+        Registry::load(store),
+        Err(watchme::daemon::registry::RegistryError::RevisionOverflow(id)) if id == "overflow"
+    ));
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -402,6 +443,18 @@ async fn live_ipc_dedupes_scopes_pause_resume_and_survives_disconnect() {
             .count(),
         1
     );
+    assert!(matches!(
+        watchme::client::register_resolved(
+            &paths,
+            watchme::client::ResolvedRegistration {
+                watcher: state("one", 52, 701),
+            },
+        )
+        .await
+        .unwrap(),
+        Response::Error { code, message }
+            if code == "daemon_error" && message == "watcher ID collision: one"
+    ));
     assert_eq!(
         responses
             .iter()
@@ -455,6 +508,73 @@ async fn live_ipc_dedupes_scopes_pause_resume_and_survives_disconnect() {
             message: "stop requires a watcher ID or --all".into(),
         }
     );
+    assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stalled_peer_does_not_block_status_or_shutdown() {
+    let temp = TempDir::new().unwrap();
+    let paths =
+        WatchmePaths::resolve(temp.path(), None, None, Some(&temp.path().join("run"))).unwrap();
+    let daemon_paths = paths.clone();
+    let task = tokio::spawn(async move {
+        watchme::daemon::run(&daemon_paths, Duration::from_secs(5), true).await
+    });
+    let socket = paths.runtime_dir().join("daemon.sock");
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    use tokio::io::AsyncWriteExt;
+    let mut stalled = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    stalled.write_all(&128_u32.to_be_bytes()).await.unwrap();
+    stalled.write_all(b"{").await.unwrap();
+    let status = tokio::time::timeout(
+        Duration::from_millis(250),
+        ipc(&socket, Request::Status { id: None }),
+    )
+    .await
+    .expect("stalled peer must not monopolize the daemon");
+    assert!(matches!(status, Response::Status { .. }));
+    assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn daemon_bounds_simultaneous_connections() {
+    let temp = TempDir::new().unwrap();
+    let paths =
+        WatchmePaths::resolve(temp.path(), None, None, Some(&temp.path().join("run"))).unwrap();
+    let daemon_paths = paths.clone();
+    let task = tokio::spawn(async move {
+        watchme::daemon::run(&daemon_paths, Duration::from_secs(5), true).await
+    });
+    let socket = paths.runtime_dir().join("daemon.sock");
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut held = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        held.push(tokio::net::UnixStream::connect(&socket).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut excess = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0];
+    let read = tokio::time::timeout(Duration::from_millis(250), excess.read(&mut byte))
+        .await
+        .expect("excess connection must be rejected promptly")
+        .unwrap();
+    assert_eq!(read, 0);
+    drop(held);
     assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
     task.await.unwrap().unwrap();
 }
@@ -557,4 +677,50 @@ async fn replayed_stopped_watchers_do_not_prevent_live_idle_shutdown() {
         .await
         .unwrap();
     assert!(!paths.runtime_dir().join("daemon.sock").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn live_transition_revision_overflow_returns_typed_daemon_error() {
+    let temp = TempDir::new().unwrap();
+    let paths =
+        WatchmePaths::resolve(temp.path(), None, None, Some(&temp.path().join("run"))).unwrap();
+    paths.create_owner_only().unwrap();
+    JsonStore::new(paths.state_file("watchers.json").unwrap())
+        .write(&serde_json::json!({
+            "version": 1,
+            "watchers": [WatcherState::new(
+                "overflow".into(),
+                TargetIdentity::process(ProcessIdentity::new(92, 903)),
+                WatcherLifecycle::Stopped { reason: "fixture".into() },
+                u64::MAX,
+                1,
+            )]
+        }))
+        .unwrap();
+    let daemon_paths = paths.clone();
+    let task = tokio::spawn(async move {
+        watchme::daemon::run(&daemon_paths, Duration::from_secs(5), true).await
+    });
+    let socket = paths.runtime_dir().join("daemon.sock");
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        ipc(
+            &socket,
+            Request::Pause {
+                id: "overflow".into(),
+            },
+        )
+        .await,
+        Response::Error {
+            code: "daemon_error".into(),
+            message: "watcher revision overflow: overflow".into(),
+        }
+    );
+    assert_eq!(ipc(&socket, Request::Shutdown).await, Response::Stopped);
+    task.await.unwrap().unwrap();
 }
