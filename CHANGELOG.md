@@ -1,3 +1,10 @@
+## 0.1.14 — 2026-07-12
+
+### Fixed
+
+- Detect case-insensitive `WatchMe`/`watchme` collision before `ln` so macOS install does not replace the binary with a self-symlink.
+- Ignore remaining timing-sensitive Herdr daemon E2E tests on CI runners.
+
 ## 0.1.13 — 2026-07-12
 
 ### Fixed
