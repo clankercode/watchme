@@ -772,7 +772,7 @@ impl Observer for AlwaysFailObserver {
         _: WatcherState,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<watchme::model::Event>, String>>
+            dyn std::future::Future<Output = Result<watchme::daemon::ObservationResult, String>>
                 + Send
                 + 'a,
         >,

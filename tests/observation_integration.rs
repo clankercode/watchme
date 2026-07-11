@@ -138,29 +138,34 @@ fn observation_commit_rolls_back_schedule_event_and_recovery_on_store_failure() 
 }
 
 #[test]
-fn herdr_typed_states_map_explicitly_and_unknown_is_nonactionable() {
+fn herdr_typed_states_map_explicitly_and_unclassified_has_no_wire_event() {
     assert_eq!(
-        classify_herdr_state("working", false).0,
+        classify_herdr_state("working", false).unwrap().0,
         EventCategory::Working
     );
-    assert_eq!(classify_herdr_state("idle", false).0, EventCategory::Idle);
     assert_eq!(
-        classify_herdr_state("waiting", false).0,
+        classify_herdr_state("idle", false).unwrap().0,
+        EventCategory::Idle
+    );
+    assert_eq!(
+        classify_herdr_state("waiting", false).unwrap().0,
         EventCategory::WaitingForTool
     );
+    assert!(classify_herdr_state("blocked", false).is_none());
     assert_eq!(
-        classify_herdr_state("blocked", false).0,
-        EventCategory::Unknown
-    );
-    assert_eq!(
-        classify_herdr_state("blocked", true).0,
+        classify_herdr_state("blocked", true).unwrap().0,
         EventCategory::BlockedGoal
     );
+    assert!(classify_herdr_state("new-state", true).is_none());
+}
+
+#[test]
+fn canonical_event_category_wire_enum_rejects_non_schema_unknown() {
+    assert!(serde_json::from_value::<EventCategory>(json!("unknown")).is_err());
     assert_eq!(
-        classify_herdr_state("new-state", true).0,
-        EventCategory::Unknown
+        serde_json::to_value(EventCategory::UnknownBlocked).unwrap(),
+        json!("unknown_blocked")
     );
-    assert!(!EventCategory::Unknown.is_actionable());
 }
 
 #[test]
@@ -485,7 +490,12 @@ async fn generic_observer_herdr_socket_maps_typed_working_and_uses_persisted_cur
         0,
     );
     watcher.observation_schedule = schedule;
-    let event = GenericObserver.observe(watcher).await.unwrap().unwrap();
+    let event = GenericObserver
+        .observe(watcher)
+        .await
+        .unwrap()
+        .event
+        .unwrap();
     assert_eq!(event.category, EventCategory::Working);
     assert_eq!(event.monotonic_sequence, Some(8));
     server.join().unwrap();
@@ -561,9 +571,9 @@ async fn generic_observer_herdr_empty_events_uses_bounded_sanitized_unknown_fall
         0,
         0,
     );
-    let event = GenericObserver.observe(watcher).await.unwrap().unwrap();
-    assert_eq!(event.category, EventCategory::Unknown);
-    assert_eq!(event.monotonic_sequence, None);
+    let result = GenericObserver.observe(watcher).await.unwrap();
+    assert!(result.event.is_none());
+    assert_eq!(result.herdr_after_sequence, None);
     server.join().unwrap();
     let methods = methods.lock().unwrap();
     let (_, params) = methods

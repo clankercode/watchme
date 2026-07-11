@@ -25,7 +25,12 @@ pub trait Observer: Send + Sync + 'static {
     fn observe<'a>(
         &'a self,
         watcher: crate::model::WatcherState,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<crate::model::Event>, String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<ObservationResult, String>> + Send + 'a>>;
+}
+#[derive(Default)]
+pub struct ObservationResult {
+    pub event: Option<crate::model::Event>,
+    pub herdr_after_sequence: Option<u64>,
 }
 pub trait ObservationClock: Send + Sync + 'static {
     fn wall_now_ms(&self) -> u64;
@@ -66,8 +71,7 @@ impl Observer for GenericObserver {
     fn observe<'a>(
         &'a self,
         watcher: crate::model::WatcherState,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<crate::model::Event>, String>> + Send + 'a>>
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<ObservationResult, String>> + Send + 'a>> {
         Box::pin(async move {
             if let crate::model::TargetIdentity::Multiplexer {
                 context: Some(context),
@@ -122,10 +126,15 @@ impl Observer for GenericObserver {
                     serde_json::to_vec(&state).map_err(|error| error.to_string())?
                 };
                 let terminal_evidence = state.events.iter().any(|event| event.kind == "terminal");
-                let (category, terminal) = if state.events.is_empty() {
-                    (crate::model::EventCategory::Unknown, false)
-                } else {
-                    classify_herdr_state(&state.state, terminal_evidence)
+                let classification = (!state.events.is_empty())
+                    .then(|| classify_herdr_state(&state.state, terminal_evidence))
+                    .flatten();
+                let cursor = state.events.iter().map(|event| event.sequence).max();
+                let Some((category, terminal)) = classification else {
+                    return Ok(ObservationResult {
+                        event: None,
+                        herdr_after_sequence: cursor,
+                    });
                 };
                 let mut event = observation_event(
                     &watcher,
@@ -138,7 +147,10 @@ impl Observer for GenericObserver {
                 )?;
                 event.terminal = terminal;
                 event.monotonic_sequence = state.events.iter().map(|event| event.sequence).max();
-                return Ok(Some(event));
+                return Ok(ObservationResult {
+                    event: Some(event),
+                    herdr_after_sequence: cursor,
+                });
             }
             tokio::task::spawn_blocking(move || generic_observe(&watcher))
                 .await
@@ -146,9 +158,7 @@ impl Observer for GenericObserver {
         })
     }
 }
-fn generic_observe(
-    watcher: &crate::model::WatcherState,
-) -> Result<Option<crate::model::Event>, String> {
+fn generic_observe(watcher: &crate::model::WatcherState) -> Result<ObservationResult, String> {
     use crate::mux::Multiplexer;
     use sha2::{Digest, Sha256};
     if let crate::model::TargetIdentity::Process { process } = &watcher.target {
@@ -175,7 +185,10 @@ fn generic_observe(
             1.0,
             if alive { b"alive" } else { b"dead" },
         )
-        .map(Some);
+        .map(|event| ObservationResult {
+            event: Some(event),
+            herdr_after_sequence: None,
+        });
     }
     let crate::model::TargetIdentity::Multiplexer {
         provider,
@@ -188,13 +201,13 @@ fn generic_observe(
         ..
     } = &watcher.target
     else {
-        return Ok(None);
+        return Ok(ObservationResult::default());
     };
     if provider != "tmux" || watcher.target.needs_revalidation() {
-        return Ok(None);
+        return Ok(ObservationResult::default());
     }
     let Some(context) = context else {
-        return Ok(None);
+        return Ok(ObservationResult::default());
     };
     let crate::model::MultiplexerContext::Tmux {
         socket_path,
@@ -205,7 +218,7 @@ fn generic_observe(
         server_instance,
     } = context.as_ref()
     else {
-        return Ok(None);
+        return Ok(ObservationResult::default());
     };
     let tmux = crate::mux::tmux::Tmux::for_socket_path(server.clone(), Duration::from_secs(2));
     let selector =
@@ -241,11 +254,10 @@ fn generic_observe(
         Sha256::digest(serde_json::to_vec(&watcher.target).map_err(|error| error.to_string())?)
     );
     let observed: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
-    let category = if clean.trim().is_empty() {
-        crate::model::EventCategory::Idle
-    } else {
-        crate::model::EventCategory::Unknown
-    };
+    if !clean.trim().is_empty() {
+        return Ok(ObservationResult::default());
+    }
+    let category = crate::model::EventCategory::Idle;
     let mut event = crate::model::Event::new(
         format!("obs-{}-{}", watcher.watcher_id, watcher.revision),
         observed.to_rfc3339(),
@@ -265,21 +277,24 @@ fn generic_observe(
     )
     .map_err(|error| error.to_string())?;
     event.session_id = session.clone();
-    Ok(Some(event))
+    Ok(ObservationResult {
+        event: Some(event),
+        herdr_after_sequence: None,
+    })
 }
 
 pub fn classify_herdr_state(
     state: &str,
     terminal_evidence: bool,
-) -> (crate::model::EventCategory, bool) {
+) -> Option<(crate::model::EventCategory, bool)> {
     use crate::model::EventCategory;
     match (state, terminal_evidence) {
-        ("working", _) => (EventCategory::Working, false),
-        ("idle", _) => (EventCategory::Idle, false),
-        ("waiting", _) => (EventCategory::WaitingForTool, false),
-        ("terminated", true) => (EventCategory::Terminated, true),
-        ("blocked", true) => (EventCategory::BlockedGoal, true),
-        _ => (EventCategory::Unknown, false),
+        ("working", _) => Some((EventCategory::Working, false)),
+        ("idle", _) => Some((EventCategory::Idle, false)),
+        ("waiting", _) => Some((EventCategory::WaitingForTool, false)),
+        ("terminated", true) => Some((EventCategory::Terminated, true)),
+        ("blocked", true) => Some((EventCategory::BlockedGoal, true)),
+        _ => None,
     }
 }
 
@@ -648,13 +663,8 @@ pub async fn run_observation_monitor_with_clock(
                     let mut next = schedule.clone();
                     next.last_check_wall_ms = Some(now);
                     next.interval_sequence = next.interval_sequence.saturating_add(1);
-                    let hash = watcher
-                        .watcher_id
-                        .bytes()
-                        .fold(next.interval_sequence, |acc, byte| {
-                            acc.wrapping_mul(109).wrapping_add(u64::from(byte))
-                        });
-                    let jitter = (hash % 11) as i64 - 5;
+                    let jitter =
+                        observation_jitter_seconds(&watcher.watcher_id, next.interval_sequence);
                     next.next_due_wall_ms =
                         now.saturating_add_signed((60_000i64 + jitter * 1_000).max(1));
                     runtime_due.insert(
@@ -676,10 +686,11 @@ pub async fn run_observation_monitor_with_clock(
                 Ok(result) => result,
                 Err(_) => Err("observation timed out".into()),
             };
-            if let Ok(event) = event {
-                if let Some(sequence) = event.as_ref().and_then(|event| event.monotonic_sequence) {
+            if let Ok(result) = event {
+                if let Some(sequence) = result.herdr_after_sequence {
                     next_schedule.herdr_after_sequence = sequence;
                 }
+                let event = result.event;
                 if let Some(event) = event.as_ref()
                     && event.source.kind == crate::model::SourceKind::ScreenDetection
                 {
@@ -714,6 +725,13 @@ pub async fn run_observation_monitor_with_clock(
         }
         clock.sleep_until_mono(mono.saturating_add(1_000)).await;
     }
+}
+
+pub fn observation_jitter_seconds(watcher_id: &str, interval_sequence: u64) -> i64 {
+    let hash = watcher_id.bytes().fold(interval_sequence, |acc, byte| {
+        acc.wrapping_mul(109).wrapping_add(u64::from(byte))
+    });
+    (hash % 11) as i64 - 5
 }
 
 async fn run_lifecycle_monitor(

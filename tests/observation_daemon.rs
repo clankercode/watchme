@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use tempfile::tempdir;
+use watchme::daemon::observation_jitter_seconds;
 use watchme::daemon::registry::Registry;
 use watchme::daemon::{ObservationClock, Observer, run_observation_monitor_with_clock};
 use watchme::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
@@ -38,13 +39,13 @@ impl Observer for CountingObserver {
         watcher: WatcherState,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<watchme::model::Event>, String>>
+            dyn std::future::Future<Output = Result<watchme::daemon::ObservationResult, String>>
                 + Send
                 + 'a,
         >,
     > {
         self.0.lock().unwrap().push(watcher.watcher_id);
-        Box::pin(async { Ok(None) })
+        Box::pin(async { Ok(watchme::daemon::ObservationResult::default()) })
     }
 }
 
@@ -157,7 +158,7 @@ impl Observer for FailingObserver {
         _: WatcherState,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<Option<watchme::model::Event>, String>>
+            dyn std::future::Future<Output = Result<watchme::daemon::ObservationResult, String>>
                 + Send
                 + 'a,
         >,
@@ -225,4 +226,21 @@ async fn monotonic_cadence_ignores_repeated_forward_and_backward_wall_jumps() {
     let checks = observer.0.lock().unwrap().len();
     assert!((2..=3).contains(&checks), "unexpected checks: {checks}");
     assert_eq!(*clock.sleeps.lock().unwrap(), 129);
+}
+
+#[test]
+fn deterministic_jitter_recomputes_each_interval_with_positive_and_negative_values() {
+    let values: Vec<i64> = (1..=128)
+        .map(|sequence| observation_jitter_seconds("watcher-seed", sequence))
+        .collect();
+    assert!(values.iter().all(|value| (-5..=5).contains(value)));
+    assert!(values.iter().any(|value| *value < 0));
+    assert!(values.iter().any(|value| *value > 0));
+    assert!(values.windows(2).any(|pair| pair[0] != pair[1]));
+    assert_eq!(
+        values,
+        (1..=128)
+            .map(|sequence| observation_jitter_seconds("watcher-seed", sequence))
+            .collect::<Vec<_>>()
+    );
 }

@@ -56,7 +56,6 @@ impl EventSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventCategory {
-    Unknown,
     Working,
     Idle,
     WaitingForModel,
@@ -90,8 +89,7 @@ impl EventCategory {
     pub const fn is_actionable(self) -> bool {
         !matches!(
             self,
-            Self::Unknown
-                | Self::Working
+            Self::Working
                 | Self::Idle
                 | Self::Recovered
                 | Self::HumanIntervention

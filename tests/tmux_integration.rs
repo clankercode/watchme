@@ -3,7 +3,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use watchme::daemon::{GenericObserver, Observer};
-use watchme::model::{EventCategory, TargetIdentity, WatcherLifecycle, WatcherState};
+use watchme::model::{TargetIdentity, WatcherLifecycle, WatcherState};
 use watchme::mux::tmux::{Tmux, TmuxSelector};
 use watchme::mux::{
     ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, SymbolicKey,
@@ -107,9 +107,8 @@ async fn generic_tmux_blocked_text_without_adapter_boundary_is_unknown_nonaction
         None,
     );
     let watcher = WatcherState::new("w".into(), target, WatcherLifecycle::Observing, 0, 0);
-    let event = GenericObserver.observe(watcher).await.unwrap().unwrap();
-    assert_eq!(event.category, EventCategory::Unknown);
-    assert!(!event.category.is_actionable());
+    let result = GenericObserver.observe(watcher).await.unwrap();
+    assert!(result.event.is_none());
 }
 
 #[test]
