@@ -339,8 +339,8 @@ fn monitor_process_lifecycles(
                 {
                     monitor.commit_reexec(identity);
                 } else {
-                    let _ = scheduler.send(SchedulerEvent::Stop(watcher.watcher_id.clone()));
-                    monitors.remove(&watcher.watcher_id);
+                    // Preserve the coherent old identity, scheduler entry, and monitor;
+                    // later ticks retry persistence while action revalidation stays closed.
                 }
             }
             LifecycleDecision::Terminate => {
@@ -712,12 +712,23 @@ mod process_lifecycle_tests {
             &FakeInspector(HashMap::from([(41, replacement)])),
             &mut monitors,
         );
-        let TargetIdentity::Process { process } = &registry.get("watcher").unwrap().target else {
+        let TargetIdentity::Process {
+            process: target_process,
+        } = &registry.get("watcher").unwrap().target
+        else {
             panic!("process target")
         };
-        assert_eq!(process.pid, 40);
-        assert!(monitors.is_empty());
-        assert!(scheduler.snapshot().await.unwrap().is_empty());
+        assert_eq!(target_process.pid, 40);
+        assert!(monitors.contains_key("watcher"));
+        assert_eq!(scheduler.snapshot().await.unwrap().len(), 1);
+        monitor_process_lifecycles(
+            &mut registry,
+            &scheduler,
+            &FakeInspector(HashMap::from([(41, process(41))])),
+            &mut monitors,
+        );
+        assert!(monitors.contains_key("watcher"));
+        assert_eq!(scheduler.snapshot().await.unwrap().len(), 1);
         scheduler.send(SchedulerEvent::Shutdown).unwrap();
         task.await.unwrap();
     }

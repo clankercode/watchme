@@ -146,6 +146,8 @@ pub enum ProcessError {
     Malformed { pid: u32, reason: String },
     #[error("process inspection failed: {0}")]
     Inspection(String),
+    #[error("process enumeration was incomplete: {0}")]
+    IncompleteEnumeration(String),
     #[error(
         "agent process discovery is ambiguous ({candidates:?}); run `watchme doctor` for pane and process evidence"
     )]

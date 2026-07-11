@@ -2,9 +2,12 @@ use std::collections::BTreeMap;
 
 #[cfg(target_os = "linux")]
 use watchme::process::linux::{
-    LinuxProcessInspector, canonical_tty_path, parse_proc_stat, parse_status_uid,
+    LinuxProcessInspector, MAX_PROC_ENTRIES, canonical_tty_path, collect_proc_pid_names,
+    parse_proc_stat, parse_status_uid,
 };
-use watchme::process::macos::{MacProcessSource, VerifiedMacInspector, parse_ps_record};
+use watchme::process::macos::{
+    MacProcessSource, VerifiedMacInspector, parse_ps_record, run_bounded_command,
+};
 use watchme::process::{
     AgentKind, CandidateHints, LifecycleDecision, LifecycleMonitor, ProcessError, ProcessInspector,
     ProcessRecord, ProcessResolver,
@@ -297,7 +300,7 @@ impl MacProcessSource for FakeMacSource {
 #[test]
 fn macos_inspection_rejects_recycle_with_before_ps_after_order() {
     let source = FakeMacSource {
-        starts: std::cell::RefCell::new(vec![100, 101]),
+        starts: std::cell::RefCell::new(vec![1_000_001, 1_000_002]),
         ..FakeMacSource::default()
     };
     let inspector = VerifiedMacInspector::new(source);
@@ -325,6 +328,30 @@ fn macos_tty_enumeration_verifies_each_pid_before_reading_its_row() {
         inspector.source().calls.borrow().as_slice(),
         ["list", "start:42", "ps:42", "start:42"]
     );
+}
+
+#[test]
+fn macos_command_boundary_bounds_output_and_kills_hung_children() {
+    assert!(
+        run_bounded_command(
+            "/usr/bin/printf",
+            &["123456789"],
+            4,
+            std::time::Duration::from_secs(1)
+        )
+        .is_err()
+    );
+    let started = std::time::Instant::now();
+    assert!(
+        run_bounded_command(
+            "/usr/bin/sleep",
+            &["10"],
+            4,
+            std::time::Duration::from_millis(20)
+        )
+        .is_err()
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
 
 #[test]
@@ -394,6 +421,20 @@ fn linux_inspector_reports_disappeared_proc_without_panicking() {
 fn pane_tty_paths_use_same_device_identity_as_proc_stat() {
     let identity = canonical_tty_path(std::path::Path::new("/dev/null")).unwrap();
     assert!(identity.starts_with("dev:"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_enumeration_rejects_over_limit_and_entry_errors() {
+    let over_limit = (0..=MAX_PROC_ENTRIES).map(|pid| Ok(pid.to_string()));
+    assert!(matches!(
+        collect_proc_pid_names(over_limit),
+        Err(ProcessError::IncompleteEnumeration(_))
+    ));
+    assert!(matches!(
+        collect_proc_pid_names([Ok("1".into()), Err("injected entry failure".into())]),
+        Err(ProcessError::IncompleteEnumeration(_))
+    ));
 }
 
 #[cfg(target_os = "linux")]

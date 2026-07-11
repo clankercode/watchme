@@ -1,9 +1,10 @@
 //! macOS process collection verifies every `ps` record between two matching
-//! sysinfo start-time reads. Bulk enumeration supplies PID numbers only; rows
+//! libproc start-time reads. Bulk enumeration supplies PID numbers only; rows
 //! that disappear or recycle during per-PID verification are omitted.
 
-#[cfg(target_os = "macos")]
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::{ProcessError, ProcessInspector, ProcessRecord};
 
@@ -68,58 +69,99 @@ pub struct SystemMacProcessSource;
 #[cfg(target_os = "macos")]
 impl MacProcessSource for SystemMacProcessSource {
     fn start_time(&self, pid: u32) -> Result<u64, ProcessError> {
-        let system = sysinfo::System::new_all();
-        system
-            .process(sysinfo::Pid::from_u32(pid))
-            .map(sysinfo::Process::start_time)
-            .ok_or(ProcessError::Disappeared(pid))
+        let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(pid as i32, 0)
+            .map_err(|_| ProcessError::Disappeared(pid))?;
+        info.pbi_start_tvsec
+            .checked_mul(1_000_000)
+            .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+            .ok_or_else(|| ProcessError::Malformed {
+                pid,
+                reason: "process start timestamp overflow".into(),
+            })
     }
 
     fn ps_record(&self, pid: u32) -> Result<Vec<u8>, ProcessError> {
         let pid_argument = pid.to_string();
-        let output = Command::new("/bin/ps")
-            .args([
+        let output = run_bounded_command(
+            "/bin/ps",
+            &[
                 "-p",
                 &pid_argument,
                 "-o",
                 "pid=,ppid=,pgid=,sess=,uid=,tty=,comm=",
-            ])
-            .output()
-            .map_err(|error| ProcessError::Inspection(error.to_string()))?;
-        bounded_successful_output(pid, output)
+            ],
+            MAX_PS_OUTPUT_BYTES,
+            Duration::from_secs(2),
+        )?;
+        (!output.is_empty())
+            .then_some(output)
+            .ok_or(ProcessError::Disappeared(pid))
     }
 
     fn list_pids(&self) -> Result<Vec<u32>, ProcessError> {
-        let output = Command::new("/bin/ps")
-            .args(["-axo", "pid="])
-            .output()
-            .map_err(|error| ProcessError::Inspection(error.to_string()))?;
-        if !output.status.success() || output.stdout.len() > MAX_PS_OUTPUT_BYTES {
-            return Err(ProcessError::Inspection(
-                "bounded PID enumeration failed".into(),
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout)
+        let output = run_bounded_command(
+            "/bin/ps",
+            &["-axo", "pid="],
+            MAX_PS_OUTPUT_BYTES,
+            Duration::from_secs(2),
+        )?;
+        Ok(String::from_utf8_lossy(&output)
             .split_ascii_whitespace()
             .filter_map(|field| field.parse().ok())
             .collect())
     }
 }
 
-#[cfg(target_os = "macos")]
-fn bounded_successful_output(
-    pid: u32,
-    output: std::process::Output,
+pub fn run_bounded_command(
+    program: &str,
+    arguments: &[&str],
+    limit: usize,
+    timeout: Duration,
 ) -> Result<Vec<u8>, ProcessError> {
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(ProcessError::Disappeared(pid));
-    }
-    if output.stdout.len() > MAX_PS_OUTPUT_BYTES {
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| ProcessError::Inspection(error.to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ProcessError::Inspection("missing stdout pipe".into()))?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| ProcessError::Inspection(error.to_string()))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Err(ProcessError::Inspection("process command timed out".into()));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let bytes = reader
+        .join()
+        .map_err(|_| ProcessError::Inspection("pipe reader panicked".into()))?
+        .map_err(|error| ProcessError::Inspection(error.to_string()))?;
+    if !status.success() || bytes.len() > limit {
         return Err(ProcessError::Inspection(
-            "ps output exceeds size limit".into(),
+            "process command failed or exceeded output limit".into(),
         ));
     }
-    Ok(output.stdout)
+    Ok(bytes)
 }
 
 #[cfg(target_os = "macos")]

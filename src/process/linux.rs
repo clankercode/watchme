@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use super::{ProcessError, ProcessInspector, ProcessRecord};
 
 const MAX_PROC_FILE_BYTES: u64 = 64 * 1024;
-const MAX_PROC_ENTRIES: usize = 32 * 1024;
+pub const MAX_PROC_ENTRIES: usize = 32 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedProcStat {
@@ -93,14 +93,12 @@ impl ProcessInspector for LinuxProcessInspector {
         let entries = std::fs::read_dir(&self.proc_root)
             .map_err(|error| ProcessError::Inspection(error.to_string()))?;
         let mut processes = Vec::new();
-        for entry in entries.take(MAX_PROC_ENTRIES).flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse().ok())
-            else {
-                continue;
-            };
+        let names = entries.map(|entry| {
+            entry
+                .map_err(|error| error.to_string())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        });
+        for pid in collect_proc_pid_names(names)? {
             if let Ok(process) = self.read_process(pid)
                 && process.tty.as_deref() == Some(tty)
             {
@@ -109,6 +107,26 @@ impl ProcessInspector for LinuxProcessInspector {
         }
         Ok(processes)
     }
+}
+
+pub fn collect_proc_pid_names(
+    names: impl IntoIterator<Item = Result<String, String>>,
+) -> Result<Vec<u32>, ProcessError> {
+    let mut pids = Vec::new();
+    for (index, name) in names.into_iter().enumerate() {
+        if index >= MAX_PROC_ENTRIES {
+            return Err(ProcessError::IncompleteEnumeration(format!(
+                "proc entry limit {MAX_PROC_ENTRIES} exceeded"
+            )));
+        }
+        let name = name.map_err(|error| {
+            ProcessError::IncompleteEnumeration(format!("proc directory entry failed: {error}"))
+        })?;
+        if let Ok(pid) = name.parse() {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
 }
 
 pub fn parse_proc_stat(pid: u32, bytes: &[u8]) -> Result<ParsedProcStat, ProcessError> {
