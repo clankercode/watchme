@@ -275,13 +275,9 @@ impl PlannerBroker {
         self.acquire_budget(&request)?;
         let result = self.invoke_with_optional_fallback(&request);
         self.release_concurrency();
-        match result {
-            Ok(plan) => {
-                self.commit_budget(&request);
-                Ok(plan)
-            }
-            Err(error) => Err(error),
-        }
+        // Consume per-event/session budget on every attempt, including failures.
+        self.commit_budget(&request);
+        result
     }
 
     fn acquire_budget(&self, request: &PlannerRequest) -> Result<(), WatchmeError> {
@@ -395,29 +391,8 @@ impl PlannerBroker {
         let plan = decode_recovery_plan(text.trim()).map_err(|error| {
             WatchmeError::PolicyDenied(format!("planner schema rejected: {error}"))
         })?;
-        let context = PlanValidationContext {
-            failed_provider_family: failed_family.to_owned(),
-            planner_provider_family: planner.provider_family.clone(),
-            evidence_fingerprint: plan.target.evidence_fingerprint.clone(),
-            watcher_id: plan.target.watcher_id.clone(),
-            process_pid: plan.target.process_pid,
-            process_start_time: plan.target.process_start_time.clone(),
-            mux_kind: plan.target.mux_kind.clone(),
-            pane_id: plan.target.pane_id.clone(),
-            now_rfc3339: plan.generated_at.clone(),
-            allowed_actions: BTreeSet::from([
-                "WAIT_UNTIL".into(),
-                "WAIT_DURATION".into(),
-                "CAPTURE".into(),
-                "CHECK_STATUS".into(),
-                "SEND_TEXT".into(),
-                "SEND_KEYS".into(),
-                "NOTIFY".into(),
-                "ESCALATE".into(),
-                "STOP_WATCHING".into(),
-                "NOOP".into(),
-            ]),
-        };
+        let context =
+            validation_context_from_snapshot(snapshot, failed_family, &planner.provider_family)?;
         // Ensure plan family matches the selected planner and differs from failed.
         if plan.diagnosis.planner_provider_family != planner.provider_family {
             return Err(WatchmeError::PolicyDenied(
@@ -427,4 +402,56 @@ impl PlannerBroker {
         validate_recovery_plan(&plan, &context)
             .map_err(|error| WatchmeError::PolicyDenied(error.to_string()))
     }
+}
+
+/// Build validation context from the trusted redacted snapshot, not the plan itself.
+fn validation_context_from_snapshot(
+    snapshot: &Value,
+    failed_provider_family: &str,
+    planner_provider_family: &str,
+) -> Result<PlanValidationContext, WatchmeError> {
+    let watcher = snapshot
+        .get("watcher")
+        .ok_or_else(|| WatchmeError::Configuration("snapshot missing watcher".into()))?;
+    let target = snapshot
+        .get("target")
+        .ok_or_else(|| WatchmeError::Configuration("snapshot missing target".into()))?;
+    let evidence_fingerprint = required_str(watcher, "evidence_fingerprint")?;
+    let watcher_id = required_str(watcher, "watcher_id")?;
+    let process_pid = target
+        .get("process_pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| WatchmeError::Configuration("snapshot missing process_pid".into()))?
+        as u32;
+    let process_start_time = required_str(target, "process_start_time")?;
+    let mux_kind = required_str(target, "mux_kind")?;
+    let pane_id = required_str(target, "pane_id")?;
+    let allowed_actions = snapshot
+        .get("allowed_actions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WatchmeError::Configuration("snapshot missing allowed_actions".into()))?
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    Ok(PlanValidationContext {
+        failed_provider_family: failed_provider_family.to_owned(),
+        planner_provider_family: planner_provider_family.to_owned(),
+        evidence_fingerprint,
+        watcher_id,
+        process_pid,
+        process_start_time,
+        mux_kind,
+        pane_id,
+        now_rfc3339: now.to_rfc3339(),
+        allowed_actions,
+    })
+}
+
+fn required_str(object: &Value, key: &str) -> Result<String, WatchmeError> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| WatchmeError::Configuration(format!("snapshot missing {key}")))
 }

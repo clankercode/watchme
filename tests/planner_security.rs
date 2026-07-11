@@ -63,6 +63,89 @@ fn write_plan_echo(dir: &Path, name: &str, plan: &str) -> PathBuf {
     )
 }
 
+/// Trusted snapshot matching the VALID_PLAN target identity/evidence.
+fn trusted_snapshot(allowed_actions: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "1.0",
+        "snapshot_id": "snap-demo",
+        "created_at": "2026-07-11T10:00:00Z",
+        "watcher": {
+            "watcher_id": "watcher-demo-001",
+            "state": "PLANNING",
+            "evidence_fingerprint": "0123456789abcdef0123456789abcdef"
+        },
+        "target": {
+            "mux_kind": "tmux",
+            "pane_id": "%7",
+            "process_pid": 4242,
+            "process_start_time": "2026-07-11T09:00:00Z",
+            "identity_hash": "0123456789abcdef0123456789abcdef"
+        },
+        "agent": {
+            "agent_id": "codex",
+            "provider_family": "openai",
+            "failed_provider_family": "openai"
+        },
+        "observations": [{
+            "event_id": "evt-1",
+            "category": "capacity_block",
+            "source_kind": "screen_detection",
+            "confidence": 0.9,
+            "summary": "blocked",
+            "observed_at": "2026-07-11T10:00:00Z"
+        }],
+        "attempts": [],
+        "allowed_actions": allowed_actions,
+        "redaction": {
+            "performed": true,
+            "replacement_count": 0,
+            "categories": [],
+            "raw_evidence_included": false
+        }
+    })
+}
+
+fn default_allowed_actions() -> Vec<&'static str> {
+    vec![
+        "WAIT_DURATION",
+        "SEND_TEXT",
+        "SEND_KEYS",
+        "CHECK_STATUS",
+        "CAPTURE",
+        "NOOP",
+    ]
+}
+
+/// Keep plan identity fixed but move validity into the far future so wall-clock checks pass.
+fn with_future_validity(plan_json: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(plan_json).unwrap();
+    value["generated_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    value["valid_until"] = serde_json::json!("2099-01-01T00:05:00Z");
+    value.to_string()
+}
+
+fn broker_request(
+    executable: PathBuf,
+    family: &str,
+    failed: &str,
+    snapshot: serde_json::Value,
+    event_id: &str,
+) -> PlannerRequest {
+    PlannerRequest {
+        session_id: "session-trust".into(),
+        event_id: event_id.into(),
+        failed_provider_family: failed.into(),
+        snapshot_json: snapshot,
+        day_key: "2026-07-12".into(),
+        resolved: vec![ResolvedPlanner {
+            id: "hermes".into(),
+            executable,
+            provider_family: family.into(),
+            args: vec![],
+        }],
+    }
+}
+
 fn base_planning() -> PlanningConfig {
     PlanningConfig {
         enabled: true,
@@ -340,7 +423,7 @@ fn planner_timeout_and_huge_output_kill_process_tree() {
     .expect_err("timeout");
     assert!(started.elapsed() < Duration::from_secs(3));
     assert!(err.is_timeout() || err.is_output_limit());
-    assert!(verify_process_gone(&sleeper).is_ok());
+    verify_process_gone(&sleeper).expect("timeout must kill sleeper tree");
 
     let huge = write_executable(
         dir.path(),
@@ -358,7 +441,7 @@ fn planner_timeout_and_huge_output_kill_process_tree() {
     })
     .expect_err("output capped");
     assert!(err.is_output_limit() || err.is_timeout());
-    assert!(verify_process_gone(&huge).is_ok());
+    verify_process_gone(&huge).expect("output limit must kill huge tree");
 }
 
 #[test]
@@ -463,9 +546,141 @@ fn hostile_actions_and_prompt_injection_reject_entire_plan() {
 }
 
 #[test]
+fn request_plan_rejects_mismatched_evidence_fingerprint() {
+    let dir = tempdir().unwrap();
+    // Self-consistent hostile plan: identity/evidence agree with each other, but not
+    // with the trusted snapshot. Without snapshot-bound validation this must pass.
+    let plan: serde_json::Value = serde_json::from_str(&with_future_validity(&plan_with_families(
+        "openai",
+        "anthropic",
+    )))
+    .unwrap();
+    let forged = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let plan_text = plan
+        .to_string()
+        .replace("0123456789abcdef0123456789abcdef", forged);
+    let echo = write_plan_echo(dir.path(), "bad-evidence.sh", &plan_text);
+    let broker = PlannerBroker::new(base_planning(), SecurityConfig::default());
+    assert!(
+        broker
+            .request_plan(broker_request(
+                echo,
+                "anthropic",
+                "openai",
+                trusted_snapshot(&default_allowed_actions()),
+                "evt-evidence",
+            ))
+            .is_err(),
+        "plan evidence_fingerprint must be checked against trusted snapshot"
+    );
+}
+
+#[test]
+fn request_plan_rejects_mismatched_watcher_or_target() {
+    let dir = tempdir().unwrap();
+    let mut plan: serde_json::Value = serde_json::from_str(&with_future_validity(
+        &plan_with_families("openai", "anthropic"),
+    ))
+    .unwrap();
+    plan["target"]["watcher_id"] = serde_json::json!("watcher-attacker");
+    plan["target"]["process_pid"] = serde_json::json!(9999);
+    let echo = write_plan_echo(dir.path(), "bad-target.sh", &plan.to_string());
+    let broker = PlannerBroker::new(base_planning(), SecurityConfig::default());
+    assert!(
+        broker
+            .request_plan(broker_request(
+                echo,
+                "anthropic",
+                "openai",
+                trusted_snapshot(&default_allowed_actions()),
+                "evt-target",
+            ))
+            .is_err(),
+        "mismatched watcher/target must be rejected by request_plan"
+    );
+}
+
+#[test]
+fn request_plan_rejects_expired_plan_using_wall_clock() {
+    let dir = tempdir().unwrap();
+    // Fixture valid_until is 2026-07-11; wall clock is later. Old broker used
+    // plan.generated_at as "now", which made expiry checks tautological.
+    let echo = write_plan_echo(
+        dir.path(),
+        "expired-plan.sh",
+        &plan_with_families("openai", "anthropic"),
+    );
+    let broker = PlannerBroker::new(base_planning(), SecurityConfig::default());
+    assert!(
+        broker
+            .request_plan(broker_request(
+                echo,
+                "anthropic",
+                "openai",
+                trusted_snapshot(&default_allowed_actions()),
+                "evt-expired",
+            ))
+            .is_err(),
+        "expired plan must be rejected against trusted wall clock"
+    );
+}
+
+#[test]
+fn request_plan_restricts_actions_to_snapshot_allowlist() {
+    let dir = tempdir().unwrap();
+    let plan = with_future_validity(&plan_with_families("openai", "anthropic"));
+    let echo = write_plan_echo(dir.path(), "restricted-actions.sh", &plan);
+    let broker = PlannerBroker::new(base_planning(), SecurityConfig::default());
+    // Snapshot omits SEND_TEXT/SEND_KEYS that the fixture plan includes.
+    let snapshot = trusted_snapshot(&["WAIT_DURATION", "CAPTURE", "CHECK_STATUS", "NOOP"]);
+    assert!(
+        broker
+            .request_plan(broker_request(
+                echo,
+                "anthropic",
+                "openai",
+                snapshot,
+                "evt-allowlist",
+            ))
+            .is_err(),
+        "actions outside snapshot allowed_actions must be rejected"
+    );
+}
+
+#[test]
+fn failed_planner_attempt_consumes_per_event_budget() {
+    let dir = tempdir().unwrap();
+    let echo = write_plan_echo(dir.path(), "fail-budget.sh", INVALID_PLAN);
+    let mut planning = base_planning();
+    planning.max_calls_per_event = 1;
+    let broker = PlannerBroker::new(planning, SecurityConfig::default());
+    let request = broker_request(
+        echo,
+        "anthropic",
+        "openai",
+        trusted_snapshot(&default_allowed_actions()),
+        "evt-budget-fail",
+    );
+    assert!(broker.request_plan(request.clone()).is_err());
+    let second = broker.request_plan(request);
+    assert!(
+        second.is_err(),
+        "failed attempt must consume max_calls_per_event"
+    );
+    assert!(
+        second
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("per-event"),
+        "second call should hit per-event budget, got: {second:?}"
+    );
+}
+
+#[test]
 fn budgets_enforce_event_session_and_concurrency_limits() {
     let dir = tempdir().unwrap();
-    let plan = plan_with_families("anthropic", "openai");
+    let plan = with_future_validity(&plan_with_families("anthropic", "openai"));
     let echo = write_plan_echo(dir.path(), "echo-plan.sh", &plan);
     let mut planning = base_planning();
     planning.max_calls_per_event = 1;
@@ -485,11 +700,12 @@ fn budgets_enforce_event_session_and_concurrency_limits() {
 
     let security = SecurityConfig::default();
     let broker = PlannerBroker::new(planning, security);
+    let snapshot = trusted_snapshot(&default_allowed_actions());
     let request = PlannerRequest {
         session_id: "session-a".into(),
         event_id: "event-1".into(),
         failed_provider_family: "anthropic".into(),
-        snapshot_json: serde_json::json!({"ok": true}),
+        snapshot_json: snapshot.clone(),
         day_key: "2026-07-11".into(),
         resolved: vec![ResolvedPlanner {
             id: "hermes".into(),
@@ -535,7 +751,7 @@ fn budgets_enforce_event_session_and_concurrency_limits() {
         session_id: "session-b".into(),
         event_id: "event-slow".into(),
         failed_provider_family: "anthropic".into(),
-        snapshot_json: serde_json::json!({}),
+        snapshot_json: snapshot,
         day_key: "2026-07-11".into(),
         resolved: vec![ResolvedPlanner {
             id: "hermes".into(),
@@ -565,7 +781,7 @@ fn budgets_enforce_event_session_and_concurrency_limits() {
 fn optional_independent_fallback_cannot_override_policy() {
     let dir = tempdir().unwrap();
     let hostile = write_plan_echo(dir.path(), "hostile-plan.sh", INVALID_PLAN);
-    let safe_plan = plan_with_families("xai", "anthropic");
+    let safe_plan = with_future_validity(&plan_with_families("xai", "anthropic"));
     let safe = write_plan_echo(dir.path(), "safe-plan.sh", &safe_plan);
     let mut planning = base_planning();
     planning.allow_independent_second_opinion = true;
@@ -599,7 +815,7 @@ fn optional_independent_fallback_cannot_override_policy() {
         session_id: "session-c".into(),
         event_id: "event-fallback".into(),
         failed_provider_family: "xai".into(),
-        snapshot_json: serde_json::json!({}),
+        snapshot_json: trusted_snapshot(&default_allowed_actions()),
         day_key: "2026-07-11".into(),
         resolved: vec![
             ResolvedPlanner {

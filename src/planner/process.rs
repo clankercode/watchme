@@ -203,14 +203,34 @@ fn kill_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Best-effort check that leftover planner processes are cleaned up.
+/// Check that leftover planner processes matching `executable` are cleaned up.
+///
+/// Does not kill processes; callers that need cleanup must do so explicitly.
 pub fn verify_process_gone(executable: &Path) -> Result<(), ProcessError> {
     thread::sleep(Duration::from_millis(50));
-    let name = executable
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("planner");
-    let _ = Command::new("pkill").args(["-9", "-f", name]).status();
-    thread::sleep(Duration::from_millis(50));
-    Ok(())
+    let needle = executable.to_string_lossy();
+    let output = Command::new("pgrep")
+        .args(["-af", "--", needle.as_ref()])
+        .output()
+        .map_err(|error| ProcessError {
+            kind: ProcessErrorKind::Failed,
+            message: format!("pgrep failed: {error}"),
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let survivors: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.contains(needle.as_ref()))
+        .filter(|line| !line.contains("pgrep"))
+        .collect();
+    if survivors.is_empty() {
+        Ok(())
+    } else {
+        Err(ProcessError {
+            kind: ProcessErrorKind::Failed,
+            message: format!(
+                "planner process still running after kill: {}",
+                survivors.join("; ")
+            ),
+        })
+    }
 }
