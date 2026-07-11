@@ -1,3 +1,9 @@
+## 0.1.16 — 2026-07-12
+
+### Fixed
+
+- Ignore flaky live wake observation socket test on CI runners.
+
 ## 0.1.15 — 2026-07-12
 
 ### Fixed
