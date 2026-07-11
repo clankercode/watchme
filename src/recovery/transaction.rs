@@ -162,8 +162,11 @@ impl RecoveryContext {
             .last_observation
             .as_ref()
             .ok_or("missing current evidence")?;
-        if machine.state() != crate::recovery::state_machine::RecoveryState::Confirmed
-            || !event.category.is_actionable()
+        if !matches!(
+            machine.state(),
+            crate::recovery::state_machine::RecoveryState::Confirmed
+                | crate::recovery::state_machine::RecoveryState::Acting
+        ) || !event.category.is_actionable()
         {
             return Err("recovery is not confirmed");
         }
@@ -176,9 +179,15 @@ impl RecoveryContext {
                 .as_secs(),
             planner_calls_remaining: budget.planner_calls.saturating_sub(machine.planner_calls()),
             planner_concurrency_available: false,
-            cooldown_ready: machine.last_attempt_monotonic_seconds().is_none_or(|last| {
-                now_monotonic_seconds.saturating_sub(last) >= budget.cooldown.as_secs()
-            }),
+            // The coordinator persists `Acting` before the transaction claim.
+            // That action owns the cooldown slot already, so checking the
+            // freshly-written attempt here would deny the very transaction it
+            // authorized. Any later action is still checked normally.
+            cooldown_ready: machine.state()
+                == crate::recovery::state_machine::RecoveryState::Acting
+                || machine.last_attempt_monotonic_seconds().is_none_or(|last| {
+                    now_monotonic_seconds.saturating_sub(last) >= budget.cooldown.as_secs()
+                }),
             session_id: event.session_id.clone(),
             failed_provider_family: event.provider_family.clone(),
             planner_provider_family: None,
