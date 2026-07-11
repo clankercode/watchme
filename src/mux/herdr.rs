@@ -1,0 +1,579 @@
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use super::{
+    Capture, ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, PaneInfo,
+    SymbolicKey,
+};
+use crate::model::ProcessIdentity;
+
+pub const HERDR_PROTOCOL: &str = "watchme.herdr";
+pub const HERDR_SCHEMA_VERSION: u16 = 1;
+const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_REQUEST_BYTES: usize = 256 * 1024;
+const MAX_CAPTURE_LINES: usize = 10_000;
+const MAX_CAPTURE_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HerdrContext {
+    pub socket_path: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub pane_id: String,
+}
+
+impl HerdrContext {
+    pub fn from_environment() -> Result<Self, MuxError> {
+        Self::from_values(|name| std::env::var(name).ok())
+    }
+
+    pub fn from_values(mut value: impl FnMut(&str) -> Option<String>) -> Result<Self, MuxError> {
+        let required = |name: &str, value: Option<String>| {
+            let value = value.ok_or_else(|| MuxError::Command(format!("{name} is not set")))?;
+            validate_context(name, &value)?;
+            Ok(value)
+        };
+        Ok(Self {
+            socket_path: required("HERDR_SOCKET_PATH", value("HERDR_SOCKET_PATH"))?,
+            workspace_id: required("HERDR_WORKSPACE_ID", value("HERDR_WORKSPACE_ID"))?,
+            tab_id: required("HERDR_TAB_ID", value("HERDR_TAB_ID"))?,
+            pane_id: required("HERDR_PANE_ID", value("HERDR_PANE_ID"))?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Herdr {
+    context: HerdrContext,
+    timeout: Duration,
+    next_request: std::sync::Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSession {
+    pub session_id: String,
+    pub agent: String,
+    pub process_id: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEvent {
+    pub sequence: u64,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStateEvents {
+    pub state: String,
+    pub events: Vec<AgentEvent>,
+}
+
+#[derive(Serialize)]
+struct Request<'a, P> {
+    schema_version: u16,
+    protocol: &'static str,
+    request_id: &'a str,
+    method: &'a str,
+    params: P,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Response<T> {
+    schema_version: u16,
+    protocol: String,
+    request_id: String,
+    ok: bool,
+    result: Option<T>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TargetParams<'a> {
+    workspace_id: &'a str,
+    tab_id: &'a str,
+    pane_id: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireProcess {
+    pid: u32,
+    start_time: u64,
+    executable: Option<String>,
+    argv_digest: Option<String>,
+    uid: Option<u32>,
+    process_group_id: Option<u32>,
+    session_leader_id: Option<u32>,
+    tty: Option<String>,
+    parent_digest: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePane {
+    server_id: String,
+    workspace_id: String,
+    workspace_name: String,
+    tab_id: String,
+    tab_title: String,
+    tab_index: u32,
+    pane_id: String,
+    pane_title: String,
+    pane_index: u32,
+    tty: String,
+    current_command: String,
+    current_path: String,
+    process: WireProcess,
+}
+
+impl Herdr {
+    pub fn new(context: HerdrContext, timeout: Duration) -> Result<Self, MuxError> {
+        if timeout.is_zero() {
+            return Err(MuxError::Protocol("timeout must be non-zero".into()));
+        }
+        validate_socket(Path::new(&context.socket_path))?;
+        Ok(Self {
+            context,
+            timeout,
+            next_request: std::sync::Arc::new(AtomicU64::new(1)),
+        })
+    }
+
+    pub fn agent_session(&self, identity: &MuxIdentity) -> Result<AgentSession, MuxError> {
+        self.validate_identity(identity)?;
+        self.call("agent_session", self.target_params())
+    }
+
+    pub fn agent_state_events(
+        &self,
+        identity: &MuxIdentity,
+        after: u64,
+        max_events: usize,
+    ) -> Result<AgentStateEvents, MuxError> {
+        self.validate_identity(identity)?;
+        if max_events == 0 || max_events > 1_000 {
+            return Err(MuxError::Protocol("max_events is out of bounds".into()));
+        }
+        #[derive(Serialize)]
+        struct Params<'a> {
+            workspace_id: &'a str,
+            tab_id: &'a str,
+            pane_id: &'a str,
+            after: u64,
+            max_events: usize,
+        }
+        self.call(
+            "agent_state_events",
+            Params {
+                workspace_id: &self.context.workspace_id,
+                tab_id: &self.context.tab_id,
+                pane_id: &self.context.pane_id,
+                after,
+                max_events,
+            },
+        )
+    }
+
+    pub fn notify(
+        &self,
+        identity: &MuxIdentity,
+        title: &str,
+        body: &str,
+    ) -> Result<bool, MuxError> {
+        self.validate_identity(identity)?;
+        validate_literal(title)?;
+        validate_literal(body)?;
+        #[derive(Serialize)]
+        struct Params<'a> {
+            workspace_id: &'a str,
+            tab_id: &'a str,
+            pane_id: &'a str,
+            title: &'a str,
+            body: &'a str,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ResultValue {
+            delivered: bool,
+        }
+        Ok(self
+            .call::<_, ResultValue>(
+                "notification",
+                Params {
+                    workspace_id: &self.context.workspace_id,
+                    tab_id: &self.context.tab_id,
+                    pane_id: &self.context.pane_id,
+                    title,
+                    body,
+                },
+            )?
+            .delivered)
+    }
+
+    fn target_params(&self) -> TargetParams<'_> {
+        TargetParams {
+            workspace_id: &self.context.workspace_id,
+            tab_id: &self.context.tab_id,
+            pane_id: &self.context.pane_id,
+        }
+    }
+
+    fn pane(&self, method: &str) -> Result<PaneInfo, MuxError> {
+        self.call::<_, WirePane>(method, self.target_params())
+            .map(|pane| self.map_pane(pane))
+    }
+
+    fn map_pane(&self, pane: WirePane) -> PaneInfo {
+        let mut process = ProcessIdentity::new(pane.process.pid, pane.process.start_time);
+        process.executable = pane.process.executable;
+        process.argv_digest = pane.process.argv_digest;
+        process.uid = pane.process.uid;
+        process.process_group_id = pane.process.process_group_id;
+        process.session_leader_id = pane.process.session_leader_id;
+        process.tty = pane.process.tty;
+        process.parent_digest = pane.process.parent_digest;
+        PaneInfo {
+            identity: MuxIdentity {
+                provider: "herdr".into(),
+                server_instance: pane.server_id.clone(),
+                server: self.context.socket_path.clone(),
+                session_id: pane.workspace_id,
+                window_id: pane.tab_id,
+                pane_id: pane.pane_id,
+                tty: pane.tty,
+                process,
+            },
+            server_id: pane.server_id,
+            session_name: pane.workspace_name,
+            window_name: pane.tab_title,
+            window_index: pane.tab_index,
+            pane_index: pane.pane_index,
+            pane_title: pane.pane_title,
+            current_command: pane.current_command,
+            current_path: pane.current_path,
+            dead: false,
+            dead_status: None,
+            started_at: None,
+            dead_at: None,
+        }
+    }
+
+    fn call<P: Serialize, T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<T, MuxError> {
+        validate_socket(Path::new(&self.context.socket_path))?;
+        let request_id = format!(
+            "watchme-{}-{}",
+            std::process::id(),
+            self.next_request.fetch_add(1, Ordering::Relaxed)
+        );
+        let request = Request {
+            schema_version: HERDR_SCHEMA_VERSION,
+            protocol: HERDR_PROTOCOL,
+            request_id: &request_id,
+            method,
+            params,
+        };
+        let mut encoded =
+            serde_json::to_vec(&request).map_err(|error| MuxError::Protocol(error.to_string()))?;
+        if encoded.len() >= MAX_REQUEST_BYTES {
+            return Err(MuxError::Protocol("request exceeds byte limit".into()));
+        }
+        encoded.push(b'\n');
+        let mut stream = UnixStream::connect(&self.context.socket_path)
+            .map_err(|error| MuxError::Command(error.to_string()))?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|error| MuxError::Command(error.to_string()))?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(|error| MuxError::Command(error.to_string()))?;
+        stream.write_all(&encoded).map_err(map_io)?;
+        let mut bytes = Vec::new();
+        BufReader::new(stream)
+            .take((MAX_RESPONSE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut bytes)
+            .map_err(map_io)?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(MuxError::Protocol("response exceeds byte limit".into()));
+        }
+        if !bytes.ends_with(b"\n") {
+            return Err(MuxError::Protocol(
+                "response is not newline terminated".into(),
+            ));
+        }
+        let response: Response<T> = serde_json::from_slice(&bytes)
+            .map_err(|error| MuxError::Protocol(format!("malformed response: {error}")))?;
+        if response.schema_version != HERDR_SCHEMA_VERSION
+            || response.protocol != HERDR_PROTOCOL
+            || response.request_id != request_id
+        {
+            return Err(MuxError::Protocol(
+                "response contract or request ID mismatch".into(),
+            ));
+        }
+        if !response.ok {
+            return Err(MuxError::Protocol(
+                response
+                    .error
+                    .unwrap_or_else(|| "request failed without an error".into()),
+            ));
+        }
+        response
+            .result
+            .ok_or_else(|| MuxError::Protocol("successful response omitted result".into()))
+    }
+}
+
+impl Multiplexer for Herdr {
+    type Selector = HerdrContext;
+    fn current_target(&self) -> Result<MuxIdentity, MuxError> {
+        Ok(self.pane("pane_info")?.identity)
+    }
+    fn resolve_selector(&self, selector: &Self::Selector) -> Result<MuxIdentity, MuxError> {
+        if selector != &self.context {
+            return Err(MuxError::IdentityChanged(
+                "selector differs from inherited Herdr context".into(),
+            ));
+        }
+        self.current_target()
+    }
+    fn pane_info(&self, identity: &MuxIdentity) -> Result<PaneInfo, MuxError> {
+        self.validate_identity(identity)?;
+        self.pane("process_info")
+    }
+    fn validate_identity(&self, expected: &MuxIdentity) -> Result<(), MuxError> {
+        let actual = self.pane("pane_info")?.identity;
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err(MuxError::IdentityChanged(format!(
+                "expected {:?}, found {:?}",
+                expected, actual
+            )))
+        }
+    }
+    fn capture_tail(
+        &self,
+        identity: &MuxIdentity,
+        lines: usize,
+        max_bytes: usize,
+    ) -> Result<Capture, MuxError> {
+        if lines == 0 || max_bytes == 0 {
+            return Ok(Capture {
+                text: String::new(),
+                bytes: 0,
+                truncated: false,
+                elapsed: Duration::ZERO,
+            });
+        }
+        if lines > MAX_CAPTURE_LINES || max_bytes > MAX_CAPTURE_BYTES {
+            return Err(MuxError::Protocol("pane read bounds exceeded".into()));
+        }
+        self.validate_identity(identity)?;
+        #[derive(Serialize)]
+        struct Params<'a> {
+            workspace_id: &'a str,
+            tab_id: &'a str,
+            pane_id: &'a str,
+            max_lines: usize,
+            max_bytes: usize,
+            recent_unwrapped: bool,
+            detect_state: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReadResult {
+            text: String,
+            bytes: usize,
+            truncated: bool,
+        }
+        let started = Instant::now();
+        let result: ReadResult = self.call(
+            "pane_read",
+            Params {
+                workspace_id: &self.context.workspace_id,
+                tab_id: &self.context.tab_id,
+                pane_id: &self.context.pane_id,
+                max_lines: lines,
+                max_bytes,
+                recent_unwrapped: true,
+                detect_state: true,
+            },
+        )?;
+        if result.bytes > max_bytes || result.text.len() != result.bytes {
+            return Err(MuxError::Protocol(
+                "pane read violated byte contract".into(),
+            ));
+        }
+        self.validate_identity(identity)?;
+        Ok(Capture {
+            text: result.text,
+            bytes: result.bytes,
+            truncated: result.truncated,
+            elapsed: started.elapsed(),
+        })
+    }
+    fn send_literal(
+        &self,
+        identity: &MuxIdentity,
+        text: &str,
+        safety: &dyn ComposerSafety,
+    ) -> Result<(), MuxError> {
+        validate_literal(text)?;
+        self.validate_identity(identity)?;
+        require_safe(safety, identity)?;
+        self.validate_identity(identity)?;
+        require_safe(safety, identity)?;
+        #[derive(Serialize)]
+        struct Params<'a> {
+            workspace_id: &'a str,
+            tab_id: &'a str,
+            pane_id: &'a str,
+            text: &'a str,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Accepted {
+            accepted: bool,
+        }
+        let accepted: Accepted = self.call(
+            "send_text",
+            Params {
+                workspace_id: &self.context.workspace_id,
+                tab_id: &self.context.tab_id,
+                pane_id: &self.context.pane_id,
+                text,
+            },
+        )?;
+        if !accepted.accepted {
+            return Err(MuxError::Protocol("Herdr refused literal input".into()));
+        }
+        self.validate_identity(identity)
+    }
+    fn send_key(
+        &self,
+        identity: &MuxIdentity,
+        key: SymbolicKey,
+        safety: &dyn ComposerSafety,
+    ) -> Result<(), MuxError> {
+        self.validate_identity(identity)?;
+        require_safe(safety, identity)?;
+        self.validate_identity(identity)?;
+        require_safe(safety, identity)?;
+        #[derive(Serialize)]
+        struct Params<'a> {
+            workspace_id: &'a str,
+            tab_id: &'a str,
+            pane_id: &'a str,
+            keys: [&'a str; 1],
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Accepted {
+            accepted: bool,
+        }
+        let accepted: Accepted = self.call(
+            "send_keys",
+            Params {
+                workspace_id: &self.context.workspace_id,
+                tab_id: &self.context.tab_id,
+                pane_id: &self.context.pane_id,
+                keys: [key_name(key)],
+            },
+        )?;
+        if !accepted.accepted {
+            return Err(MuxError::Protocol("Herdr refused symbolic input".into()));
+        }
+        self.validate_identity(identity)
+    }
+}
+
+fn key_name(key: SymbolicKey) -> &'static str {
+    match key {
+        SymbolicKey::Enter => "Enter",
+        SymbolicKey::Escape => "Escape",
+        SymbolicKey::Up => "Up",
+        SymbolicKey::Down => "Down",
+        SymbolicKey::Left => "Left",
+        SymbolicKey::Right => "Right",
+        SymbolicKey::Tab => "Tab",
+        SymbolicKey::Backspace => "Backspace",
+    }
+}
+fn require_safe(safety: &dyn ComposerSafety, identity: &MuxIdentity) -> Result<(), MuxError> {
+    match safety.observe(identity)? {
+        ComposerState::Safe => Ok(()),
+        state => Err(MuxError::IdentityChanged(format!(
+            "composer safety is {state:?}"
+        ))),
+    }
+}
+fn validate_literal(value: &str) -> Result<(), MuxError> {
+    if value.chars().any(char::is_control) {
+        Err(MuxError::InvalidSelector(
+            "literal contains a control character".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+fn validate_context(name: &str, value: &str) -> Result<(), MuxError> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        Err(MuxError::Protocol(format!("invalid {name}")))
+    } else {
+        Ok(())
+    }
+}
+fn map_io(error: std::io::Error) -> MuxError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        MuxError::Timeout
+    } else {
+        MuxError::Command(error.to_string())
+    }
+}
+
+fn validate_socket(path: &Path) -> Result<(), MuxError> {
+    if !path.is_absolute() {
+        return Err(MuxError::UnsafeSocket("path is not absolute".into()));
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
+    if canonical.as_path() != path {
+        return Err(MuxError::UnsafeSocket(
+            "socket path contains a symlink or alias".into(),
+        ));
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
+    if !metadata.file_type().is_socket() {
+        return Err(MuxError::UnsafeSocket("path is not a Unix socket".into()));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(MuxError::UnsafeSocket(
+            "socket is not owned by the current user".into(),
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(MuxError::UnsafeSocket(
+            "socket is writable by group or others".into(),
+        ));
+    }
+    Ok(())
+}

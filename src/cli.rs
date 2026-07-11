@@ -9,6 +9,7 @@ use watchme::daemon;
 use watchme::ipc::protocol::{Request, Response};
 use watchme::ipc::{read_response, write_request};
 use watchme::mux::Multiplexer;
+use watchme::mux::herdr::{Herdr, HerdrContext};
 use watchme::mux::tmux::Tmux;
 use watchme::paths::WatchmePaths;
 use watchme::process::{CandidateHints, ProcessInspector, ProcessResolver};
@@ -415,6 +416,49 @@ impl RegistrationContextDetector for ProductionContextDetector {
         let resolved = ProcessResolver::default()
             .resolve(&inspector, current_pid, &hints)
             .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+
+        if std::env::var_os("HERDR_SOCKET_PATH").is_some()
+            || std::env::var_os("HERDR_WORKSPACE_ID").is_some()
+            || std::env::var_os("HERDR_TAB_ID").is_some()
+            || std::env::var_os("HERDR_PANE_ID").is_some()
+        {
+            let herdr = Herdr::new(
+                HerdrContext::from_environment()
+                    .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?,
+                Duration::from_secs(2),
+            )
+            .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+            let pane = herdr
+                .current_target()
+                .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+            if pane.process != resolved.identity
+                || normalize_tty(pane.tty.as_str())
+                    != normalize_tty(resolved.identity.tty.as_deref().unwrap_or_default())
+            {
+                return Err(WatchmeError::UnsupportedContext(
+                    "agent ancestor and Herdr pane process/TTY identities do not match".into(),
+                ));
+            }
+            let watcher_id = format!(
+                "herdr-{}-{}-{}",
+                pane.pane_id, resolved.identity.pid, resolved.identity.start_time
+            );
+            return Ok(ResolvedRegistration {
+                watcher: watchme::model::WatcherState::new(
+                    watcher_id,
+                    watchme::model::TargetIdentity::multiplexer(
+                        "herdr".into(),
+                        format!("{}#{}", pane.server, pane.server_instance),
+                        pane.pane_id,
+                        resolved.identity,
+                        Some(pane.session_id),
+                    ),
+                    watchme::model::WatcherLifecycle::Registered,
+                    0,
+                    unix_time_ms(),
+                ),
+            });
+        }
 
         if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some() {
             let tmux = Tmux::from_environment(Duration::from_secs(2))

@@ -262,6 +262,7 @@ fn parse_metadata(value: &str) -> Result<PaneInfo, MuxError> {
     let process = crate::model::ProcessIdentity::new(pid, 0);
     let identity = MuxIdentity {
         provider: "tmux".into(),
+        server_instance: fields[0].into(),
         server: fields[0].into(),
         session_id: fields[1].into(),
         window_id: fields[3].into(),
@@ -271,10 +272,12 @@ fn parse_metadata(value: &str) -> Result<PaneInfo, MuxError> {
     };
     Ok(PaneInfo {
         identity,
+        server_id: fields[0].into(),
         session_name: fields[2].into(),
         window_name: fields[4].into(),
         window_index: number(5, "window index")?,
         pane_index: number(7, "pane index")?,
+        pane_title: fields[4].into(),
         current_command: fields[10].into(),
         current_path: fields[11].into(),
         dead,

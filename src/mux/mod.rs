@@ -1,4 +1,5 @@
 pub mod fake;
+pub mod herdr;
 pub mod tmux;
 
 use std::time::Duration;
@@ -10,6 +11,8 @@ use crate::model::ProcessIdentity;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MuxIdentity {
     pub provider: String,
+    /// Provider-side server identity; distinct from the local socket selector.
+    pub server_instance: String,
     pub server: String,
     pub session_id: String,
     pub window_id: String,
@@ -21,10 +24,12 @@ pub struct MuxIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneInfo {
     pub identity: MuxIdentity,
+    pub server_id: String,
     pub session_name: String,
     pub window_name: String,
     pub window_index: u32,
     pub pane_index: u32,
+    pub pane_title: String,
     pub current_command: String,
     pub current_path: String,
     pub dead: bool,
@@ -94,6 +99,10 @@ pub enum MuxError {
     IdentityChanged(String),
     #[error("captured output is not valid UTF-8")]
     InvalidUtf8,
+    #[error("Herdr protocol error: {0}")]
+    Protocol(String),
+    #[error("unsafe Herdr socket: {0}")]
+    UnsafeSocket(String),
 }
 
 pub trait Multiplexer {
