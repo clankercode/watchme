@@ -8,10 +8,11 @@ pub const WATCHER_STATE_SCHEMA_VERSION: u16 = 1;
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationSchedule {
-    pub next_due_monotonic_ms: u64,
-    pub last_check_monotonic_ms: Option<u64>,
+    pub next_due_wall_ms: u64,
+    pub last_check_wall_ms: Option<u64>,
     pub event_wake_pending: bool,
     pub interval_sequence: u64,
+    pub last_wake_fingerprint: Option<String>,
 }
 impl ObservationSchedule {
     fn is_default(&self) -> bool {
@@ -32,7 +33,7 @@ pub enum WatcherLifecycle {
     Stopped { reason: String },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatcherState {
     schema_version: u16,
@@ -45,6 +46,8 @@ pub struct WatcherState {
     pub recovery: Option<RecoveryMachine>,
     #[serde(default, skip_serializing_if = "ObservationSchedule::is_default")]
     pub observation_schedule: ObservationSchedule,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observation: Option<crate::model::Event>,
 }
 
 impl WatcherState {
@@ -64,6 +67,7 @@ impl WatcherState {
             updated_at_unix_ms,
             recovery: None,
             observation_schedule: ObservationSchedule::default(),
+            last_observation: None,
         }
     }
 
@@ -90,6 +94,8 @@ impl<'de> Deserialize<'de> for WatcherState {
             recovery: Option<RecoveryMachine>,
             #[serde(default)]
             observation_schedule: ObservationSchedule,
+            #[serde(default)]
+            last_observation: Option<crate::model::Event>,
         }
         let wire = Wire::deserialize(deserializer)?;
         if wire.schema_version != WATCHER_STATE_SCHEMA_VERSION {
@@ -107,6 +113,7 @@ impl<'de> Deserialize<'de> for WatcherState {
         );
         state.recovery = wire.recovery;
         state.observation_schedule = wire.observation_schedule;
+        state.last_observation = wire.last_observation;
         Ok(state)
     }
 }

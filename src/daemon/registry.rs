@@ -219,15 +219,50 @@ impl Registry {
         self.watchers = updated;
         Ok(())
     }
-    pub fn wake_observation(&mut self, id: &str, now: u64) -> Result<(), RegistryError> {
+    pub fn persist_observation_event(
+        &mut self,
+        id: &str,
+        event: crate::model::Event,
+        now: u64,
+    ) -> Result<(), RegistryError> {
+        let mut updated = self.watchers.clone();
+        let watcher = updated
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::Unknown(id.into()))?;
+        watcher.last_observation = Some(event);
+        watcher.revision = next_revision(watcher)?;
+        watcher.updated_at_unix_ms = now;
+        self.persist_watchers(&updated)?;
+        self.watchers = updated;
+        Ok(())
+    }
+    pub fn wake_observation(
+        &mut self,
+        id: &str,
+        fingerprint: &str,
+        now: u64,
+    ) -> Result<(), RegistryError> {
+        if fingerprint.len() < 16
+            || fingerprint.len() > 128
+            || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(RegistryError::Corrupt("invalid wake fingerprint".into()));
+        }
         let watcher = self
             .get(id)
             .ok_or_else(|| RegistryError::Unknown(id.into()))?;
-        if watcher.observation_schedule.event_wake_pending {
+        if watcher.observation_schedule.event_wake_pending
+            || watcher
+                .observation_schedule
+                .last_wake_fingerprint
+                .as_deref()
+                == Some(fingerprint)
+        {
             return Ok(());
         }
         let mut schedule = watcher.observation_schedule.clone();
         schedule.event_wake_pending = true;
+        schedule.last_wake_fingerprint = Some(fingerprint.into());
         self.persist_observation_schedule(id, schedule, now)
     }
 

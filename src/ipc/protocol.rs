@@ -5,7 +5,7 @@ use thiserror::Error;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Status {
@@ -22,13 +22,17 @@ pub enum Request {
     Resume {
         id: String,
     },
+    WakeObservation {
+        id: String,
+        event_fingerprint: String,
+    },
     Register {
         watcher: Box<crate::model::WatcherState>,
     },
     Shutdown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Response {
     Status {
@@ -46,6 +50,7 @@ pub enum Response {
         watcher: Box<crate::model::WatcherState>,
     },
     Stopped,
+    Acknowledged,
     Error {
         code: String,
         message: String,

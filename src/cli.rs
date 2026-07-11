@@ -343,6 +343,7 @@ fn render_response(response: Response, json: bool) -> Result<(), CliFailure> {
             lifecycle_name(&watcher.lifecycle)
         ),
         Response::Error { .. } => unreachable!("daemon errors return before success rendering"),
+        Response::Acknowledged => println!("acknowledged"),
     }
     Ok(())
 }

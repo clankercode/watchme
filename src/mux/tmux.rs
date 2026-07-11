@@ -69,6 +69,12 @@ impl Tmux {
             timeout,
         }
     }
+    pub fn for_socket_path(path: String, timeout: Duration) -> Self {
+        Self {
+            server: Server::SocketPath(path),
+            timeout,
+        }
+    }
     pub fn default_server(timeout: Duration) -> Self {
         Self {
             server: Server::Default,

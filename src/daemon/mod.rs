@@ -22,13 +22,99 @@ use std::pin::Pin;
 pub const MAX_CONNECTIONS: usize = 32;
 const PROCESS_REEXEC_GRACE_MS: u64 = 2_000;
 pub trait Observer: Send + Sync + 'static {
-    fn observe<'a>(&'a self, watcher_id: &'a str) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn observe<'a>(
+        &'a self,
+        watcher: crate::model::WatcherState,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<crate::model::Event>, String>> + Send + 'a>>;
 }
-struct NoopObserver;
-impl Observer for NoopObserver {
-    fn observe<'a>(&'a self, _: &'a str) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
+struct GenericObserver;
+impl Observer for GenericObserver {
+    fn observe<'a>(
+        &'a self,
+        watcher: crate::model::WatcherState,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<crate::model::Event>, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || generic_observe(&watcher))
+                .await
+                .map_err(|error| error.to_string())?
+        })
     }
+}
+fn generic_observe(
+    watcher: &crate::model::WatcherState,
+) -> Result<Option<crate::model::Event>, String> {
+    use crate::mux::Multiplexer;
+    use sha2::{Digest, Sha256};
+    let crate::model::TargetIdentity::Multiplexer {
+        provider,
+        server,
+        pane,
+        process,
+        session,
+    } = &watcher.target
+    else {
+        return Ok(None);
+    };
+    if provider != "tmux" {
+        return Ok(None);
+    }
+    let tmux = crate::mux::tmux::Tmux::for_socket_path(server.clone(), Duration::from_secs(2));
+    let selector =
+        crate::mux::tmux::TmuxSelector::parse(pane).map_err(|error| error.to_string())?;
+    let identity = tmux
+        .resolve_selector(&selector)
+        .map_err(|error| error.to_string())?;
+    if identity.process.pid != process.pid || identity.process.start_time != process.start_time {
+        return Err("target identity changed".into());
+    }
+    let capture = tmux
+        .capture_tail(&identity, 80, 32 * 1024)
+        .map_err(|error| error.to_string())?;
+    let clean = crate::observe::screen::sanitize_terminal(capture.text.as_bytes(), 32 * 1024, 80);
+    let lines = clean
+        .lines()
+        .map(|text| crate::observe::screen::ScreenLine {
+            text: text.into(),
+            provenance: crate::observe::screen::LineProvenance::LiveOutput,
+        })
+        .collect();
+    let live = crate::observe::screen::LiveScreen::from_adapter(lines, None, true);
+    let actionable = live.actionable_bottom(40);
+    let fingerprint =
+        crate::observe::evidence_fingerprint("screen_detection", "generic_tail", clean.as_bytes());
+    let target_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&watcher.target).map_err(|error| error.to_string())?)
+    );
+    let observed: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    let category = if clean.trim().is_empty() {
+        crate::model::EventCategory::Idle
+    } else if actionable.is_some() {
+        crate::model::EventCategory::UnknownBlocked
+    } else {
+        crate::model::EventCategory::Working
+    };
+    let mut event = crate::model::Event::new(
+        format!("obs-{}-{}", watcher.watcher_id, watcher.revision),
+        observed.to_rfc3339(),
+        watcher.watcher_id.clone(),
+        target_hash,
+        crate::model::EventSource::new(
+            crate::model::SourceKind::ScreenDetection,
+            "tmux",
+            "generic_tail",
+        ),
+        category,
+        if actionable.is_some() { 0.4 } else { 0.2 },
+        false,
+        fingerprint,
+        "bounded generic observation",
+        crate::model::PolicyHint::ObserveOnly,
+    )
+    .map_err(|error| error.to_string())?;
+    event.session_id = session.clone();
+    Ok(Some(event))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -238,7 +324,7 @@ pub async fn run_with_peer_provider(
     let lifecycle_task = tokio::spawn(run_lifecycle_monitor(registry.clone(), scheduler.clone()));
     let observation_task = tokio::spawn(run_observation_monitor(
         registry.clone(),
-        std::sync::Arc::new(NoopObserver),
+        std::sync::Arc::new(GenericObserver),
     ));
     let timeout = Duration::from_secs(2);
     let result = loop {
@@ -326,9 +412,13 @@ pub async fn run_observation_monitor(
                     continue;
                 }
                 let schedule = &watcher.observation_schedule;
-                if schedule.event_wake_pending || schedule.next_due_monotonic_ms <= now {
+                let clock_discontinuity = schedule.next_due_wall_ms > now.saturating_add(65_000);
+                if schedule.event_wake_pending
+                    || schedule.next_due_wall_ms <= now
+                    || clock_discontinuity
+                {
                     let mut next = schedule.clone();
-                    next.last_check_monotonic_ms = Some(now);
+                    next.last_check_wall_ms = Some(now);
                     next.event_wake_pending = false;
                     next.interval_sequence = next.interval_sequence.saturating_add(1);
                     let hash = watcher
@@ -338,20 +428,29 @@ pub async fn run_observation_monitor(
                             acc.wrapping_mul(109).wrapping_add(u64::from(byte))
                         });
                     let jitter = (hash % 11) as i64 - 5;
-                    next.next_due_monotonic_ms =
+                    next.next_due_wall_ms =
                         now.saturating_add_signed((60_000i64 + jitter * 1_000).max(1));
                     if guard
                         .persist_observation_schedule(&watcher.watcher_id, next, now)
                         .is_ok()
                     {
-                        due.push(watcher.watcher_id)
+                        due.push(watcher)
                     }
                 }
             }
             due
         };
-        for id in due {
-            let _ = tokio::time::timeout(Duration::from_secs(5), observer.observe(&id)).await;
+        for watcher in due {
+            if let Ok(Ok(Some(event))) =
+                tokio::time::timeout(Duration::from_secs(5), observer.observe(watcher.clone()))
+                    .await
+            {
+                let _ = registry.lock().await.persist_observation_event(
+                    &watcher.watcher_id,
+                    event,
+                    now_ms(),
+                );
+            }
         }
     }
 }
@@ -552,7 +651,9 @@ fn request_has_empty_target(request: &Request) -> bool {
         Request::Status { id } | Request::Stop { id, .. } => {
             id.as_ref().is_some_and(String::is_empty)
         }
-        Request::Pause { id } | Request::Resume { id } => id.is_empty(),
+        Request::Pause { id } | Request::Resume { id } | Request::WakeObservation { id, .. } => {
+            id.is_empty()
+        }
         Request::List | Request::Register { .. } | Request::Shutdown => false,
     }
 }
@@ -577,6 +678,15 @@ fn handle_request(
             Ok(Response::Watchers {
                 watchers: registry.list(),
             }),
+            false,
+        ),
+        Request::WakeObservation {
+            id,
+            event_fingerprint,
+        } => (
+            registry
+                .wake_observation(&id, &event_fingerprint, now_ms())
+                .map(|()| Response::Acknowledged),
             false,
         ),
         Request::Register { watcher } => (
