@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6 — 2026-07-12
+
+### Fixed
+
+- Physicalize existing path prefixes in `WatchmePaths::resolve` so macOS tempfile paths under `/var` (symlink to `/private/var`) work with `O_NOFOLLOW` directory walks.
+- Package release archives with Python `tarfile` so both `watchme` and `WatchMe` appear as distinct members on case-insensitive APFS; harden `install.sh` / install smoke for the same collapse.
+- Retry tmux `resolve_selector` in recovery readiness loops instead of unwrapping transient `Malformed` parse errors.
+
 ## 0.1.5 — 2026-07-12
 
 ### Fixed

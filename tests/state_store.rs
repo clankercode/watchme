@@ -48,13 +48,13 @@ fn xdg_paths_use_safe_fallbacks_and_explicit_overrides() {
         fallback.state_dir(),
         Path::new("/home/alice/.local/state/watchme")
     );
-    assert_eq!(
-        fallback.runtime_dir(),
-        Path::new(&format!(
-            "/tmp/watchme-{}",
+    let expected_runtime = fs::canonicalize("/tmp")
+        .unwrap_or_else(|_| Path::new("/tmp").to_path_buf())
+        .join(format!(
+            "watchme-{}",
             rustix::process::geteuid().as_raw()
-        ))
-    );
+        ));
+    assert_eq!(fallback.runtime_dir(), expected_runtime);
 
     let overridden = WatchmePaths::resolve(
         Path::new("/home/alice"),
@@ -69,6 +69,30 @@ fn xdg_paths_use_safe_fallbacks_and_explicit_overrides() {
         overridden.runtime_dir(),
         Path::new("/run/user/1000/watchme")
     );
+}
+
+#[test]
+fn resolve_physicalizes_symlink_prefixes_before_joining_watchme() {
+    // Simulates macOS `/var` → `/private/var` prefixes under tempfile paths: resolve must
+    // canonicalize existing ancestors so O_NOFOLLOW directory walks can succeed.
+    let temp = TempDir::new().unwrap();
+    let real = temp.path().join("real");
+    fs::create_dir_all(real.join("run")).unwrap();
+    let linked = temp.path().join("linked");
+    symlink(&real, &linked).unwrap();
+
+    let paths = WatchmePaths::resolve(
+        &linked,
+        Some(&linked.join("config")),
+        Some(&linked.join("state")),
+        Some(&linked.join("run")),
+    )
+    .unwrap();
+    let physical = fs::canonicalize(&real).unwrap();
+    assert_eq!(paths.config_dir(), physical.join("config/watchme"));
+    assert_eq!(paths.state_dir(), physical.join("state/watchme"));
+    assert_eq!(paths.runtime_dir(), physical.join("run/watchme"));
+    paths.create_owner_only().unwrap();
 }
 
 #[test]
@@ -471,8 +495,11 @@ fn managed_paths_and_store_reject_symlinked_ancestors() {
     let linked = temp.path().join("linked");
     symlink(&real, &linked).unwrap();
 
+    // resolve() physicalizes symlink prefixes, so create_owner_only succeeds on the
+    // canonical path. JsonStore still refuses unresolved symlink ancestors.
     let paths = WatchmePaths::resolve(&linked, None, None, None).unwrap();
-    assert!(paths.create_owner_only().is_err());
+    paths.create_owner_only().unwrap();
+    assert!(paths.config_dir().starts_with(fs::canonicalize(&real).unwrap()));
 
     let nested = linked.join("state.json");
     assert!(JsonStore::new(nested).write(&state()).is_err());

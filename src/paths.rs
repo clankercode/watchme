@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
@@ -33,12 +34,25 @@ impl WatchmePaths {
         if let Some(path) = runtime_dir {
             require_absolute_clean(path)?;
         }
-        let config_root = config_home.map_or_else(|| home.join(".config"), Path::to_path_buf);
-        let state_root = state_home.map_or_else(|| home.join(".local/state"), Path::to_path_buf);
+        // Physicalize existing prefixes so O_NOFOLLOW walks can traverse hosts where
+        // ancestors are symlinks (notably macOS `/var` → `/private/var` under tempdirs).
+        let home = physicalize_existing_prefix(home)?;
+        let config_root = match config_home {
+            Some(path) => physicalize_existing_prefix(path)?,
+            None => home.join(".config"),
+        };
+        let state_root = match state_home {
+            Some(path) => physicalize_existing_prefix(path)?,
+            None => home.join(".local/state"),
+        };
+        let runtime_dir = match runtime_dir {
+            Some(path) => physicalize_existing_prefix(path)?.join("watchme"),
+            None => physicalize_existing_prefix(&runtime_fallback())?,
+        };
         Ok(Self {
             config_dir: config_root.join("watchme"),
             state_dir: state_root.join("watchme"),
-            runtime_dir: runtime_dir.map_or_else(runtime_fallback, |path| path.join("watchme")),
+            runtime_dir,
         })
     }
 
@@ -102,6 +116,44 @@ fn runtime_fallback() -> PathBuf {
         "/tmp/watchme-{}",
         rustix::process::geteuid().as_raw()
     ))
+}
+
+/// Canonicalize the longest existing ancestor, then re-append any missing suffix.
+///
+/// Used so managed paths do not retain intermediate symlink components (e.g. `/var`
+/// on macOS) that `O_NOFOLLOW` directory walks cannot traverse.
+fn physicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
+    require_absolute_clean(path)?;
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    while !existing.as_os_str().is_empty() {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "path has no existing ancestor to physicalize",
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                existing.pop();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if existing.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "path has no existing ancestor to physicalize",
+        ));
+    }
+    let mut physical = fs::canonicalize(&existing)?;
+    for component in missing.into_iter().rev() {
+        physical.push(component);
+    }
+    require_absolute_clean(&physical)?;
+    Ok(physical)
 }
 
 fn require_absolute_clean(path: &Path) -> io::Result<()> {

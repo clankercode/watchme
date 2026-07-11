@@ -767,16 +767,17 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let tmux = Tmux::for_socket_name(socket.clone(), Duration::from_secs(2));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let identity = loop {
-            let candidate = tmux
-                .resolve_selector(&TmuxSelector::parse("recovery").unwrap())
-                .unwrap();
-            if tmux
-                .capture_tail(&candidate, 8, 1_024)
-                .is_ok_and(|capture| capture.text.contains("recovery-ready"))
+            if let Ok(candidate) =
+                tmux.resolve_selector(&TmuxSelector::parse("recovery").unwrap())
             {
-                break candidate;
+                if tmux
+                    .capture_tail(&candidate, 8, 1_024)
+                    .is_ok_and(|capture| capture.text.contains("recovery-ready"))
+                {
+                    break candidate;
+                }
             }
             assert!(
                 Instant::now() < deadline,
@@ -921,16 +922,17 @@ mod tests {
                 .success()
         );
         let tmux = Tmux::for_socket_name(socket.clone(), Duration::from_secs(2));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let identity = loop {
-            let candidate = tmux
-                .resolve_selector(&TmuxSelector::parse("recovery").unwrap())
-                .unwrap();
-            if tmux
-                .capture_tail(&candidate, 8, 1_024)
-                .is_ok_and(|capture| capture.text.contains("recovery-ready"))
+            if let Ok(candidate) =
+                tmux.resolve_selector(&TmuxSelector::parse("recovery").unwrap())
             {
-                break candidate;
+                if tmux
+                    .capture_tail(&candidate, 8, 1_024)
+                    .is_ok_and(|capture| capture.text.contains("recovery-ready"))
+                {
+                    break candidate;
+                }
             }
             assert!(
                 Instant::now() < deadline,

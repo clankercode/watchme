@@ -67,9 +67,25 @@ jobs:
           archive="watchme-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$archive"
           cp "target/${{ matrix.target }}/release/watchme" "$archive/watchme"
-          ln -s watchme "$archive/WatchMe"
           cp LICENSES/UNLICENSE LICENSES/CC0-1.0 "$archive/"
-          tar -czf "$archive.tar.gz" "$archive"
+          # Build the tarball with Python so both `watchme` and `WatchMe` appear as
+          # distinct members. On case-insensitive APFS, `ln WatchMe` collides with
+          # `watchme` as a directory entry, so we cannot materialize both on disk.
+          ARCHIVE_NAME="$archive" python3 - <<'PY'
+          import os
+          import tarfile
+
+          archive = os.environ["ARCHIVE_NAME"]
+          with tarfile.open(f"{archive}.tar.gz", "w:gz") as tar:
+              for name in ("watchme", "UNLICENSE", "CC0-1.0"):
+                  path = os.path.join(archive, name)
+                  tar.add(path, arcname=f"{archive}/{name}")
+              link = tarfile.TarInfo(name=f"{archive}/WatchMe")
+              link.type = tarfile.SYMTYPE
+              link.linkname = "watchme"
+              link.mode = 0o777
+              tar.addfile(link)
+          PY
       - name: Upload immutable build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

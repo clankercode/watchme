@@ -91,11 +91,20 @@ fn isolated_prefix_install_smoke_and_uninstall_preserves_unrelated() {
     assert!(bin.is_file(), "watchme binary missing");
     assert!(alias.exists(), "WatchMe alias missing");
     let alias_meta = fs::symlink_metadata(&alias).unwrap();
-    assert!(
-        alias_meta.file_type().is_symlink(),
-        "WatchMe must be a symlink"
-    );
-    assert_eq!(fs::read_link(&alias).unwrap(), Path::new("watchme"));
+    if alias_meta.file_type().is_symlink() {
+        assert_eq!(fs::read_link(&alias).unwrap(), Path::new("watchme"));
+    } else {
+        // Case-insensitive FS (e.g. macOS APFS): WatchMe collapses onto watchme.
+        assert!(
+            cfg!(target_os = "macos"),
+            "non-symlink WatchMe alias is only expected on Darwin case-insensitive volumes"
+        );
+        assert!(alias.is_file(), "collapsed WatchMe must still be the binary");
+        assert_eq!(
+            fs::canonicalize(&alias).unwrap(),
+            fs::canonicalize(&bin).unwrap()
+        );
+    }
 
     // Bare-command behavior for both spellings.
     for exe in [&bin, &alias] {
@@ -254,7 +263,12 @@ fn install_and_uninstall_dry_run_report_without_writing() {
 
     // Seed files then dry-run uninstall.
     fs::copy(watchme_bin(), prefix.join("bin/watchme")).unwrap();
-    std::os::unix::fs::symlink("watchme", prefix.join("bin/WatchMe")).unwrap();
+    if let Err(error) = std::os::unix::fs::symlink("watchme", prefix.join("bin/WatchMe")) {
+        assert!(
+            cfg!(target_os = "macos") && prefix.join("bin/WatchMe").exists(),
+            "WatchMe alias seed failed: {error}"
+        );
+    }
 
     let output = StdCommand::new("bash")
         .arg(uninstall_script())

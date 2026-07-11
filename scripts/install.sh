@@ -102,11 +102,23 @@ install_file() {
 install_link() {
   local target="$1"
   local dest="$2"
+  local sibling
   report "symlink" "${dest} -> ${target}"
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     return 0
   fi
   mkdir -p "$(dirname "${dest}")"
+  # On case-insensitive filesystems (typical macOS APFS), WatchMe and watchme are
+  # the same directory entry after installing the binary, so the alias symlink is
+  # unnecessary — the lowercase binary already serves the uppercase spelling.
+  if ln -sfn "${target}" "${dest}" 2>/dev/null; then
+    return 0
+  fi
+  sibling="$(dirname "${dest}")/${target}"
+  if [[ -e "${sibling}" && -e "${dest}" && "${dest}" -ef "${sibling}" ]]; then
+    report "alias-collapsed" "${dest} (case-insensitive FS; watchme serves as WatchMe)"
+    return 0
+  fi
   ln -sfn "${target}" "${dest}"
 }
 
