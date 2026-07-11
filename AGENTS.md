@@ -60,6 +60,11 @@ For every release:
    that all four platform archives and `SHA256SUMS` are attached, downloads
    succeed, archive contents include both `watchme` and the `WatchMe` alias,
    and every checksum matches. Verify the release description after editing.
+   A matching published release is already complete and must not be mutated.
+   If any published release differs, fail and create a corrected version tag;
+   never silently unpublish it. Only incomplete drafts may be updated. Mark
+   SemVer prereleases as prereleases and never as Latest; stable releases are
+   explicitly eligible to become Latest.
 
 The supported release artifacts are Linux x86_64, Linux aarch64, macOS
 x86_64, and macOS aarch64. Do not claim Windows support or claim a release is
