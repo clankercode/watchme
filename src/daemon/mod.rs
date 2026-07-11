@@ -1277,6 +1277,13 @@ pub(super) fn execute_mux_action(
     action: &crate::model::Action,
 ) -> Result<crate::recovery::actuator::ExecutionOutput, crate::recovery::actuator::ExecutionError> {
     use crate::recovery::actuator::ActionExecutor;
+    let source = watcher
+        .last_observation
+        .as_ref()
+        .map(|event| &event.source)
+        .ok_or(crate::recovery::actuator::ExecutionError::Unsafe(
+            "mux action requires a current observation source",
+        ))?;
     let identity = watcher_mux_identity(watcher)
         .map_err(|error| crate::recovery::actuator::ExecutionError::Integration(error.to_string()))?
         .ok_or(crate::recovery::actuator::ExecutionError::Unsafe(
@@ -1292,6 +1299,7 @@ pub(super) fn execute_mux_action(
                 ),
                 &identity,
                 &safety,
+                source,
             )
             .execute(action)
         }
@@ -1314,7 +1322,8 @@ pub(super) fn execute_mux_action(
             .map_err(|error| {
                 crate::recovery::actuator::ExecutionError::Integration(error.to_string())
             })?;
-            crate::recovery::actuator::MuxActuator::new(&herdr, &identity, &safety).execute(action)
+            crate::recovery::actuator::MuxActuator::new(&herdr, &identity, &safety, source)
+                .execute(action)
         }
         _ => Err(crate::recovery::actuator::ExecutionError::Unsafe(
             "missing concrete multiplexer context",

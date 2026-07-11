@@ -22,10 +22,24 @@ pub enum RegistryError {
     Corrupt(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RegistrationOutcome {
     Added(String),
     Existing(String),
+}
+
+/// Immutable authorization token for one daemon action.  Policy, evidence,
+/// and dispatch all bind to this same watcher image; any durable mutation
+/// invalidates the token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DispatchSnapshot {
+    watcher: WatcherState,
+}
+
+impl DispatchSnapshot {
+    pub const fn watcher(&self) -> &WatcherState {
+        &self.watcher
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,6 +177,22 @@ impl Registry {
     pub fn get(&self, id: &str) -> Option<&WatcherState> {
         self.watchers.get(id)
     }
+
+    pub fn dispatch_snapshot(&self, id: &str) -> Result<DispatchSnapshot, RegistryError> {
+        self.get(id)
+            .cloned()
+            .map(|watcher| DispatchSnapshot { watcher })
+            .ok_or_else(|| RegistryError::Unknown(id.into()))
+    }
+
+    /// Call while holding the registry lock immediately before an external
+    /// side effect.  Equality includes target identity, lifecycle, revision,
+    /// and the current evidence used for authorization.
+    pub fn matches_dispatch_snapshot(&self, snapshot: &DispatchSnapshot) -> bool {
+        self.get(&snapshot.watcher.watcher_id)
+            .is_some_and(|current| current == snapshot.watcher())
+    }
+
     #[cfg(test)]
     pub fn fail_next_persist(&mut self) {
         self.fail_next_persist = true;
@@ -428,5 +458,33 @@ fn stable_target_eq(left: &TargetIdentity, right: &TargetIdentity) -> bool {
                 && left_process.start_time == right_process.start_time
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_snapshot_refuses_a_retargeted_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry =
+            Registry::load(JsonStore::new(temp.path().join("watchers.json"))).unwrap();
+        registry
+            .register(WatcherState::new(
+                "watcher".into(),
+                TargetIdentity::process(ProcessIdentity::new(10, 20)),
+                WatcherLifecycle::Observing,
+                0,
+                1,
+            ))
+            .unwrap();
+        let token = registry.dispatch_snapshot("watcher").unwrap();
+
+        registry
+            .retarget_process("watcher", ProcessIdentity::new(11, 21), 2)
+            .unwrap();
+
+        assert!(!registry.matches_dispatch_snapshot(&token));
     }
 }

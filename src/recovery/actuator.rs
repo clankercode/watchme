@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::model::{Action, ActionKind};
+use crate::model::{Action, ActionKind, EventSource, SourceKind};
 use crate::mux::{ComposerSafety, Multiplexer, MuxIdentity, SymbolicKey};
 
 const MAX_CAPTURE_LINES: u16 = 300;
@@ -141,6 +141,7 @@ pub struct MuxActuator<'a, M: Multiplexer> {
     mux: &'a M,
     identity: &'a MuxIdentity,
     composer: &'a dyn ComposerSafety,
+    source: &'a EventSource,
 }
 
 impl<'a, M: Multiplexer> MuxActuator<'a, M> {
@@ -148,11 +149,13 @@ impl<'a, M: Multiplexer> MuxActuator<'a, M> {
         mux: &'a M,
         identity: &'a MuxIdentity,
         composer: &'a dyn ComposerSafety,
+        source: &'a EventSource,
     ) -> Self {
         Self {
             mux,
             identity,
             composer,
+            source,
         }
     }
 }
@@ -182,11 +185,17 @@ impl<M: Multiplexer> ActionExecutor for MuxActuator<'_, M> {
                 }
                 Ok(ExecutionOutput::Committed)
             }
-            ActionKind::Capture { max_lines, .. } => self
-                .mux
-                .capture_tail(self.identity, usize::from(*max_lines), MAX_CAPTURE_BYTES)
-                .map(|capture| ExecutionOutput::Captured(capture.text))
-                .map_err(integration),
+            ActionKind::Capture { source, max_lines } => {
+                if !mux_capture_source_matches(source, self.source) {
+                    return Err(ExecutionError::Unsafe(
+                        "capture source is not the bound mux screen observation",
+                    ));
+                }
+                self.mux
+                    .capture_tail(self.identity, usize::from(*max_lines), MAX_CAPTURE_BYTES)
+                    .map(|capture| ExecutionOutput::Captured(capture.text))
+                    .map_err(integration)
+            }
             ActionKind::WaitDuration { duration_seconds } => Ok(ExecutionOutput::Scheduled(
                 Duration::from_secs(*duration_seconds),
             )),
@@ -207,4 +216,26 @@ fn integration(error: crate::mux::MuxError) -> ExecutionError {
 
 fn possible_side_effect(error: crate::mux::MuxError) -> ExecutionError {
     ExecutionError::PossibleSideEffect(error.to_string())
+}
+
+fn mux_capture_source_matches(requested: &str, source: &EventSource) -> bool {
+    matches!(requested, "screen_detection" | "screen_recent")
+        && source.kind == SourceKind::ScreenDetection
+        && source.source_id == "tmux"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mux_capture_source_matches;
+    use crate::model::{EventSource, SourceKind};
+
+    #[test]
+    fn mux_capture_accepts_only_its_bound_screen_source() {
+        let screen = EventSource::new(SourceKind::ScreenDetection, "tmux", "generic_tail");
+        let typed = EventSource::new(SourceKind::HerdrAgentState, "herdr", "typed_pane_state");
+
+        assert!(mux_capture_source_matches("screen_recent", &screen));
+        assert!(!mux_capture_source_matches("structured_state", &typed));
+        assert!(!mux_capture_source_matches("log_tail", &screen));
+    }
 }

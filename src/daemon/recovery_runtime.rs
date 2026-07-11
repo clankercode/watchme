@@ -3,6 +3,7 @@ use super::{
     execute_mux_action, mux_identity_key, now_ms, process_identity_key, target_identity_hash,
     target_process_is_alive, validate_mux_target, watcher_mux_identity,
 };
+use crate::daemon::registry::DispatchSnapshot;
 use crate::mux::ComposerSafety;
 use crate::recovery::actuator::{ActionExecutor, ExecutionError, ExecutionOutput, RuntimeActuator};
 use crate::recovery::transaction::{EvidenceReader, LiveEvidence, OwnerIdentity};
@@ -11,36 +12,27 @@ use crate::recovery::transaction::{EvidenceReader, LiveEvidence, OwnerIdentity};
 /// lifecycle change is evidence of concurrent ownership and fails closed.
 pub(super) struct FreshTargetEvidence {
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-    watcher_id: String,
-    expected_revision: u64,
-    expected_lifecycle: WatcherLifecycle,
+    snapshot: DispatchSnapshot,
 }
 
 impl FreshTargetEvidence {
     pub(super) fn new(
         registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-        watcher_id: String,
-        expected_revision: u64,
-        expected_lifecycle: WatcherLifecycle,
+        snapshot: DispatchSnapshot,
     ) -> Self {
-        Self {
-            registry,
-            watcher_id,
-            expected_revision,
-            expected_lifecycle,
-        }
+        Self { registry, snapshot }
     }
 
     fn watcher(&self) -> Result<crate::model::WatcherState, String> {
         self.registry
             .blocking_lock()
-            .get(&self.watcher_id)
+            .get(&self.snapshot.watcher().watcher_id)
             .cloned()
             .ok_or_else(|| "recovery watcher disappeared".to_owned())
     }
 
     fn unchanged(&self, watcher: &crate::model::WatcherState) -> bool {
-        watcher.revision == self.expected_revision && watcher.lifecycle == self.expected_lifecycle
+        watcher == self.snapshot.watcher()
     }
 }
 
@@ -132,27 +124,29 @@ impl ComposerSafety for RuntimeComposerSafety {
 }
 
 struct DaemonActionExecutor {
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
     services: DaemonRuntimeServices,
     evidence: FreshTargetEvidence,
+    snapshot: DispatchSnapshot,
 }
 
 impl DaemonActionExecutor {
     fn new(
         registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-        watcher: &crate::model::WatcherState,
+        snapshot: DispatchSnapshot,
     ) -> Self {
         Self {
-            services: DaemonRuntimeServices::new(registry.clone(), watcher.watcher_id.clone()),
-            evidence: FreshTargetEvidence::new(
-                registry,
-                watcher.watcher_id.clone(),
-                watcher.revision,
-                watcher.lifecycle.clone(),
+            services: DaemonRuntimeServices::new(
+                registry.clone(),
+                snapshot.watcher().watcher_id.clone(),
             ),
+            evidence: FreshTargetEvidence::new(registry.clone(), snapshot.clone()),
+            registry,
+            snapshot,
         }
     }
 
-    fn live_watcher(&self) -> Result<crate::model::WatcherState, ExecutionError> {
+    fn confirm_live_evidence(&self) -> Result<(), ExecutionError> {
         let live = self.evidence.read().map_err(ExecutionError::Integration)?;
         if live.human_intervened
             || !live.target_revalidated
@@ -161,7 +155,17 @@ impl DaemonActionExecutor {
         {
             return Err(ExecutionError::Unsafe("target changed before dispatch"));
         }
-        self.evidence.watcher().map_err(ExecutionError::Integration)
+        Ok(())
+    }
+
+    fn locked_snapshot_watcher(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Registry>, ExecutionError> {
+        let guard = self.registry.blocking_lock();
+        if !guard.matches_dispatch_snapshot(&self.snapshot) {
+            return Err(ExecutionError::Unsafe("target changed before dispatch"));
+        }
+        Ok(guard)
     }
 }
 
@@ -170,12 +174,21 @@ impl ActionExecutor for DaemonActionExecutor {
         use crate::model::ActionKind;
         match &action.kind {
             ActionKind::SendText { .. } | ActionKind::SendKeys { .. } => {
-                let watcher = self.live_watcher()?;
-                execute_mux_action(&watcher, action)
+                self.confirm_live_evidence()?;
+                // Keep the registry lock through the mux command.  Retarget,
+                // pause, and stop all require this same lock, making the
+                // revision check and external side effect one critical region.
+                let guard = self.locked_snapshot_watcher()?;
+                let result = execute_mux_action(self.snapshot.watcher(), action);
+                drop(guard);
+                result
             }
             ActionKind::Capture { source, max_lines } => {
-                let watcher = self.live_watcher()?;
-                execute_capture(&watcher, source, *max_lines)
+                self.confirm_live_evidence()?;
+                let guard = self.locked_snapshot_watcher()?;
+                let result = execute_capture(self.snapshot.watcher(), source, *max_lines);
+                drop(guard);
+                result
             }
             ActionKind::Notify { .. } => Err(ExecutionError::Unsafe(
                 "notification is not an autonomous recovery action",
@@ -190,9 +203,9 @@ fn execute_capture(
     source: &str,
     max_lines: u16,
 ) -> Result<ExecutionOutput, ExecutionError> {
-    if source != "screen_detection" && source != "screen_recent" {
+    if !capture_source_matches(watcher, source) {
         return Err(ExecutionError::Unsafe(
-            "unsupported capture source for target",
+            "capture source does not match current adapter observation",
         ));
     }
     let identity = watcher_mux_identity(watcher)
@@ -200,8 +213,86 @@ fn execute_capture(
         .ok_or(ExecutionError::Unsafe(
             "capture requires a multiplexer target",
         ))?;
+    if source == "structured_state" {
+        return capture_herdr_structured_state(watcher, &identity, max_lines);
+    }
     capture_mux_target(watcher, &identity, usize::from(max_lines), 32 * 1024)
         .map(|capture| ExecutionOutput::Captured(capture.text))
+        .map_err(|error| ExecutionError::Integration(error.to_string()))
+}
+
+/// A capture recipe is allowed to read only the concrete subsystem that
+/// produced the current durable evidence.  There is deliberately no generic
+/// `log_tail` path: no adapter currently provides a correlated log reader.
+fn capture_source_matches(watcher: &crate::model::WatcherState, requested: &str) -> bool {
+    let Some(event) = watcher.last_observation.as_ref() else {
+        return false;
+    };
+    match (requested, watcher.target.observation_context()) {
+        (
+            "screen_detection" | "screen_recent",
+            Some(crate::model::MultiplexerContext::Tmux { .. }),
+        ) => {
+            event.source.kind == crate::model::SourceKind::ScreenDetection
+                && event.source.source_id == "tmux"
+        }
+        ("structured_state", Some(crate::model::MultiplexerContext::Herdr { .. })) => {
+            event.source.kind == crate::model::SourceKind::HerdrAgentState
+                && event.source.source_id == "herdr"
+                && event.source.rule_or_field == "typed_pane_state"
+        }
+        // A correlated log reader has not been implemented, so this source
+        // remains intentionally unavailable rather than falling back to a
+        // pane capture that could belong to another session.
+        ("log_tail", _) | (_, _) => false,
+    }
+}
+
+fn capture_herdr_structured_state(
+    watcher: &crate::model::WatcherState,
+    identity: &crate::mux::MuxIdentity,
+    max_events: u16,
+) -> Result<ExecutionOutput, ExecutionError> {
+    let Some(crate::model::MultiplexerContext::Herdr {
+        socket_path,
+        workspace_id,
+        tab_id,
+        pane_id,
+        ..
+    }) = watcher.target.observation_context()
+    else {
+        return Err(ExecutionError::Unsafe(
+            "structured state requires a Herdr target",
+        ));
+    };
+    let event = watcher
+        .last_observation
+        .as_ref()
+        .ok_or(ExecutionError::Unsafe("missing current observation"))?;
+    if event.source.kind != crate::model::SourceKind::HerdrAgentState
+        || event.source.source_id != "herdr"
+        || event.source.rule_or_field != "typed_pane_state"
+    {
+        return Err(ExecutionError::Unsafe(
+            "structured state source is not Herdr typed state",
+        ));
+    }
+    let herdr = crate::mux::herdr::Herdr::new(
+        crate::mux::herdr::HerdrContext {
+            socket_path: socket_path.clone(),
+            workspace_id: workspace_id.clone(),
+            tab_id: tab_id.clone(),
+            pane_id: pane_id.clone(),
+        },
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|error| ExecutionError::Integration(error.to_string()))?;
+    let after = watcher.observation_schedule.herdr_after_sequence;
+    let state = herdr
+        .agent_state_events(identity, after, usize::from(max_events))
+        .map_err(|error| ExecutionError::Integration(error.to_string()))?;
+    serde_json::to_string(&state)
+        .map(ExecutionOutput::Captured)
         .map_err(|error| ExecutionError::Integration(error.to_string()))
 }
 
@@ -231,7 +322,7 @@ pub(super) fn execute_recovery_action(
         return;
     }
     let clock = SystemRecoveryClock::new();
-    let current = {
+    let dispatch = {
         let mut guard = registry.blocking_lock();
         let snapshot = crate::recovery::state_machine::ClockSnapshot::new(
             crate::recovery::transaction::Clock::monotonic_ms(&clock) / 1_000,
@@ -246,16 +337,12 @@ pub(super) fn execute_recovery_action(
         {
             return;
         }
-        guard.get(&watcher.watcher_id).cloned()
+        guard.dispatch_snapshot(&watcher.watcher_id).ok()
     };
-    let Some(current) = current else { return };
-    let evidence = FreshTargetEvidence::new(
-        registry.clone(),
-        current.watcher_id.clone(),
-        current.revision,
-        current.lifecycle.clone(),
-    );
-    let executor = DaemonActionExecutor::new(registry.clone(), &current);
+    let Some(dispatch) = dispatch else { return };
+    let current = dispatch.watcher().clone();
+    let evidence = FreshTargetEvidence::new(registry.clone(), dispatch.clone());
+    let executor = DaemonActionExecutor::new(registry.clone(), dispatch);
     match engine.execute(&current, owner, &evidence, &executor, &clock) {
         Ok(Some(record))
             if record.phase == crate::recovery::transaction::ActionPhase::Succeeded =>
@@ -289,6 +376,46 @@ mod tests {
     use crate::store::JsonStore;
 
     #[test]
+    fn capture_source_must_be_bound_to_the_current_adapter_observation() {
+        let target = TargetIdentity::herdr(
+            "/tmp/herdr.sock".into(),
+            "server".into(),
+            "workspace".into(),
+            "tab".into(),
+            "pane".into(),
+            "/dev/pts/1".into(),
+            ProcessIdentity::new(1, 2),
+        );
+        let mut watcher = WatcherState::new(
+            "bound".into(),
+            target.clone(),
+            WatcherLifecycle::Observing,
+            1,
+            1,
+        );
+        watcher.last_observation = Some(
+            Event::new(
+                "event",
+                "2026-07-11T00:00:00Z",
+                "bound",
+                target_identity_hash(&target),
+                EventSource::new(SourceKind::HerdrAgentState, "herdr", "typed_pane_state"),
+                EventCategory::BlockedGoal,
+                1.0,
+                false,
+                "a".repeat(64),
+                "blocked",
+                PolicyHint::DeterministicActionAllowed,
+            )
+            .unwrap(),
+        );
+
+        assert!(capture_source_matches(&watcher, "structured_state"));
+        assert!(!capture_source_matches(&watcher, "screen_recent"));
+        assert!(!capture_source_matches(&watcher, "log_tail"));
+    }
+
+    #[test]
     fn durable_reader_rejects_pause_after_its_baseline_revision() {
         let temp = tempfile::tempdir().unwrap();
         let mut registry =
@@ -318,14 +445,9 @@ mod tests {
             .unwrap(),
         );
         registry.register(watcher).unwrap();
-        let revision = registry.get("live-reader").unwrap().revision;
+        let dispatch = registry.dispatch_snapshot("live-reader").unwrap();
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
-        let reader = FreshTargetEvidence::new(
-            registry.clone(),
-            "live-reader".into(),
-            revision,
-            WatcherLifecycle::Observing,
-        );
+        let reader = FreshTargetEvidence::new(registry.clone(), dispatch);
         registry
             .blocking_lock()
             .transition("live-reader", WatcherLifecycle::Paused, 2)
