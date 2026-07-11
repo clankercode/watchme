@@ -7,8 +7,8 @@ use std::path::Path;
 use tempfile::TempDir;
 use watchme::config::Config;
 use watchme::model::{
-    PROCESS_IDENTITY_SCHEMA_VERSION, ProcessIdentity, TargetIdentity, WatcherLifecycle,
-    WatcherState,
+    PROCESS_IDENTITY_SCHEMA_VERSION, ProcessIdentity, TARGET_IDENTITY_SCHEMA_VERSION,
+    TargetIdentity, WATCHER_STATE_SCHEMA_VERSION, WatcherLifecycle, WatcherState,
 };
 use watchme::paths::WatchmePaths;
 use watchme::store::{JsonStore, LoadOutcome};
@@ -26,17 +26,13 @@ fn process() -> ProcessIdentity {
 }
 
 fn state() -> WatcherState {
-    WatcherState {
-        schema_version: 1,
-        watcher_id: "watcher-1".into(),
-        target: TargetIdentity::Process {
-            version: 1,
-            process: process(),
-        },
-        lifecycle: WatcherLifecycle::Observing,
-        revision: 3,
-        updated_at_unix_ms: 9_876,
-    }
+    WatcherState::new(
+        "watcher-1".into(),
+        TargetIdentity::process(process()),
+        WatcherLifecycle::Observing,
+        3,
+        9_876,
+    )
 }
 
 #[test]
@@ -101,6 +97,28 @@ fn process_identity_has_a_locked_current_schema_version() {
 }
 
 #[test]
+fn target_and_watcher_state_reject_unknown_versions_and_fields() {
+    let target = TargetIdentity::process(process());
+    assert_eq!(target.schema_version(), TARGET_IDENTITY_SCHEMA_VERSION);
+    let mut target_json = serde_json::to_value(&target).unwrap();
+    let mut target_unknown = target_json.clone();
+    target_unknown["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<TargetIdentity>(target_unknown).is_err());
+    target_json["schema_version"] = serde_json::json!(999);
+    assert!(serde_json::from_value::<TargetIdentity>(target_json).is_err());
+
+    let watcher = state();
+    assert_eq!(watcher.schema_version(), WATCHER_STATE_SCHEMA_VERSION);
+    let mut watcher_json = serde_json::to_value(&watcher).unwrap();
+    watcher_json["schema_version"] = serde_json::json!(999);
+    assert!(serde_json::from_value::<WatcherState>(watcher_json).is_err());
+
+    let mut unknown = serde_json::to_value(state()).unwrap();
+    unknown["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<WatcherState>(unknown).is_err());
+}
+
+#[test]
 fn managed_paths_reject_relative_traversal_and_symlinks() {
     let temp = TempDir::new().unwrap();
     let paths = WatchmePaths::resolve(temp.path(), None, None, None).unwrap();
@@ -155,6 +173,28 @@ fn configuration_layers_over_conservative_defaults_and_rejects_unknown_keys() {
 }
 
 #[test]
+fn configuration_ignores_only_missing_files_and_reports_broken_symlinks() {
+    let temp = TempDir::new().unwrap();
+    let missing = temp.path().join("missing.toml");
+    assert_eq!(
+        Config::load_layers([missing.as_path()]).unwrap(),
+        Config::default()
+    );
+
+    let broken = temp.path().join("broken.toml");
+    symlink(temp.path().join("absent-target"), &broken).unwrap();
+    let error = Config::load_layers([broken.as_path()]).unwrap_err();
+    assert!(error.to_string().contains(&broken.display().to_string()));
+
+    let target = temp.path().join("target.toml");
+    fs::write(&target, "[observation]\npoll_interval_seconds = 10\n").unwrap();
+    let linked = temp.path().join("linked.toml");
+    symlink(&target, &linked).unwrap();
+    let error = Config::load_layers([linked.as_path()]).unwrap_err();
+    assert!(error.to_string().contains(&linked.display().to_string()));
+}
+
+#[test]
 fn state_round_trips_and_atomic_replacement_does_not_change_inode_contents_partway() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("state.json");
@@ -204,21 +244,19 @@ fn every_lifecycle_and_multiplexer_identity_round_trips_through_atomic_store() {
     ];
 
     for (revision, lifecycle) in lifecycles.into_iter().enumerate() {
-        let expected = WatcherState {
-            schema_version: 1,
-            watcher_id: format!("watcher-{revision}"),
-            target: TargetIdentity::Multiplexer {
-                version: 1,
-                provider: "tmux".into(),
-                server: "/tmp/tmux-1000/default".into(),
-                pane: "%3".into(),
-                process: process(),
-                session: Some("work:1.2".into()),
-            },
+        let expected = WatcherState::new(
+            format!("watcher-{revision}"),
+            TargetIdentity::multiplexer(
+                "tmux".into(),
+                "/tmp/tmux-1000/default".into(),
+                "%3".into(),
+                process(),
+                Some("work:1.2".into()),
+            ),
             lifecycle,
-            revision: revision as u64,
-            updated_at_unix_ms: 555_000 + revision as u64,
-        };
+            revision as u64,
+            555_000 + revision as u64,
+        );
         store.write(&expected).unwrap();
         assert_eq!(
             store.load::<WatcherState>().unwrap(),

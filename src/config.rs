@@ -43,13 +43,34 @@ impl Config {
     pub fn load_layers<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<Self, ConfigError> {
         let mut merged = toml::Value::Table(Default::default());
         for path in paths {
-            if !path.exists() {
-                continue;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(ConfigError::Read {
+                        path: path.display().to_string(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "configuration path must not be a symlink",
+                        ),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(ConfigError::Read {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
             }
-            let source = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-                path: path.display().to_string(),
-                source,
-            })?;
+            let source = match fs::read_to_string(path) {
+                Ok(source) => source,
+                Err(source) => {
+                    return Err(ConfigError::Read {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
+            };
             let layer: toml::Value = toml::from_str(&source)?;
             merge(&mut merged, layer)?;
         }

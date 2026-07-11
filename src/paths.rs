@@ -1,9 +1,13 @@
-use std::fs::{self, DirBuilder};
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(unix)]
-use std::os::unix::fs::DirBuilderExt;
+use rustix::fs::{Mode, OFlags};
+
+const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatchmePaths {
@@ -50,9 +54,12 @@ impl WatchmePaths {
 
     pub fn create_owner_only(&self) -> io::Result<()> {
         for path in [&self.config_dir, &self.state_dir, &self.runtime_dir] {
-            reject_symlink_components(path)?;
-            create_private_dir(path)?;
-            reject_symlink_components(path)?;
+            let directory = open_directory_chain(path, true)?;
+            rx(rustix::fs::fchmod(
+                &directory,
+                Mode::from_bits_truncate(0o700),
+            ))?;
+            verify_owned_private(&directory)?;
         }
         Ok(())
     }
@@ -71,7 +78,7 @@ impl WatchmePaths {
     }
 
     pub fn validate_managed_path(&self, path: &Path) -> io::Result<()> {
-        reject_symlink_components(path)
+        open_directory_chain(path, false).map(drop)
     }
 }
 
@@ -80,25 +87,6 @@ fn runtime_fallback() -> PathBuf {
         "/tmp/watchme-{}",
         rustix::process::geteuid().as_raw()
     ))
-}
-
-fn reject_symlink_components(path: &Path) -> io::Result<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("managed path contains symlink: {}", current.display()),
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 fn require_absolute_clean(path: &Path) -> io::Result<()> {
@@ -115,16 +103,52 @@ fn require_absolute_clean(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn create_private_dir(path: &Path) -> io::Result<()> {
-    let mut builder = DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    builder.mode(0o700);
-    builder.create(path)?;
-    #[cfg(unix)]
+fn open_directory_chain(path: &Path, create: bool) -> io::Result<OwnedFd> {
+    require_absolute_clean(path)?;
+    let mut directory = rx(rustix::fs::open("/", DIRECTORY_FLAGS, Mode::empty()))?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                if create {
+                    match rustix::fs::mkdirat(&directory, name, Mode::from_bits_truncate(0o700)) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => return Err(errno(error)),
+                    }
+                }
+                directory = rx(rustix::fs::openat(
+                    &directory,
+                    name,
+                    DIRECTORY_FLAGS,
+                    Mode::empty(),
+                ))?;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsafe path component",
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn verify_owned_private(directory: &OwnedFd) -> io::Result<()> {
+    let stat = rx(rustix::fs::fstat(directory))?;
+    if stat.st_uid as u32 != rustix::process::geteuid().as_raw() || stat.st_mode as u32 & 0o077 != 0
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "managed directory is not owner-only",
+        ));
     }
     Ok(())
+}
+
+fn rx<T>(result: rustix::io::Result<T>) -> io::Result<T> {
+    result.map_err(errno)
+}
+fn errno(error: rustix::io::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error.raw_os_error())
 }

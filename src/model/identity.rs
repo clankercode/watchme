@@ -2,6 +2,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const PROCESS_IDENTITY_SCHEMA_VERSION: u16 = 1;
+pub const TARGET_IDENTITY_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -81,19 +82,123 @@ impl<'de> Deserialize<'de> for ProcessIdentity {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetIdentity {
     Process {
-        version: u16,
         process: ProcessIdentity,
     },
     Multiplexer {
-        version: u16,
         provider: String,
         server: String,
         pane: String,
         process: ProcessIdentity,
         session: Option<String>,
     },
+}
+
+impl TargetIdentity {
+    pub const fn process(process: ProcessIdentity) -> Self {
+        Self::Process { process }
+    }
+
+    pub fn multiplexer(
+        provider: String,
+        server: String,
+        pane: String,
+        process: ProcessIdentity,
+        session: Option<String>,
+    ) -> Self {
+        Self::Multiplexer {
+            provider,
+            server,
+            pane,
+            process,
+            session,
+        }
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        TARGET_IDENTITY_SCHEMA_VERSION
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TargetWire {
+    Process {
+        schema_version: u16,
+        process: ProcessIdentity,
+    },
+    Multiplexer {
+        schema_version: u16,
+        provider: String,
+        server: String,
+        pane: String,
+        process: ProcessIdentity,
+        session: Option<String>,
+    },
+}
+
+impl Serialize for TargetIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let wire = match self {
+            Self::Process { process } => TargetWire::Process {
+                schema_version: TARGET_IDENTITY_SCHEMA_VERSION,
+                process: process.clone(),
+            },
+            Self::Multiplexer {
+                provider,
+                server,
+                pane,
+                process,
+                session,
+            } => TargetWire::Multiplexer {
+                schema_version: TARGET_IDENTITY_SCHEMA_VERSION,
+                provider: provider.clone(),
+                server: server.clone(),
+                pane: pane.clone(),
+                process: process.clone(),
+                session: session.clone(),
+            },
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TargetWire::deserialize(deserializer)?;
+        let version = match &wire {
+            TargetWire::Process { schema_version, .. }
+            | TargetWire::Multiplexer { schema_version, .. } => *schema_version,
+        };
+        if version != TARGET_IDENTITY_SCHEMA_VERSION {
+            return Err(D::Error::custom(format_args!(
+                "unsupported target identity schema version {version}"
+            )));
+        }
+        Ok(match wire {
+            TargetWire::Process { process, .. } => Self::Process { process },
+            TargetWire::Multiplexer {
+                provider,
+                server,
+                pane,
+                process,
+                session,
+                ..
+            } => Self::Multiplexer {
+                provider,
+                server,
+                pane,
+                process,
+                session,
+            },
+        })
+    }
 }
