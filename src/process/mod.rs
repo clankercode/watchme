@@ -2,7 +2,6 @@ mod scoring;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(target_os = "macos")]
 pub mod macos;
 
 use sha2::{Digest, Sha256};
@@ -179,7 +178,9 @@ impl ProcessResolver {
         let mut candidates = Vec::new();
         for (distance, process) in ancestry.iter().enumerate().skip(1) {
             if let Some(agent) = self.agent_for(process) {
-                candidates.push(self.candidate(process, agent, hints, Some(distance)));
+                if let Some(candidate) = self.candidate(process, agent, hints, Some(distance)) {
+                    candidates.push(candidate);
+                }
             }
         }
         if candidates.is_empty()
@@ -187,7 +188,9 @@ impl ProcessResolver {
         {
             for process in inspector.processes_on_tty(tty)? {
                 if let Some(agent) = self.agent_for(&process) {
-                    candidates.push(self.candidate(&process, agent, hints, None));
+                    if let Some(candidate) = self.candidate(&process, agent, hints, None) {
+                        candidates.push(candidate);
+                    }
                 }
             }
         }
@@ -236,14 +239,14 @@ impl ProcessResolver {
         agent: AgentKind,
         hints: &CandidateHints,
         distance: Option<usize>,
-    ) -> ResolvedProcess {
-        let (score, reasons) = score(process, hints, distance);
-        ResolvedProcess {
+    ) -> Option<ResolvedProcess> {
+        let (score, reasons) = score(process, hints, distance)?;
+        Some(ResolvedProcess {
             identity: process.identity(),
             agent,
             score,
             reasons,
-        }
+        })
     }
 }
 
@@ -335,9 +338,12 @@ impl LifecycleMonitor {
         if matches.len() != 1 {
             return LifecycleDecision::Grace;
         }
-        self.identity = matches[0].identity();
+        LifecycleDecision::ReexecAccepted(matches[0].identity())
+    }
+
+    pub fn commit_reexec(&mut self, identity: ProcessIdentity) {
+        self.identity = identity;
         self.missing_since = None;
-        LifecycleDecision::ReexecAccepted(self.identity.clone())
     }
 }
 
@@ -350,10 +356,24 @@ fn same_process(identity: &ProcessIdentity, process: &ProcessRecord) -> bool {
 fn strong_reexec_match(identity: &ProcessIdentity, process: &ProcessRecord) -> bool {
     let original_agent = identity.executable.as_deref().and_then(identify_agent);
     let replacement_agent = process.executable.as_deref().and_then(identify_agent);
-    identity.tty == process.tty
-        && identity.process_group_id == process.process_group_id
-        && identity.session_leader_id == process.session_leader_id
+    identity.tty.is_some()
+        && identity.tty == process.tty
+        && identity.uid.is_some()
         && identity.uid == process.uid
+        && continuity_matches(identity, process)
         && original_agent.is_some()
         && original_agent == replacement_agent
+}
+
+fn continuity_matches(identity: &ProcessIdentity, process: &ProcessRecord) -> bool {
+    let pairs = [
+        (identity.process_group_id, process.process_group_id),
+        (identity.session_leader_id, process.session_leader_id),
+    ];
+    !pairs
+        .iter()
+        .any(|(left, right)| left.is_some() && right.is_some() && left != right)
+        && pairs
+            .iter()
+            .any(|(left, right)| left.is_some() && left == right)
 }

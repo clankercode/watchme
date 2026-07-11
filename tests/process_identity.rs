@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 #[cfg(target_os = "linux")]
-use watchme::process::linux::{LinuxProcessInspector, parse_proc_stat, parse_status_uid};
+use watchme::process::linux::{
+    LinuxProcessInspector, canonical_tty_path, parse_proc_stat, parse_status_uid,
+};
+use watchme::process::macos::parse_ps_record;
 use watchme::process::{
     AgentKind, CandidateHints, LifecycleDecision, LifecycleMonitor, ProcessError, ProcessInspector,
     ProcessRecord, ProcessResolver,
@@ -119,6 +122,42 @@ fn refuses_low_confidence_global_or_unrelated_processes() {
 }
 
 #[test]
+fn rejects_known_ancestor_when_strong_pane_evidence_conflicts() {
+    let mut agent = process(40, 1, "claude");
+    agent.uid = Some(2000);
+    let inspector = FakeInspector::default()
+        .with(process(70, 40, "watchme"))
+        .with(agent);
+    let hints = CandidateHints::for_tty("/dev/pts/4")
+        .with_uid(1000)
+        .with_process_group(40)
+        .with_session(30);
+    assert!(matches!(
+        ProcessResolver::default().resolve(&inspector, 70, &hints),
+        Err(ProcessError::NoConfidentCandidate { .. })
+    ));
+}
+
+#[test]
+fn known_name_without_positive_cross_correlation_is_low_confidence() {
+    let mut child = process(70, 40, "watchme");
+    child.tty = None;
+    child.uid = None;
+    child.process_group_id = None;
+    child.session_leader_id = None;
+    let mut agent = process(40, 1, "claude");
+    agent.tty = None;
+    agent.uid = None;
+    agent.process_group_id = None;
+    agent.session_leader_id = None;
+    let inspector = FakeInspector::default().with(child).with(agent);
+    assert!(matches!(
+        ProcessResolver::default().resolve(&inspector, 70, &CandidateHints::default()),
+        Err(ProcessError::NoConfidentCandidate { .. })
+    ));
+}
+
+#[test]
 fn lifecycle_rejects_pid_reuse_and_executable_replacement() {
     let original = process(40, 1, "claude");
     let identity = original.identity();
@@ -199,6 +238,42 @@ fn lifecycle_refuses_reexec_with_weak_or_conflicting_evidence() {
 }
 
 #[test]
+fn lifecycle_refuses_missing_uid_or_group_and_does_not_commit_proposal() {
+    let original = process(40, 1, "claude");
+    let mut monitor = LifecycleMonitor::with_reexec_grace(original.identity(), 50);
+    assert_eq!(
+        monitor.observe(&FakeInspector::default(), 100),
+        LifecycleDecision::Grace
+    );
+    let mut missing_uid = process(41, 1, "claude");
+    missing_uid.uid = None;
+    assert_eq!(
+        monitor.observe(&FakeInspector::default().with(missing_uid), 110),
+        LifecycleDecision::Grace
+    );
+    let proposed = process(41, 1, "claude");
+    assert!(matches!(
+        monitor.observe(&FakeInspector::default().with(proposed.clone()), 120),
+        LifecycleDecision::ReexecAccepted(_)
+    ));
+    assert!(
+        matches!(
+            monitor.observe(&FakeInspector::default().with(proposed), 121),
+            LifecycleDecision::ReexecAccepted(_)
+        ),
+        "proposal must remain uncommitted until durable registry update succeeds"
+    );
+}
+
+#[test]
+fn macos_parser_uses_tty_name_and_is_runnable_cross_platform() {
+    let parsed = parse_ps_record(b"42 7 40 30 1000 ttys004 /opt/claude", 123).unwrap();
+    assert_eq!(parsed.tty.as_deref(), Some("/dev/ttys004"));
+    assert_eq!(parsed.start_time, 123);
+    assert!(parse_ps_record(b"42 malformed", 123).is_err());
+}
+
+#[test]
 fn argv_is_hashed_and_never_exposed_by_debug_or_serialization() {
     let secret = "sk-secret-never-persist";
     let record = process(40, 1, "claude").with_argv(["claude", "--token", secret]);
@@ -230,6 +305,7 @@ fn proc_stat_parser_handles_spaces_parentheses_and_rejects_truncation() {
         (7, 40, 30)
     );
     assert_eq!(parsed.start_time, 987654);
+    assert_eq!(parsed.tty.as_deref(), Some("dev:136:1"));
     assert!(matches!(
         parse_proc_stat(42, b"42 (bad) S 1"),
         Err(ProcessError::Malformed { pid: 42, .. })
@@ -257,4 +333,32 @@ fn linux_inspector_reports_disappeared_proc_without_panicking() {
         inspector.inspect(1234),
         Err(ProcessError::Disappeared(1234))
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pane_tty_paths_use_same_device_identity_as_proc_stat() {
+    let identity = canonical_tty_path(std::path::Path::new("/dev/null")).unwrap();
+    assert!(identity.starts_with("dev:"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_inspector_rejects_mid_read_pid_recycle_and_ignores_redirected_stdin() {
+    use std::sync::Arc;
+    let directory = tempfile::tempdir().unwrap();
+    let process_dir = directory.path().join("42");
+    std::fs::create_dir_all(&process_dir).unwrap();
+    let stat = |start| format!("42 (claude) S 1 40 30 34817 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {start} 0");
+    std::fs::write(process_dir.join("stat"), stat(100)).unwrap();
+    std::fs::write(process_dir.join("status"), "Uid:\t1000\t1000\t1000\t1000\n").unwrap();
+    std::fs::write(process_dir.join("cmdline"), b"claude\0").unwrap();
+    std::fs::create_dir_all(process_dir.join("fd")).unwrap();
+    std::fs::write(process_dir.join("fd/0"), b"redirected input").unwrap();
+    let stat_path = process_dir.join("stat");
+    let inspector = LinuxProcessInspector::from_proc_root_with_hook(
+        directory.path(),
+        Arc::new(move || std::fs::write(&stat_path, stat(101)).unwrap()),
+    );
+    assert_eq!(inspector.inspect(42), Err(ProcessError::Disappeared(42)));
 }

@@ -1,6 +1,15 @@
+//! macOS uses fixed-argument `/bin/ps` only for metadata and `sysinfo` for the
+//! stable start-time boundary. Records are rejected if that boundary changes.
+//! Enumeration is intentionally best-effort: rows that disappear or recycle
+//! while being verified are omitted rather than combined or guessed.
+
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
-use super::{ProcessError, ProcessInspector, ProcessRecord};
+#[cfg(target_os = "macos")]
+use super::ProcessInspector;
+
+use super::{ProcessError, ProcessRecord};
 
 const MAX_PS_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -8,6 +17,7 @@ const MAX_PS_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 /// No process-controlled value is interpreted by a shell.
 pub struct MacOsProcessInspector;
 
+#[cfg(target_os = "macos")]
 impl ProcessInspector for MacOsProcessInspector {
     fn inspect(&self, pid: u32) -> Result<ProcessRecord, ProcessError> {
         let output = Command::new("/bin/ps")
@@ -15,19 +25,24 @@ impl ProcessInspector for MacOsProcessInspector {
                 "-p",
                 &pid.to_string(),
                 "-o",
-                "pid=,ppid=,pgid=,sess=,uid=,tdev=,comm=",
+                "pid=,ppid=,pgid=,sess=,uid=,tty=,comm=",
             ])
             .output()
             .map_err(|error| ProcessError::Inspection(error.to_string()))?;
         if !output.status.success() || output.stdout.is_empty() {
             return Err(ProcessError::Disappeared(pid));
         }
-        parse_ps_line(&output.stdout, process_start_time(pid)?)
+        let before = process_start_time(pid)?;
+        let record = parse_ps_record(&output.stdout, before)?;
+        if process_start_time(pid)? != before {
+            return Err(ProcessError::Disappeared(pid));
+        }
+        Ok(record)
     }
 
     fn processes_on_tty(&self, tty: &str) -> Result<Vec<ProcessRecord>, ProcessError> {
         let output = Command::new("/bin/ps")
-            .args(["-axo", "pid=,ppid=,pgid=,sess=,uid=,tdev=,comm="])
+            .args(["-axo", "pid=,ppid=,pgid=,sess=,uid=,tty=,comm="])
             .output()
             .map_err(|error| ProcessError::Inspection(error.to_string()))?;
         if output.stdout.len() > MAX_PS_OUTPUT_BYTES {
@@ -40,13 +55,16 @@ impl ProcessInspector for MacOsProcessInspector {
             .split(|byte| *byte == b'\n')
             .filter_map(|line| {
                 let pid = first_u32(line)?;
-                parse_ps_line(line, process_start_time(pid).ok()?).ok()
+                let start = process_start_time(pid).ok()?;
+                let record = parse_ps_record(line, start).ok()?;
+                (process_start_time(pid).ok()? == start).then_some(record)
             })
             .filter(|process| process.tty.as_deref() == Some(tty))
             .collect())
     }
 }
 
+#[cfg(target_os = "macos")]
 fn process_start_time(pid: u32) -> Result<u64, ProcessError> {
     let system = sysinfo::System::new_all();
     system
@@ -55,7 +73,7 @@ fn process_start_time(pid: u32) -> Result<u64, ProcessError> {
         .ok_or(ProcessError::Disappeared(pid))
 }
 
-fn parse_ps_line(bytes: &[u8], start_time: u64) -> Result<ProcessRecord, ProcessError> {
+pub fn parse_ps_record(bytes: &[u8], start_time: u64) -> Result<ProcessRecord, ProcessError> {
     if bytes.len() > MAX_PS_OUTPUT_BYTES {
         return Err(ProcessError::Inspection(
             "ps record exceeds size limit".into(),
@@ -84,6 +102,7 @@ fn parse_ps_line(bytes: &[u8], start_time: u64) -> Result<ProcessRecord, Process
     })
 }
 
+#[cfg(target_os = "macos")]
 fn first_u32(line: &[u8]) -> Option<u32> {
     std::str::from_utf8(line)
         .ok()?

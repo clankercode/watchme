@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -14,11 +15,13 @@ pub struct ParsedProcStat {
     pub parent_pid: u32,
     pub process_group_id: u32,
     pub session_leader_id: u32,
+    pub tty: Option<String>,
     pub start_time: u64,
 }
 
 pub struct LinuxProcessInspector {
     proc_root: PathBuf,
+    after_initial_stat: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for LinuxProcessInspector {
@@ -31,6 +34,18 @@ impl LinuxProcessInspector {
     pub fn from_proc_root(root: impl AsRef<Path>) -> Self {
         Self {
             proc_root: root.as_ref().to_path_buf(),
+            after_initial_stat: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn from_proc_root_with_hook(
+        root: impl AsRef<Path>,
+        hook: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self {
+            proc_root: root.as_ref().to_path_buf(),
+            after_initial_stat: Some(hook),
         }
     }
 
@@ -38,6 +53,9 @@ impl LinuxProcessInspector {
         let directory = self.proc_root.join(pid.to_string());
         let stat = read_bounded(&directory.join("stat"), pid)?;
         let parsed = parse_proc_stat(pid, &stat)?;
+        if let Some(hook) = &self.after_initial_stat {
+            hook();
+        }
         let status = read_bounded(&directory.join("status"), pid)?;
         let uid = parse_status_uid(pid, &status)?;
         let executable = std::fs::read_link(directory.join("exe"))
@@ -47,10 +65,11 @@ impl LinuxProcessInspector {
             .ok()
             .filter(|bytes| !bytes.is_empty())
             .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
-        let tty = std::fs::read_link(directory.join("fd/0"))
-            .ok()
-            .filter(|path| path.starts_with("/dev/"))
-            .map(|path| path.to_string_lossy().into_owned());
+        let final_stat = read_bounded(&directory.join("stat"), pid)?;
+        let final_identity = parse_proc_stat(pid, &final_stat)?;
+        if final_identity.start_time != parsed.start_time {
+            return Err(ProcessError::Disappeared(pid));
+        }
         Ok(ProcessRecord {
             pid,
             parent_pid: parsed.parent_pid,
@@ -60,7 +79,7 @@ impl LinuxProcessInspector {
             uid: Some(uid),
             process_group_id: Some(parsed.process_group_id),
             session_leader_id: Some(parsed.session_leader_id),
-            tty,
+            tty: parsed.tty,
         })
     }
 }
@@ -105,8 +124,26 @@ pub fn parse_proc_stat(pid: u32, bytes: &[u8]) -> Result<ParsedProcStat, Process
         parent_pid: parse_field(pid, fields[1], "parent PID")?,
         process_group_id: parse_field(pid, fields[2], "process group")?,
         session_leader_id: parse_field(pid, fields[3], "session leader")?,
+        tty: canonical_tty(parse_field(pid, fields[4], "controlling tty")?),
         start_time: parse_field(pid, fields[19], "start time")?,
     })
+}
+
+fn canonical_tty(device: i64) -> Option<String> {
+    let device = u64::try_from(device).ok().filter(|device| *device != 0)?;
+    Some(canonical_device(device))
+}
+
+pub fn canonical_tty_path(path: &Path) -> Result<String, ProcessError> {
+    let metadata =
+        std::fs::metadata(path).map_err(|error| ProcessError::Inspection(error.to_string()))?;
+    Ok(canonical_device(metadata.rdev()))
+}
+
+fn canonical_device(device: u64) -> String {
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & 0xffff_f000);
+    let minor = (device & 0xff) | ((device >> 12) & 0xffff_ff00);
+    format!("dev:{major}:{minor}")
 }
 
 pub fn parse_status_uid(pid: u32, bytes: &[u8]) -> Result<u32, ProcessError> {
