@@ -1,9 +1,16 @@
 mod observation;
+mod recovery_runtime;
 pub mod registry;
+mod runtime_services;
 pub mod scheduler;
 
 pub use observation::classify_herdr_state;
 use observation::observation_event;
+use recovery_runtime::{RuntimeComposerSafety, execute_recovery_action};
+use runtime_services::{
+    DaemonRuntimeServices, SystemRecoveryClock, recover_durable_actions_after_restart,
+    recover_stale_durable_actions, target_process_is_alive,
+};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
@@ -731,12 +738,20 @@ async fn run_observation_loop(
                     }
                 }
                 let mut guard = registry.lock().await;
-                let _ = guard.commit_observation(
-                    &watcher.watcher_id,
-                    next_schedule,
-                    event,
-                    clock.wall_now_ms(),
-                );
+                if guard
+                    .commit_observation(
+                        &watcher.watcher_id,
+                        next_schedule,
+                        event,
+                        clock.wall_now_ms(),
+                    )
+                    .is_err()
+                {
+                    // A recovery decision may only consume an observation that is
+                    // durably committed. Retrying the next poll is safe; running
+                    // against the old snapshot is not.
+                    continue;
+                }
                 let current = recovery
                     .as_ref()
                     .and_then(|_| guard.get(&watcher.watcher_id).cloned());
@@ -1095,455 +1110,17 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Concrete daemon-owned services for canonical, non-input actions.  Each
-/// success result follows a registry write, so a receipt can never claim that
-/// a wait, escalation, or stop was merely queued in memory.
-struct DaemonRuntimeServices {
-    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-    watcher_id: String,
-}
-
-impl DaemonRuntimeServices {
-    fn new(registry: std::sync::Arc<tokio::sync::Mutex<Registry>>, watcher_id: String) -> Self {
-        Self {
-            registry,
-            watcher_id,
-        }
-    }
-
-    fn with_registry<T>(
-        &self,
-        action: impl FnOnce(&mut Registry) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let mut registry = self.registry.blocking_lock();
-        action(&mut registry)
-    }
-}
-
-impl crate::recovery::actuator::RuntimeServices for DaemonRuntimeServices {
-    fn schedule(&self, deadline: &str) -> Result<(), String> {
-        let now = now_ms();
-        let until = parse_wait_deadline(deadline, now)?;
-        self.with_registry(|registry| {
-            let watcher = registry
-                .get(&self.watcher_id)
-                .ok_or_else(|| "unknown watcher for scheduled action".to_owned())?;
-            let mut schedule = watcher.observation_schedule.clone();
-            schedule.next_due_wall_ms = until;
-            schedule.event_wake_pending = false;
-            registry
-                .persist_observation_schedule(&self.watcher_id, schedule, now)
-                .map_err(|error| error.to_string())?;
-            registry
-                .transition(
-                    &self.watcher_id,
-                    WatcherLifecycle::Waiting {
-                        until_unix_ms: until,
-                        reason: "recovery wait scheduled".into(),
-                    },
-                    now,
-                )
-                .map_err(|error| error.to_string())
-        })
-    }
-
-    fn capture(&self, _: &str, _: u16) -> Result<String, String> {
-        Err("capture requires the target-bound multiplexer dispatcher".into())
-    }
-
-    fn check(&self, kind: &str, _: Option<&str>) -> Result<bool, String> {
-        if kind != "PROCESS_ALIVE" {
-            return Err("unsupported runtime status check".into());
-        }
-        let watcher = self.with_registry(|registry| {
-            registry
-                .get(&self.watcher_id)
-                .cloned()
-                .ok_or_else(|| "unknown watcher for status check".to_owned())
-        })?;
-        Ok(target_process_is_alive(&watcher.target))
-    }
-
-    fn notify(&self, _: &str, _: &str) -> Result<(), String> {
-        Err("notification requires a target adapter".into())
-    }
-
-    fn escalate(&self, level: &str) -> Result<(), String> {
-        if level != "human_required" {
-            return Err("planner escalation is not available in the daemon runtime".into());
-        }
-        self.with_registry(|registry| {
-            registry
-                .transition(
-                    &self.watcher_id,
-                    WatcherLifecycle::HumanRequired {
-                        reason: "recovery escalation requested".into(),
-                    },
-                    now_ms(),
-                )
-                .map_err(|error| error.to_string())
-        })
-    }
-
-    fn stop_watching(&self) -> Result<(), String> {
-        self.with_registry(|registry| {
-            registry
-                .transition(
-                    &self.watcher_id,
-                    WatcherLifecycle::Stopped {
-                        reason: "recovery action stopped watcher".into(),
-                    },
-                    now_ms(),
-                )
-                .map_err(|error| error.to_string())
-        })
-    }
-}
-
-fn parse_wait_deadline(deadline: &str, now: u64) -> Result<u64, String> {
-    if let Some(seconds) = deadline
-        .strip_prefix("monotonic+")
-        .and_then(|value| value.strip_suffix('s'))
-    {
-        let seconds = seconds
-            .parse::<u64>()
-            .map_err(|_| "invalid monotonic wait deadline")?;
-        return Ok(now.saturating_add(seconds.saturating_mul(1_000)));
-    }
-    let date = chrono::DateTime::parse_from_rfc3339(deadline)
-        .map_err(|_| "invalid wall-clock wait deadline")?;
-    let milliseconds =
-        u64::try_from(date.timestamp_millis()).map_err(|_| "wait deadline predates Unix epoch")?;
-    if milliseconds < now {
-        return Err("wait deadline is in the past".into());
-    }
-    Ok(milliseconds)
-}
-
-fn target_process_is_alive(target: &crate::model::TargetIdentity) -> bool {
-    let process = match target {
-        crate::model::TargetIdentity::Process { process }
-        | crate::model::TargetIdentity::Multiplexer { process, .. } => process,
-    };
-    #[cfg(target_os = "linux")]
-    let inspector = crate::process::linux::LinuxProcessInspector::default();
-    #[cfg(target_os = "macos")]
-    let inspector = crate::process::macos::MacOsProcessInspector::default();
-    inspector
-        .inspect(process.pid)
-        .ok()
-        .is_some_and(|actual| actual.start_time == process.start_time)
-}
-
-struct SystemRecoveryClock;
-
-static RECOVERY_CLOCK_ORIGIN: std::sync::LazyLock<std::time::Instant> =
-    std::sync::LazyLock::new(std::time::Instant::now);
-
-impl SystemRecoveryClock {
-    const fn new() -> Self {
-        Self
-    }
-}
-
-impl crate::recovery::transaction::Clock for SystemRecoveryClock {
-    fn monotonic_ms(&self) -> u64 {
-        RECOVERY_CLOCK_ORIGIN.elapsed().as_millis() as u64
-    }
-
-    fn wall_time_rfc3339(&self) -> String {
-        let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
-        now.to_rfc3339()
-    }
-
-    fn sleep_ms(&self, duration: u64) {
-        std::thread::sleep(Duration::from_millis(duration));
-    }
-}
-
-struct NoEvidence;
-impl crate::recovery::transaction::EvidenceReader for NoEvidence {
-    fn read(&self) -> Result<crate::recovery::transaction::LiveEvidence, String> {
-        Err("recovery scan has no live evidence".into())
-    }
-}
-
-struct NoExecutor;
-impl crate::recovery::actuator::ActionExecutor for NoExecutor {
-    fn execute(
-        &self,
-        _: &crate::model::Action,
-    ) -> Result<crate::recovery::actuator::ExecutionOutput, crate::recovery::actuator::ExecutionError>
-    {
-        Err(crate::recovery::actuator::ExecutionError::Unsafe(
-            "recovery scan cannot execute actions",
-        ))
-    }
-}
-
-struct DaemonOwnerProbe;
-impl crate::recovery::transaction::ProcessProbe for DaemonOwnerProbe {
-    fn matches(&self, owner: &crate::recovery::transaction::OwnerIdentity) -> bool {
-        #[cfg(target_os = "linux")]
-        let inspector = crate::process::linux::LinuxProcessInspector::default();
-        #[cfg(target_os = "macos")]
-        let inspector = crate::process::macos::MacOsProcessInspector::default();
-        inspector
-            .inspect(owner.pid)
-            .ok()
-            .is_some_and(|actual| actual.start_time == owner.process_start_time)
-    }
-}
-
-fn recover_durable_actions_after_restart(
-    engine: &crate::recovery::engine::RecoveryEngine<
-        crate::recovery::action_store::JsonActionStore,
-        crate::recovery::engine::BuiltinRecipes,
-    >,
-) {
-    let evidence = NoEvidence;
-    let executor = NoExecutor;
-    let clock = SystemRecoveryClock::new();
-    if let Ok(records) = engine.store().active_records() {
-        for record in records {
-            // Every pre-existing active record predates this daemon process.
-            // `recover_after_restart` keeps post-commit phases human-owned.
-            let _ = engine.recover_after_restart(&record.target, &evidence, &executor, &clock);
-        }
-    }
-}
-
-fn recover_stale_durable_actions(
-    engine: &crate::recovery::engine::RecoveryEngine<
-        crate::recovery::action_store::JsonActionStore,
-        crate::recovery::engine::BuiltinRecipes,
-    >,
-) {
-    let evidence = NoEvidence;
-    let executor = NoExecutor;
-    let clock = SystemRecoveryClock::new();
-    let probe = DaemonOwnerProbe;
-    if let Ok(records) = engine.store().active_records() {
-        for record in records {
-            let _ = engine.recover_stale(&record.target, &probe, &evidence, &executor, &clock);
-        }
-    }
-}
-
 /// A fresh, target-bound read used at every transaction revalidation point.
 /// It intentionally does not reuse a previous boolean: identity, process,
 /// mux state, composer state, and the persisted observation binding are all
 /// recomputed for every call.
-struct FreshTargetEvidence {
-    watcher: crate::model::WatcherState,
-}
-
-impl FreshTargetEvidence {
-    fn new(watcher: crate::model::WatcherState) -> Self {
-        Self { watcher }
-    }
-}
-
-impl crate::recovery::transaction::EvidenceReader for FreshTargetEvidence {
-    fn read(&self) -> Result<crate::recovery::transaction::LiveEvidence, String> {
-        let event = self
-            .watcher
-            .last_observation
-            .clone()
-            .ok_or_else(|| "missing current observation".to_owned())?;
-        let process_alive = target_process_is_alive(&self.watcher.target);
-        let (target_revalidated, pane_matches, identity, composer_safe) =
-            match watcher_mux_identity(&self.watcher) {
-                Ok(Some(identity)) => {
-                    let validated = validate_mux_target(&self.watcher, &identity).is_ok();
-                    let composer_safe = validated
-                        && crate::mux::ComposerSafety::observe(
-                            &RuntimeComposerSafety::new(self.watcher.clone()),
-                            &identity,
-                        )
-                        .is_ok_and(|state| state == crate::mux::ComposerState::Safe);
-                    (
-                        validated,
-                        validated,
-                        mux_identity_key(&identity),
-                        composer_safe,
-                    )
-                }
-                Ok(None) => (
-                    process_alive,
-                    true,
-                    process_identity_key(&self.watcher.target),
-                    false,
-                ),
-                Err(_) => (
-                    false,
-                    false,
-                    process_identity_key(&self.watcher.target),
-                    false,
-                ),
-            };
-        let evidence_current = event.watcher_id == self.watcher.watcher_id
-            && event.target_identity_hash == target_identity_hash(&self.watcher.target);
-        let human_intervened = matches!(
-            self.watcher.lifecycle,
-            WatcherLifecycle::HumanRequired { .. }
-        ) || event.category
-            == crate::model::EventCategory::HumanIntervention;
-        Ok(crate::recovery::transaction::LiveEvidence {
-            identity,
-            target_revalidated,
-            process_alive,
-            pane_matches,
-            evidence_current,
-            composer_safe,
-            human_intervened,
-            event,
-        })
-    }
-}
-
-struct RuntimeComposerSafety {
-    watcher: crate::model::WatcherState,
-}
-
-impl RuntimeComposerSafety {
-    fn new(watcher: crate::model::WatcherState) -> Self {
-        Self { watcher }
-    }
-}
-
-impl crate::mux::ComposerSafety for RuntimeComposerSafety {
-    fn observe(
-        &self,
-        identity: &crate::mux::MuxIdentity,
-    ) -> Result<crate::mux::ComposerState, crate::mux::MuxError> {
-        let capture = capture_mux_target(&self.watcher, identity, 3, 1_024)?;
-        let empty = capture
-            .text
-            .lines()
-            .next_back()
-            .is_none_or(|line| line.trim().is_empty());
-        Ok(if empty {
-            crate::mux::ComposerState::Safe
-        } else {
-            crate::mux::ComposerState::Unsafe
-        })
-    }
-}
-
-struct DaemonActionExecutor {
-    services: DaemonRuntimeServices,
-    watcher: crate::model::WatcherState,
-}
-
-impl DaemonActionExecutor {
-    fn new(
-        registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-        watcher: crate::model::WatcherState,
-    ) -> Self {
-        Self {
-            services: DaemonRuntimeServices::new(registry, watcher.watcher_id.clone()),
-            watcher,
-        }
-    }
-}
-
-impl crate::recovery::actuator::ActionExecutor for DaemonActionExecutor {
-    fn execute(
-        &self,
-        action: &crate::model::Action,
-    ) -> Result<crate::recovery::actuator::ExecutionOutput, crate::recovery::actuator::ExecutionError>
-    {
-        use crate::model::ActionKind;
-        match &action.kind {
-            ActionKind::SendText { .. }
-            | ActionKind::SendKeys { .. }
-            | ActionKind::Capture { .. } => execute_mux_action(&self.watcher, action),
-            ActionKind::Notify { severity, message } => {
-                notify_target(&self.watcher, severity, message)
-            }
-            _ => crate::recovery::actuator::RuntimeActuator::new(&self.services).execute(action),
-        }
-    }
-}
-
-fn execute_recovery_action(
-    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-    engine: std::sync::Arc<
-        crate::recovery::engine::RecoveryEngine<
-            crate::recovery::action_store::JsonActionStore,
-            crate::recovery::engine::BuiltinRecipes,
-        >,
-    >,
-    watcher: crate::model::WatcherState,
-    owner: crate::recovery::transaction::OwnerIdentity,
-) {
-    let Some(action) = engine.proposed_action(&watcher) else {
-        return;
-    };
-    let fingerprint = action
-        .preconditions
-        .iter()
-        .find(|condition| condition.kind == "EVIDENCE_FINGERPRINT_MATCHES")
-        .and_then(|condition| condition.value.as_ref())
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    if fingerprint.is_empty() {
-        return;
-    }
-    let clock = SystemRecoveryClock::new();
-    let current = {
-        let mut registry_guard = registry.blocking_lock();
-        let snapshot = crate::recovery::state_machine::ClockSnapshot::new(
-            crate::recovery::transaction::Clock::monotonic_ms(&clock) / 1_000,
-            {
-                let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
-                now.timestamp()
-            },
-        );
-        if crate::recovery::coordinator::RecoveryCoordinator::new(&mut registry_guard)
-            .begin_action(&watcher.watcher_id, &fingerprint, snapshot, now_ms())
-            .is_err()
-        {
-            return;
-        }
-        match registry_guard.get(&watcher.watcher_id).cloned() {
-            Some(current) => current,
-            None => return,
-        }
-    };
-    let evidence = FreshTargetEvidence::new(current.clone());
-    let executor = DaemonActionExecutor::new(registry.clone(), current.clone());
-    match engine.execute(&current, owner, &evidence, &executor, &clock) {
-        Ok(Some(record))
-            if record.phase == crate::recovery::transaction::ActionPhase::Succeeded =>
-        {
-            let mut registry_guard = registry.blocking_lock();
-            let _ = crate::recovery::coordinator::RecoveryCoordinator::new(&mut registry_guard)
-                .action_succeeded(&current.watcher_id, &fingerprint, now_ms());
-        }
-        Ok(_) => {}
-        Err(error) => {
-            let mut registry_guard = registry.blocking_lock();
-            let _ = registry_guard.transition(
-                &current.watcher_id,
-                WatcherLifecycle::HumanRequired {
-                    reason: format!("recovery action requires review: {error}"),
-                },
-                now_ms(),
-            );
-        }
-    }
-}
-
-fn target_identity_hash(target: &crate::model::TargetIdentity) -> String {
+pub(super) fn target_identity_hash(target: &crate::model::TargetIdentity) -> String {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(target).unwrap_or_default();
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn process_identity_key(target: &crate::model::TargetIdentity) -> String {
+pub(super) fn process_identity_key(target: &crate::model::TargetIdentity) -> String {
     match target {
         crate::model::TargetIdentity::Process { process }
         | crate::model::TargetIdentity::Multiplexer { process, .. } => {
@@ -1552,7 +1129,7 @@ fn process_identity_key(target: &crate::model::TargetIdentity) -> String {
     }
 }
 
-fn mux_identity_key(identity: &crate::mux::MuxIdentity) -> String {
+pub(super) fn mux_identity_key(identity: &crate::mux::MuxIdentity) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}:{}:{}",
         identity.provider,
@@ -1566,7 +1143,7 @@ fn mux_identity_key(identity: &crate::mux::MuxIdentity) -> String {
     )
 }
 
-fn watcher_mux_identity(
+pub(super) fn watcher_mux_identity(
     watcher: &crate::model::WatcherState,
 ) -> Result<Option<crate::mux::MuxIdentity>, crate::mux::MuxError> {
     let crate::model::TargetIdentity::Multiplexer {
@@ -1629,7 +1206,7 @@ fn watcher_mux_identity(
     Ok(Some(identity))
 }
 
-fn validate_mux_target(
+pub(super) fn validate_mux_target(
     watcher: &crate::model::WatcherState,
     identity: &crate::mux::MuxIdentity,
 ) -> Result<(), crate::mux::MuxError> {
@@ -1661,7 +1238,7 @@ fn validate_mux_target(
     }
 }
 
-fn capture_mux_target(
+pub(super) fn capture_mux_target(
     watcher: &crate::model::WatcherState,
     identity: &crate::mux::MuxIdentity,
     lines: usize,
@@ -1695,7 +1272,7 @@ fn capture_mux_target(
     }
 }
 
-fn execute_mux_action(
+pub(super) fn execute_mux_action(
     watcher: &crate::model::WatcherState,
     action: &crate::model::Action,
 ) -> Result<crate::recovery::actuator::ExecutionOutput, crate::recovery::actuator::ExecutionError> {
@@ -1743,55 +1320,6 @@ fn execute_mux_action(
             "missing concrete multiplexer context",
         )),
     }
-}
-
-fn notify_target(
-    watcher: &crate::model::WatcherState,
-    severity: &str,
-    message: &str,
-) -> Result<crate::recovery::actuator::ExecutionOutput, crate::recovery::actuator::ExecutionError> {
-    use crate::mux::Multiplexer;
-    let identity = watcher_mux_identity(watcher)
-        .map_err(|error| crate::recovery::actuator::ExecutionError::Integration(error.to_string()))?
-        .ok_or(crate::recovery::actuator::ExecutionError::Unsafe(
-            "notification requires a Herdr target",
-        ))?;
-    let Some(crate::model::MultiplexerContext::Herdr {
-        socket_path,
-        workspace_id,
-        tab_id,
-        pane_id,
-        ..
-    }) = watcher.target.observation_context()
-    else {
-        return Err(crate::recovery::actuator::ExecutionError::Unsafe(
-            "notification has no concrete target adapter",
-        ));
-    };
-    let herdr = crate::mux::herdr::Herdr::new(
-        crate::mux::herdr::HerdrContext {
-            socket_path: socket_path.clone(),
-            workspace_id: workspace_id.clone(),
-            tab_id: tab_id.clone(),
-            pane_id: pane_id.clone(),
-        },
-        Duration::from_secs(2),
-    )
-    .map_err(|error| crate::recovery::actuator::ExecutionError::Integration(error.to_string()))?;
-    herdr.validate_identity(&identity).map_err(|error| {
-        crate::recovery::actuator::ExecutionError::Integration(error.to_string())
-    })?;
-    if !herdr
-        .notify(&identity, severity, message)
-        .map_err(|error| {
-            crate::recovery::actuator::ExecutionError::PossibleSideEffect(error.to_string())
-        })?
-    {
-        return Err(crate::recovery::actuator::ExecutionError::Integration(
-            "Herdr did not confirm notification delivery".into(),
-        ));
-    }
-    Ok(crate::recovery::actuator::ExecutionOutput::Notified)
 }
 
 #[cfg(test)]
@@ -2136,5 +1664,82 @@ mod recovery_runtime_tests {
             registry.lock().await.get("waiter").unwrap().lifecycle,
             WatcherLifecycle::Waiting { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_observation_commit_never_begins_a_recovery_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = {
+            #[cfg(target_os = "linux")]
+            let inspector = crate::process::linux::LinuxProcessInspector::default();
+            #[cfg(target_os = "macos")]
+            let inspector = crate::process::macos::MacOsProcessInspector::default();
+            inspector.inspect(std::process::id()).unwrap().identity()
+        };
+        let mut watcher = WatcherState::new(
+            "store-failure".into(),
+            TargetIdentity::process(process),
+            WatcherLifecycle::Observing,
+            0,
+            now_ms(),
+        );
+        let mut recovery = RecoveryMachine::new(Budget {
+            max_attempts: 3,
+            max_cumulative_wait: Duration::from_secs(300),
+            planner_calls: 0,
+            cooldown: Duration::ZERO,
+        });
+        recovery
+            .apply(crate::recovery::state_machine::RecoveryCommand::Revalidated)
+            .unwrap();
+        recovery
+            .apply(crate::recovery::state_machine::RecoveryCommand::Confirm {
+                fingerprint: "a".repeat(64),
+            })
+            .unwrap();
+        watcher.recovery = Some(recovery);
+        watcher.last_observation = Some(
+            Event::new(
+                "stored-wait",
+                "2026-07-11T00:00:00Z",
+                "store-failure",
+                target_identity_hash(&watcher.target),
+                EventSource::new(SourceKind::StructuredLog, "test", "wait"),
+                EventCategory::WaitingForModel,
+                1.0,
+                false,
+                "a".repeat(64),
+                "wait allowed",
+                PolicyHint::WaitAllowed,
+            )
+            .unwrap(),
+        );
+        let mut persisted =
+            Registry::load(JsonStore::new(temp.path().join("watchers.json"))).unwrap();
+        persisted.register(watcher).unwrap();
+        persisted.fail_next_persist();
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(persisted));
+        let engine = std::sync::Arc::new(crate::recovery::engine::RecoveryEngine::new(
+            crate::recovery::action_store::JsonActionStore::load(temp.path().join("actions.json"))
+                .unwrap(),
+            crate::recovery::engine::BuiltinRecipes,
+        ));
+        let owner = crate::recovery::transaction::OwnerIdentity {
+            pid: std::process::id(),
+            process_start_time: current_process_start_time().unwrap(),
+            nonce: "test-owner".into(),
+        };
+
+        run_observation_loop(
+            registry,
+            std::sync::Arc::new(WaitObserver),
+            std::sync::Arc::new(SystemObservationClock::new()),
+            1,
+            Some(engine.clone()),
+            Some(owner),
+        )
+        .await;
+
+        assert!(engine.store().audit("store-failure").unwrap().is_empty());
     }
 }

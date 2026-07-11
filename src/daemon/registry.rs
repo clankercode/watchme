@@ -38,6 +38,8 @@ struct PersistedRegistry {
 pub struct Registry {
     store: JsonStore,
     watchers: BTreeMap<String, WatcherState>,
+    #[cfg(test)]
+    fail_next_persist: bool,
 }
 
 impl Registry {
@@ -96,7 +98,12 @@ impl Registry {
                 watchers: watchers.values().cloned().collect(),
             })?;
         }
-        Ok(Self { store, watchers })
+        Ok(Self {
+            store,
+            watchers,
+            #[cfg(test)]
+            fail_next_persist: false,
+        })
     }
 
     pub fn register(
@@ -155,6 +162,10 @@ impl Registry {
 
     pub fn get(&self, id: &str) -> Option<&WatcherState> {
         self.watchers.get(id)
+    }
+    #[cfg(test)]
+    pub fn fail_next_persist(&mut self) {
+        self.fail_next_persist = true;
     }
 
     pub fn retarget_process(
@@ -361,9 +372,19 @@ impl Registry {
     }
 
     fn persist_watchers(
-        &self,
+        &mut self,
         watchers: &BTreeMap<String, WatcherState>,
     ) -> Result<(), RegistryError> {
+        #[cfg(test)]
+        if self.fail_next_persist {
+            // Test-only injected durability failure at the exact registry write boundary.
+            // The state map is only replaced after a successful write, so this remains
+            // representative of an atomic-store failure.
+            self.fail_next_persist = false;
+            return Err(RegistryError::Corrupt(
+                "injected persistence failure".into(),
+            ));
+        }
         self.store.write(&PersistedRegistry {
             version: 1,
             watchers: watchers.values().cloned().collect(),
