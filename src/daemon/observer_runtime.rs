@@ -69,6 +69,20 @@ impl Observer for GenericObserver {
         watcher: crate::model::WatcherState,
     ) -> Pin<Box<dyn Future<Output = Result<ObservationResult, String>> + Send + 'a>> {
         Box::pin(async move {
+            let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+            if crate::agents::claude::resume_candidate_event(&watcher, now).is_some()
+                && tokio::task::spawn_blocking({
+                    let watcher = watcher.clone();
+                    move || crate::agents::claude::correlated_hook_event(&watcher).is_some()
+                })
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(ObservationResult {
+                    event: crate::agents::claude::resume_candidate_event(&watcher, now),
+                    herdr_after_sequence: None,
+                });
+            }
             if let Some(event) = tokio::task::spawn_blocking({
                 let watcher = watcher.clone();
                 move || crate::agents::claude::correlated_hook_event(&watcher)
@@ -270,6 +284,30 @@ fn generic_observe(watcher: &crate::model::WatcherState) -> Result<ObservationRe
         |descriptor| crate::observe::screen::trusted_tmux_screen(&clean, descriptor),
     );
     let actionable = live.actionable_bottom(40);
+    // A menu is an input-capable boundary only when two fresh trusted live
+    // captures agree exactly. Generic tails remain observation-only.
+    if let Some(first) = actionable.as_deref() {
+        let second_capture = tmux
+            .capture_tail(&identity, 80, 32 * 1024)
+            .map_err(|error| error.to_string())?;
+        let second_clean = crate::observe::screen::sanitize_terminal(
+            second_capture.text.as_bytes(),
+            32 * 1024,
+            80,
+        );
+        let second_live = chrome.as_ref().map_or_else(
+            || crate::observe::screen::LiveScreen::from_adapter(Vec::new(), None, false),
+            |descriptor| crate::observe::screen::trusted_tmux_screen(&second_clean, descriptor),
+        );
+        if let Some(second) = second_live.actionable_bottom(40)
+            && let Some(event) = crate::agents::claude::trusted_menu_event(watcher, first, &second)
+        {
+            return Ok(ObservationResult {
+                event: Some(event),
+                herdr_after_sequence: None,
+            });
+        }
+    }
     let fingerprint =
         crate::observe::evidence_fingerprint("screen_detection", "generic_tail", clean.as_bytes());
     let target_hash = format!(

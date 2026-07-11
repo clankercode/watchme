@@ -28,6 +28,10 @@ struct Cli {
 enum Command {
     #[command(hide = true)]
     WatchmeHookStopFailure(HookStopFailure),
+    Hooks {
+        #[command(subcommand)]
+        command: crate::hook_cli::HooksCommand,
+    },
     Status(IdAndJson),
     List(JsonOutput),
     Explain(OptionalId),
@@ -210,6 +214,7 @@ pub fn run() -> Result<(), CliFailure> {
         Some(Command::WatchmeHookStopFailure(options)) => {
             hook_stop_failure(options).map_err(Into::into)
         }
+        Some(Command::Hooks { command }) => hook_lifecycle(command).map_err(Into::into),
         Some(Command::Status(options)) => admin(Request::Status { id: options.id }, options.json),
         Some(Command::List(options)) => admin(Request::List, options.json),
         Some(Command::Stop(options)) if options.id.is_none() && !options.all => Err(CliFailure {
@@ -237,6 +242,63 @@ pub fn run() -> Result<(), CliFailure> {
         }) => admin(Request::Shutdown, false),
         Some(command) => Err(unavailable(command)),
     }
+}
+
+fn hook_lifecycle(command: crate::hook_cli::HooksCommand) -> Result<(), WatchmeError> {
+    let (options, install) = match command {
+        crate::hook_cli::HooksCommand::InstallClaude(options) => (options, true),
+        crate::hook_cli::HooksCommand::RemoveClaude(options) => (options, false),
+    };
+    let paths = runtime_paths().map_err(|failure| failure.error)?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| WatchmeError::Configuration("HOME is not set".into()))?;
+    let settings = options
+        .settings
+        .unwrap_or_else(|| home.join(".claude/settings.json"));
+    let marker = match options.marker {
+        Some(marker) => marker,
+        None => paths
+            .state_file("claude-stop-failure.jsonl")
+            .map_err(|error| WatchmeError::Configuration(error.to_string()))?,
+    };
+    if options.dry_run {
+        let command = watchme::hooks::claude::stop_failure_command(&marker)
+            .map_err(WatchmeError::Configuration)?;
+        println!(
+            "{} Claude hook\nsettings: {}\nmarker: {}\ncommand: {}",
+            if install {
+                "would install"
+            } else {
+                "would remove"
+            },
+            settings.display(),
+            marker.display(),
+            command
+        );
+        return Ok(());
+    }
+    if install {
+        paths
+            .create_owner_only()
+            .map_err(|error| WatchmeError::Configuration(error.to_string()))?;
+    }
+    let changed = if install {
+        watchme::hooks::claude::install_stop_failure_hook(&settings, &marker)
+    } else {
+        watchme::hooks::claude::remove_stop_failure_hook(&settings, &marker)
+    }
+    .map_err(WatchmeError::Configuration)?;
+    println!(
+        "Claude hook {}{}",
+        if install { "installed" } else { "removed" },
+        if changed {
+            ""
+        } else {
+            " (already in requested state)"
+        }
+    );
+    Ok(())
 }
 
 fn hook_stop_failure(options: HookStopFailure) -> Result<(), WatchmeError> {
@@ -495,7 +557,7 @@ impl RegistrationContextDetector for ProductionContextDetector {
                 0,
                 unix_time_ms(),
             );
-            attach_process_correlated_claude_session(&mut watcher);
+            crate::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
             return Ok(ResolvedRegistration { watcher });
         }
 
@@ -535,7 +597,7 @@ impl RegistrationContextDetector for ProductionContextDetector {
                 0,
                 unix_time_ms(),
             );
-            attach_process_correlated_claude_session(&mut watcher);
+            crate::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
             return Ok(ResolvedRegistration { watcher });
         }
         let watcher_id = format!(
@@ -549,54 +611,8 @@ impl RegistrationContextDetector for ProductionContextDetector {
             0,
             unix_time_ms(),
         );
-        attach_process_correlated_claude_session(&mut watcher);
+        crate::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
         Ok(ResolvedRegistration { watcher })
-    }
-}
-
-/// Claude's registration variables are accepted only when the durable
-/// transcript is open by the resolved agent process.  There is deliberately no
-/// directory/newest-file fallback: absent or malformed data merely disables
-/// hook recovery for this watcher.
-fn attach_process_correlated_claude_session(watcher: &mut watchme::model::WatcherState) {
-    let (Some(session_id), Some(transcript), Some(marker)) = (
-        std::env::var_os("CLAUDE_SESSION_ID"),
-        std::env::var_os("CLAUDE_TRANSCRIPT_PATH"),
-        std::env::var_os("WATCHME_CLAUDE_MARKER_PATH"),
-    ) else {
-        return;
-    };
-    let transcript = match std::fs::canonicalize(transcript) {
-        Ok(path) if path.is_file() => path,
-        _ => return,
-    };
-    let marker = PathBuf::from(marker);
-    if !marker.is_absolute() {
-        return;
-    }
-    let process = match &watcher.target {
-        watchme::model::TargetIdentity::Process { process }
-        | watchme::model::TargetIdentity::Multiplexer { process, .. } => process,
-    };
-    #[cfg(target_os = "linux")]
-    {
-        let fd_dir = format!("/proc/{}/fd", process.pid);
-        let opened = std::fs::read_dir(fd_dir).ok().is_some_and(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .any(|entry| std::fs::read_link(entry.path()).ok().as_ref() == Some(&transcript))
-        });
-        let cwd = std::fs::read_link(format!("/proc/{}/cwd", process.pid)).ok();
-        let (true, Some(cwd)) = (opened, cwd) else {
-            return;
-        };
-        let _ = watcher.set_claude_session(watchme::model::ClaudeSessionReference {
-            session_id: session_id.to_string_lossy().into(),
-            transcript_path: transcript.to_string_lossy().into(),
-            marker_path: marker.to_string_lossy().into(),
-            process_start_time: process.start_time,
-            process_cwd: cwd.to_string_lossy().into(),
-        });
     }
 }
 

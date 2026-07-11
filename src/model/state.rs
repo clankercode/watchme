@@ -31,6 +31,20 @@ pub struct ClaudeSessionReference {
     pub marker_path: String,
     pub process_start_time: u64,
     pub process_cwd: String,
+    /// Captured at registration. Legacy references without this proof remain
+    /// readable but are intentionally ineligible for hook recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_binding: Option<TranscriptBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptBinding {
+    pub device: u64,
+    pub inode: u64,
+    pub length: u64,
+    pub changed_at_ns: i128,
+    pub head_digest: String,
 }
 impl ObservationSchedule {
     fn is_default(&self) -> bool {

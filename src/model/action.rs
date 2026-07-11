@@ -229,6 +229,7 @@ fn valid_outcome(condition: &Condition) -> bool {
                 | "GOAL_ACTIVE_OR_PURSUING"
                 | "MENU_DISMISSED"
                 | "WAIT_STATE_RECORDED"
+                | "AGENT_STATE_IS"
                 | "PROCESS_TERMINATED"
                 | "HUMAN_NOTIFIED"
                 | "NO_STATE_CHANGE_EXPECTED"

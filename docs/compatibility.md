@@ -26,6 +26,18 @@ uninstall removes only its own tagged entry. Markers must be owner-owned,
 regular, bounded JSONL files. WatchMe never chooses a transcript merely
 because it is newest.
 
+Install or remove this optional integration explicitly with
+`watchme hooks install-claude` and `watchme hooks remove-claude`.
+`--dry-run` shows the resolved settings, marker, and escaped hook command
+without writing either file; `--settings` and `--marker` support an explicit
+owner-controlled location. Installation writes a fixed `watchme` command and
+strict POSIX-single-quotes the marker path, so paths with spaces or shell
+metacharacters remain literal data. Bare `watchme` remains registration only.
+On macOS, Claude hook attachment additionally requires its explicit session,
+transcript, marker, resolved agent PID/start-time, and canonical CWD
+environment correlation. If that proof is unavailable WatchMe simply does
+not enable hook recovery for that watcher.
+
 The terminal fallback is intentionally narrower than the installed UI:
 two identical, trusted live captures are required before it recognizes the
 semantic label `Stop and wait for limit to reset`. It sends only minimal
@@ -33,6 +45,12 @@ allowlisted cursor keys, then Enter, and never selects usage-credit, funding,
 upgrade, login, billing, or account actions. Claude's native retry UI always
 wins over WatchMe backoff. This support is fixture-tested, not a guarantee
 that every future Claude Code UI layout remains action-compatible.
+
+After a correlated reset wait is persisted, WatchMe waits through the parsed
+margin, rechecks the same target/session evidence, then sends its fixed
+resume text once through the normal durable action transaction. It verifies a
+fresh working state before recording success; intervention, changed identity,
+missing evidence, or an unparseable reset requires a human instead.
 
 ## Herdr
 

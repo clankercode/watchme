@@ -148,3 +148,26 @@ fn stop_failure_hook_mode_writes_only_a_valid_marker() {
             .contains("rate_limit_error")
     );
 }
+
+#[test]
+fn public_claude_hook_lifecycle_is_dry_run_safe_and_has_no_registration_alias() {
+    let temp = tempdir().unwrap();
+    let settings = temp.path().join("settings.json");
+    let marker = temp.path().join("watch me.jsonl");
+    Command::cargo_bin("watchme")
+        .unwrap()
+        .args([
+            "hooks",
+            "install-claude",
+            "--settings",
+            settings.to_str().unwrap(),
+            "--marker",
+            marker.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would install Claude hook"))
+        .stdout(predicate::str::contains("--marker '"));
+    assert!(!settings.exists());
+}

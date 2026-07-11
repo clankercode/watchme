@@ -192,12 +192,18 @@ pub const DEFAULT_RESUME: &str = "Continue exactly where you left off.";
 /// not evidence and therefore produce no action.
 pub fn correlated_hook_event(watcher: &WatcherState) -> Option<Event> {
     let reference = watcher.claude_session.as_ref()?;
+    let binding = reference.transcript_binding.as_ref()?;
     let process = match &watcher.target {
         crate::model::TargetIdentity::Process { process }
         | crate::model::TargetIdentity::Multiplexer { process, .. } => process,
     };
     if process.start_time != reference.process_start_time
         || !process_cwd_matches(process.pid, &reference.process_cwd)
+        || !crate::hooks::claude::transcript_matches_binding(
+            std::path::Path::new(&reference.transcript_path),
+            std::path::Path::new(&reference.transcript_path),
+            binding,
+        )
     {
         return None;
     }
@@ -263,7 +269,119 @@ pub fn correlated_hook_event(watcher: &WatcherState) -> Option<Event> {
             confidence: f64::from(reset.confidence_milli) / 1000.0,
             margin_seconds: Some(reset.margin_seconds),
         });
+        event.metadata.insert(
+            "claude_resume_margin_seconds".into(),
+            serde_json::Value::Number(reset.margin_seconds.into()),
+        );
     }
+    Some(event)
+}
+
+/// Creates a distinct, correlated resume candidate only after the persisted
+/// reset time and margin. It is deliberately not a terminal-menu heuristic:
+/// the action transaction still revalidates target, user intervention, and
+/// composer state before literal input can be sent.
+pub fn resume_candidate_event(
+    watcher: &WatcherState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Event> {
+    if !matches!(
+        watcher.lifecycle,
+        crate::model::WatcherLifecycle::Waiting { .. }
+    ) {
+        return None;
+    }
+    let previous = watcher.last_observation.as_ref()?;
+    if previous.source.kind != SourceKind::Hook
+        || previous.source.source_id != "claude_stop_failure"
+        || !matches!(
+            previous.category,
+            EventCategory::UsageLimit | EventCategory::SessionLimit | EventCategory::WeeklyLimit
+        )
+    {
+        return None;
+    }
+    let reset_text = previous.metadata.get("claude_reset_at")?.as_str()?;
+    let reset = chrono::DateTime::parse_from_rfc3339(reset_text)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let margin = previous
+        .metadata
+        .get("claude_resume_margin_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            previous
+                .reset
+                .as_ref()
+                .and_then(|reset| reset.margin_seconds)
+        })
+        .unwrap_or(30);
+    if now < reset + chrono::Duration::seconds(i64::try_from(margin).ok()?) {
+        return None;
+    }
+    let mut event = previous.clone();
+    event.event_id = format!("claude-resume-{}", watcher.watcher_id);
+    event.observed_at = now.to_rfc3339();
+    event.category = EventCategory::WaitingForModel;
+    event.terminal = false;
+    event.policy_hint = PolicyHint::DeterministicActionAllowed;
+    event.evidence_fingerprint = crate::observe::evidence_fingerprint(
+        "claude_resume",
+        &previous.evidence_fingerprint,
+        reset.to_rfc3339().as_bytes(),
+    );
+    event.summary = "Claude reset elapsed; resume revalidation candidate".into();
+    event
+        .metadata
+        .insert("claude_resume".into(), serde_json::Value::Bool(true));
+    event.metadata.insert(
+        "agent_state".into(),
+        serde_json::Value::String("WORKING".into()),
+    );
+    Some(event)
+}
+
+/// Converts two identical trusted live screen captures into a narrow menu
+/// event. Callers must provide only the adapter-defined live bottom; this
+/// parser never treats arbitrary terminal history as interactive chrome.
+pub fn trusted_menu_event(watcher: &WatcherState, first: &str, second: &str) -> Option<Event> {
+    let menu = labelled_wait_menu(first, second)?;
+    let category = classify_screen(first, second);
+    if !matches!(
+        category,
+        ClaudeClass::UsageLimit | ClaudeClass::SessionLimit | ClaudeClass::WeeklyLimit
+    ) {
+        return None;
+    }
+    let target_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&watcher.target).ok()?)
+    );
+    let observed: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+    let category = match category {
+        ClaudeClass::UsageLimit => EventCategory::UsageLimit,
+        ClaudeClass::SessionLimit => EventCategory::SessionLimit,
+        ClaudeClass::WeeklyLimit => EventCategory::WeeklyLimit,
+        _ => return None,
+    };
+    let mut event = Event::new(
+        format!("claude-menu-{}", watcher.watcher_id),
+        observed.to_rfc3339(),
+        watcher.watcher_id.clone(),
+        target_hash,
+        EventSource::new(SourceKind::ScreenDetection, "claude", "labelled_wait_menu"),
+        category,
+        0.7,
+        true,
+        crate::observe::evidence_fingerprint("claude_menu", "wait", first.as_bytes()),
+        "trusted Claude labelled wait menu",
+        PolicyHint::DeterministicActionAllowed,
+    )
+    .ok()?;
+    event.metadata.insert(
+        "claude_menu_moves".into(),
+        serde_json::Value::Number(i64::from(menu.moves).into()),
+    );
     Some(event)
 }
 
@@ -277,8 +395,15 @@ fn process_cwd_matches(pid: u32, expected: &str) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (pid, expected);
-        false
+        // macOS has no Linux /proc open-file proof. Registration instead binds
+        // the session to the resolved PID/start time and an injected canonical
+        // CWD; at observation time we can still reject a vanished or replaced
+        // owner-only CWD while the daemon's normal target revalidation checks
+        // process/multiplexer identity.
+        let _ = pid;
+        std::fs::canonicalize(expected)
+            .ok()
+            .is_some_and(|path| path.is_dir())
     }
 }
 
@@ -301,6 +426,18 @@ impl Default for ClaudeRecipes {
 impl RecipeProvider for ClaudeRecipes {
     fn action_for(&self, watcher: &WatcherState) -> Option<Action> {
         let event = watcher.last_observation.as_ref()?;
+        if event.source.kind == crate::model::SourceKind::ScreenDetection
+            && event.source.source_id == "claude"
+            && matches!(
+                event.category,
+                EventCategory::UsageLimit
+                    | EventCategory::SessionLimit
+                    | EventCategory::WeeklyLimit
+            )
+            && event.policy_hint == PolicyHint::DeterministicActionAllowed
+        {
+            return menu_action(event);
+        }
         if event.source.kind != crate::model::SourceKind::Hook
             || event.source.source_id != "claude_stop_failure"
         {
@@ -332,11 +469,55 @@ impl RecipeProvider for ClaudeRecipes {
     }
 }
 
+fn menu_action(event: &crate::model::Event) -> Option<Action> {
+    let moves = event
+        .metadata
+        .get("claude_menu_moves")?
+        .as_i64()
+        .and_then(|value| i8::try_from(value).ok())?;
+    let menu = WaitMenu { moves };
+    let mut action = Action::new(
+        "claude.select_wait_menu",
+        ActionKind::SendKeys {
+            keys: menu_keys(&menu).into_iter().map(str::to_owned).collect(),
+        },
+        "trusted stable Claude labelled wait menu",
+        event.evidence_fingerprint.clone(),
+        30,
+    );
+    action.preconditions.extend([
+        Condition {
+            kind: "PROCESS_ALIVE".into(),
+            value: None,
+        },
+        Condition {
+            kind: "NO_HUMAN_INTERVENTION".into(),
+            value: None,
+        },
+        Condition {
+            kind: "MENU_STABLE".into(),
+            value: None,
+        },
+    ]);
+    action.expected_outcomes = vec![Condition {
+        kind: "MENU_DISMISSED".into(),
+        value: None,
+    }];
+    Some(action)
+}
+
 fn wait_for_reset(event: &crate::model::Event) -> Option<Action> {
     let at = event.metadata.get("claude_reset_at")?.as_str()?;
+    let reset = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    let margin = event
+        .reset
+        .as_ref()
+        .and_then(|reset| reset.margin_seconds)
+        .unwrap_or(30);
+    let at = (reset + chrono::Duration::seconds(i64::try_from(margin).ok()?)).to_rfc3339();
     let mut action = Action::new(
         "claude.wait_for_reset",
-        ActionKind::WaitUntil { at: at.to_owned() },
+        ActionKind::WaitUntil { at },
         "correlated Claude reset time",
         event.evidence_fingerprint.clone(),
         30,

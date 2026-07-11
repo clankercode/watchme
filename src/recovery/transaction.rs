@@ -543,6 +543,7 @@ fn needs_progress_verification(kind: &ActionKind, outcomes: &[Condition]) -> boo
                     | "AGENT_IDLE"
                     | "BLOCK_CLEARED"
                     | "GOAL_ACTIVE_OR_PURSUING"
+                    | "AGENT_STATE_IS"
                     | "MENU_DISMISSED"
                     | "PROCESS_TERMINATED"
             )
@@ -576,6 +577,12 @@ fn policy_context(live: &LiveEvidence, recovery: &RecoveryContext, wall: String)
     context.planner_provider_family = recovery.planner_provider_family.clone();
     context.evidence_fingerprint = Some(live.event.evidence_fingerprint.clone());
     context.event_category = Some(format!("{:?}", live.event.category).to_ascii_uppercase());
+    context.agent_state = live
+        .event
+        .metadata
+        .get("agent_state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     context.wall_time_rfc3339 = Some(wall);
     context
 }
@@ -612,6 +619,13 @@ fn verified(before: &LiveEvidence, after: &LiveEvidence, outcomes: &[Condition])
         "AGENT_WORKING" | "GOAL_ACTIVE_OR_PURSUING" => {
             after.event.category == EventCategory::Working
         }
+        "AGENT_STATE_IS" => outcome
+            .value
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|state| {
+                state == "WORKING" && after.event.category == EventCategory::Working
+            }),
         "AGENT_IDLE" => after.event.category == EventCategory::Idle,
         "BLOCK_CLEARED" | "MENU_DISMISSED" => !after.event.category.is_actionable(),
         "PROCESS_TERMINATED" => after.event.category == EventCategory::Terminated,

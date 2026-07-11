@@ -50,7 +50,7 @@ impl EvidenceReader for FreshTargetEvidence {
             .ok_or_else(|| "missing current observation".to_owned())?;
         let target_and_lifecycle_are_stable = self.target_and_lifecycle_are_stable(&watcher);
         let process_alive = target_process_is_alive(&watcher.target);
-        let (target_revalidated, pane_matches, identity, composer_safe) =
+        let (target_revalidated, pane_matches, identity, mut composer_safe) =
             match watcher_mux_identity(&watcher) {
                 Ok(Some(identity)) => {
                     let validated = validate_mux_target(&watcher, &identity).is_ok();
@@ -73,6 +73,20 @@ impl EvidenceReader for FreshTargetEvidence {
                 ),
                 Err(_) => (false, false, process_identity_key(&watcher.target), false),
             };
+        // A stable, adapter-bounded Claude menu has no text composer to
+        // protect. The menu recipe still requires the persisted debounce and
+        // dispatches allowlisted symbolic keys only.
+        composer_safe |= event.source.kind == crate::model::SourceKind::ScreenDetection
+            && event.source.source_id == "claude"
+            && event
+                .metadata
+                .get("claude_menu_moves")
+                .is_some_and(|moves| {
+                    moves
+                        .as_i64()
+                        .and_then(|value| i8::try_from(value).ok())
+                        .is_some()
+                });
         let event_matches = event.watcher_id == watcher.watcher_id
             && event.target_identity_hash == target_identity_hash(&watcher.target);
         let human_intervened = !target_and_lifecycle_are_stable

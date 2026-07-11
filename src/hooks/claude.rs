@@ -17,13 +17,21 @@ pub struct HookMarker {
     pub detail: String,
 }
 
+/// Builds the only shell command WatchMe writes into Claude's hook settings.
+/// The executable is a fixed token; the user-controlled path is strictly
+/// POSIX single-quoted so whitespace and shell metacharacters remain data.
+pub fn stop_failure_command(marker: &Path) -> Result<String, String> {
+    validate_marker_path(marker)?;
+    Ok(format!(
+        "watchme watchme-hook-stop-failure --marker {}",
+        posix_single_quote(&marker.to_string_lossy())
+    ))
+}
+
 pub fn install_stop_failure_hook(settings: &Path, marker: &Path) -> Result<bool, String> {
     check_parent(settings)?;
+    let command = stop_failure_command(marker)?;
     let mut root = read_settings(settings)?;
-    let command = format!(
-        "watchme watchme-hook-stop-failure --marker {}",
-        marker.display()
-    );
     let hooks = root
         .as_object_mut()
         .ok_or("Claude settings root must be object")?
@@ -79,19 +87,82 @@ pub fn read_markers(path: &Path) -> Result<Vec<HookMarker>, String> {
         return Err("hook marker exceeds size limit".into());
     }
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut markers = Vec::new();
-    for line in BufReader::new(file).lines().take(256) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata().map_err(|e| e.to_string())?;
+        if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+            return Err("hook marker changed while opening".into());
+        }
+    }
+    // Keep only the newest bounded records. A long-lived marker file must not
+    // starve a current StopFailure behind an old 256-line prefix.
+    let mut lines = std::collections::VecDeque::with_capacity(256);
+    for line in BufReader::new(file).lines() {
         let line = line.map_err(|e| e.to_string())?;
         if line.len() > 8192 {
             continue;
         }
         if let Ok(marker) = serde_json::from_str::<HookMarker>(&line) {
             if valid_marker(&marker) {
-                markers.push(marker);
+                if lines.len() == 256 {
+                    lines.pop_front();
+                }
+                lines.push_back(marker);
             }
         }
     }
-    Ok(markers)
+    Ok(lines.into_iter().collect())
+}
+
+/// Revalidates the transcript immediately before accepting a marker. It is
+/// intentionally a strict canonical-path and owner-only check; replacing the
+/// path, following a link, or relaxing its permissions invalidates the
+/// reference rather than letting a hook event steer recovery.
+pub fn transcript_matches_reference(path: &Path, expected: &Path) -> bool {
+    std::fs::canonicalize(path)
+        .ok()
+        .as_deref()
+        .filter(|actual| *actual == expected)
+        .is_some_and(|actual| checked_file(actual, "Claude transcript", true).is_ok())
+}
+
+pub fn bind_transcript(path: &Path) -> Result<crate::model::TranscriptBinding, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = checked_file(path, "Claude transcript", true)?;
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let opened = file.metadata().map_err(|error| error.to_string())?;
+    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return Err("Claude transcript changed while opening".into());
+    }
+    let mut prefix = vec![0_u8; usize::try_from(metadata.len().min(4096)).unwrap_or(4096)];
+    use std::io::Read as _;
+    file.read_exact(&mut prefix)
+        .map_err(|error| error.to_string())?;
+    Ok(crate::model::TranscriptBinding {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        changed_at_ns: i128::from(metadata.ctime()) * 1_000_000_000
+            + i128::from(metadata.ctime_nsec()),
+        head_digest: sha256_hex(&prefix),
+    })
+}
+
+pub fn transcript_matches_binding(
+    path: &Path,
+    expected: &Path,
+    binding: &crate::model::TranscriptBinding,
+) -> bool {
+    if !transcript_matches_reference(path, expected) {
+        return false;
+    }
+    bind_transcript(path).is_ok_and(|current| current == *binding)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Append one bounded, strict marker without shell interpolation. O_APPEND
@@ -129,9 +200,27 @@ pub fn correlate_marker<'a>(
     session_id: &str,
     transcript: &Path,
 ) -> Option<&'a HookMarker> {
-    markers.iter().find(|marker| {
+    markers.iter().rev().find(|marker| {
         marker.session_id == session_id && Path::new(&marker.transcript_path) == transcript
     })
+}
+
+fn validate_marker_path(marker: &Path) -> Result<(), String> {
+    if !marker.is_absolute()
+        || marker.as_os_str().is_empty()
+        || marker
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+    {
+        return Err("hook marker path must be an absolute single-line path".into());
+    }
+    Ok(())
+}
+
+fn posix_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 fn valid_marker(marker: &HookMarker) -> bool {
     !marker.session_id.is_empty()

@@ -345,6 +345,14 @@ impl Registry {
                         .map_err(|reason| RegistryError::Corrupt(reason.into()))?;
                     watcher.lifecycle = WatcherLifecycle::Observing;
                 }
+                if matches!(watcher.lifecycle, WatcherLifecycle::Waiting { .. })
+                    && event.metadata.get("claude_resume") == Some(&serde_json::Value::Bool(true))
+                    && machine.state() == RecoveryState::Recovered
+                {
+                    machine
+                        .apply(RecoveryCommand::RearmAfterWait)
+                        .map_err(|reason| RegistryError::Corrupt(reason.into()))?;
+                }
                 let screen_is_stable = event.source.kind
                     != crate::model::SourceKind::ScreenDetection
                     || watcher.observation_schedule.screen_stable_count >= 2;

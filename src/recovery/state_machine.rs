@@ -45,6 +45,8 @@ pub enum RecoveryCommand {
     ActionSucceeded {
         fingerprint: String,
     },
+    /// A persisted wait completed and supplied fresh, distinct evidence.
+    RearmAfterWait,
     ReservePlanner,
 }
 impl RecoveryMachine {
@@ -61,6 +63,7 @@ impl RecoveryMachine {
                 clock,
             } => self.action_failed(&fingerprint, wait, clock),
             RecoveryCommand::ActionSucceeded { fingerprint } => self.action_succeeded(&fingerprint),
+            RecoveryCommand::RearmAfterWait => self.rearm_after_wait(),
             RecoveryCommand::ReservePlanner => self.reserve_planner_call(),
         }
     }
@@ -204,6 +207,13 @@ impl RecoveryMachine {
         self.completed.insert(fingerprint.into());
         Ok(())
     }
+    pub fn rearm_after_wait(&mut self) -> Result<(), &'static str> {
+        if self.state != RecoveryState::Recovered {
+            return Err("wait rearm requires a completed action");
+        }
+        self.current = None;
+        self.transition(RecoveryState::Observing)
+    }
     pub fn reserve_planner_call(&mut self) -> Result<(), &'static str> {
         if self.planner_calls >= self.budget.planner_calls {
             return Err("planner budget exhausted");
@@ -218,6 +228,7 @@ impl RecoveryMachine {
                 | (RecoveryState::Observing, RecoveryState::Confirmed)
                 | (RecoveryState::Confirmed, RecoveryState::Acting)
                 | (RecoveryState::Acting, RecoveryState::Waiting)
+                | (RecoveryState::Recovered, RecoveryState::Observing)
                 | (RecoveryState::Acting, RecoveryState::Verifying)
                 | (RecoveryState::Waiting, RecoveryState::Confirmed)
                 | (RecoveryState::Verifying, RecoveryState::Recovered)

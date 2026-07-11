@@ -1,10 +1,14 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 use chrono::{Datelike, FixedOffset, TimeZone, Timelike};
 use tempfile::tempdir;
 use watchme::agents::claude::{
     ClaudeClass, ClaudeRecipes, DEFAULT_RESUME, classify_screen, classify_stop_failure,
-    correlated_hook_event, labelled_wait_menu, menu_keys,
+    correlated_hook_event, labelled_wait_menu, menu_keys, resume_candidate_event,
+    trusted_menu_event,
 };
 use watchme::daemon::{GenericObserver, Observer};
 use watchme::hooks::claude::{
@@ -40,6 +44,33 @@ fn structured_failure_distinguishes_safe_and_unsafe_classes() {
         classify_stop_failure("overloaded_error", "retrying in 5s", true),
         ClaudeClass::NativeRetry
     );
+}
+
+#[test]
+fn resume_candidate_requires_wait_deadline_and_a_still_correlated_marker() {
+    let mut watcher = claude_watcher(EventCategory::UsageLimit, PolicyHint::WaitAllowed, true);
+    watcher.lifecycle = WatcherLifecycle::Waiting {
+        until_unix_ms: 1,
+        reason: "recovery wait scheduled".into(),
+    };
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let reset = "2026-07-11T00:00:00Z";
+    watcher.last_observation.as_mut().unwrap().metadata.insert(
+        "claude_reset_at".into(),
+        serde_json::Value::String(reset.into()),
+    );
+    watcher.last_observation.as_mut().unwrap().metadata.insert(
+        "claude_resume_margin_seconds".into(),
+        serde_json::Value::Number(0.into()),
+    );
+    let event = resume_candidate_event(&watcher, now).unwrap();
+    assert_eq!(event.category, EventCategory::WaitingForModel);
+    assert_eq!(event.metadata["claude_resume"], true);
+    assert_eq!(event.metadata["agent_state"], "WORKING");
+    watcher.lifecycle = WatcherLifecycle::Observing;
+    assert!(resume_candidate_event(&watcher, now).is_none());
 }
 
 #[test]
@@ -87,6 +118,26 @@ fn live_screen_menu_uses_label_never_option_number_and_requires_stability() {
 }
 
 #[test]
+fn trusted_menu_event_carries_only_symbolic_semantic_selection() {
+    let mut watcher = claude_watcher(EventCategory::Idle, PolicyHint::ObserveOnly, false);
+    let screen = "  1. Buy credits\n> 2. Stop and wait for limit to reset\n  3. Exit";
+    let event = trusted_menu_event(&watcher, screen, screen).unwrap();
+    assert_eq!(
+        event.source.kind,
+        watchme::model::SourceKind::ScreenDetection
+    );
+    assert_eq!(event.metadata["claude_menu_moves"], 0);
+    watcher.last_observation = Some(event);
+    let action = ClaudeRecipes::default().action_for(&watcher).unwrap();
+    assert_eq!(
+        action.kind,
+        ActionKind::SendKeys {
+            keys: vec!["ENTER".into()]
+        }
+    );
+}
+
+#[test]
 fn reset_parser_handles_relative_and_sydney_wall_clock_without_guessing_status_time() {
     let now = FixedOffset::east_opt(10 * 3600)
         .unwrap()
@@ -129,6 +180,18 @@ fn hook_merge_ingestion_and_remove_preserve_user_settings() {
             .unwrap()
             .contains("PreToolUse")
     );
+    let installed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    let command = installed["hooks"]["StopFailure"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        command,
+        format!(
+            "watchme watchme-hook-stop-failure --marker '{}'",
+            marker.display()
+        )
+    );
     fs::write(
         &marker,
         serde_json::to_string(&HookMarker {
@@ -153,6 +216,85 @@ fn hook_merge_ingestion_and_remove_preserve_user_settings() {
             .unwrap()
             .contains("PreToolUse")
     );
+}
+
+#[test]
+fn hook_command_uses_posix_quotes_for_metacharacter_paths() {
+    let marker = PathBuf::from("/tmp/watch me/'danger';$(nope).jsonl");
+    let command = watchme::hooks::claude::stop_failure_command(&marker).unwrap();
+    assert_eq!(
+        command,
+        "watchme watchme-hook-stop-failure --marker '/tmp/watch me/'\\''danger'\\'';$(nope).jsonl'"
+    );
+}
+
+#[test]
+fn marker_reader_prefers_the_newest_exact_marker_beyond_its_bounded_window() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let marker_path = temp.path().join("markers.jsonl");
+    for index in 0..300 {
+        write_marker(
+            &marker_path,
+            &HookMarker {
+                session_id: "session".into(),
+                transcript_path: "/tmp/transcript.jsonl".into(),
+                error_type: "overloaded_error".into(),
+                detail: format!("old-{index}"),
+            },
+        )
+        .unwrap();
+    }
+    write_marker(
+        &marker_path,
+        &HookMarker {
+            session_id: "session".into(),
+            transcript_path: "/tmp/transcript.jsonl".into(),
+            error_type: "rate_limit_error".into(),
+            detail: "newest".into(),
+        },
+    )
+    .unwrap();
+    let markers = read_markers(&marker_path).unwrap();
+    assert_eq!(markers.len(), 256);
+    assert_eq!(
+        correlate_marker(
+            &markers,
+            "session",
+            std::path::Path::new("/tmp/transcript.jsonl")
+        )
+        .unwrap()
+        .detail,
+        "newest"
+    );
+}
+
+#[test]
+fn transcript_binding_rejects_copytruncate_and_replacement() {
+    let temp = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let transcript = temp.path().join("session.jsonl");
+    fs::write(&transcript, "same-length-evidence\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    let binding = watchme::hooks::claude::bind_transcript(&transcript).unwrap();
+    fs::write(&transcript, "different-length-evidence\n").unwrap();
+    assert!(!watchme::hooks::claude::transcript_matches_binding(
+        &transcript,
+        &transcript,
+        &binding
+    ));
+    fs::remove_file(&transcript).unwrap();
+    fs::write(&transcript, "same-length-evidence\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!watchme::hooks::claude::transcript_matches_binding(
+        &transcript,
+        &transcript,
+        &binding
+    ));
 }
 
 #[test]
@@ -257,11 +399,15 @@ fn correlated_hook_marker_becomes_claude_event_only_for_the_registered_process_a
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
     let marker_path = temp.path().join("markers.jsonl");
+    let transcript = temp.path().join("session.jsonl");
+    fs::write(&transcript, "{}\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
     write_marker(
         &marker_path,
         &HookMarker {
             session_id: "session-1".into(),
-            transcript_path: "/safe/a.jsonl".into(),
+            transcript_path: transcript.to_string_lossy().into(),
             error_type: "rate_limit_error".into(),
             detail: "resets in 10 minutes".into(),
         },
@@ -277,10 +423,11 @@ fn correlated_hook_marker_becomes_claude_event_only_for_the_registered_process_a
     watcher
         .set_claude_session(ClaudeSessionReference {
             session_id: "session-1".into(),
-            transcript_path: "/safe/a.jsonl".into(),
+            transcript_path: transcript.to_string_lossy().into(),
             marker_path: marker_path.to_string_lossy().into(),
             process_start_time: 2,
             process_cwd: std::env::current_dir().unwrap().to_string_lossy().into(),
+            transcript_binding: Some(watchme::hooks::claude::bind_transcript(&transcript).unwrap()),
         })
         .unwrap();
     let event = correlated_hook_event(&watcher).expect("exact correlated marker");
@@ -300,11 +447,15 @@ async fn daemon_observer_prioritizes_a_correlated_claude_hook_over_generic_liven
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
     let marker_path = temp.path().join("markers.jsonl");
+    let transcript = temp.path().join("session.jsonl");
+    fs::write(&transcript, "{}\n").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
     write_marker(
         &marker_path,
         &HookMarker {
             session_id: "session-1".into(),
-            transcript_path: "/safe/a.jsonl".into(),
+            transcript_path: transcript.to_string_lossy().into(),
             error_type: "rate_limit_error".into(),
             detail: "resets in 10 minutes".into(),
         },
@@ -320,10 +471,11 @@ async fn daemon_observer_prioritizes_a_correlated_claude_hook_over_generic_liven
     watcher
         .set_claude_session(ClaudeSessionReference {
             session_id: "session-1".into(),
-            transcript_path: "/safe/a.jsonl".into(),
+            transcript_path: transcript.to_string_lossy().into(),
             marker_path: marker_path.to_string_lossy().into(),
             process_start_time: 7,
             process_cwd: std::env::current_dir().unwrap().to_string_lossy().into(),
+            transcript_binding: Some(watchme::hooks::claude::bind_transcript(&transcript).unwrap()),
         })
         .unwrap();
     let result = GenericObserver.observe(watcher).await.unwrap();

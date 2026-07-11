@@ -1,5 +1,7 @@
+mod claude_attachment;
 mod cli;
 mod error;
+mod hook_cli;
 
 use std::process::ExitCode;
 
