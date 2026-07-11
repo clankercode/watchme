@@ -102,6 +102,57 @@ fn jsonl_reader_detects_same_inode_copy_truncate_and_regrow() {
 }
 
 #[test]
+fn jsonl_generation_guard_detects_rewrite_that_preserves_consumed_tail() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("events.jsonl");
+    let old_prefix = format!("{{\"old\":\"{}\"}}\n", "a".repeat(12_000));
+    let preserved_tail = format!("{{\"tail\":\"{}\"}}\n", "t".repeat(5_000));
+    fs::write(&path, format!("{old_prefix}{preserved_tail}")).unwrap();
+    let mut cursor = JsonlCursor::new(
+        path.clone(),
+        ReadLimits {
+            max_read_bytes: 64 * 1024,
+            max_record_bytes: 32 * 1024,
+            max_records: 8,
+        },
+    );
+    assert_eq!(cursor.read_new().unwrap().records.len(), 2);
+
+    let replacement_prefix = format!("{{\"new\":\"{}\"}}\n", "b".repeat(12_000));
+    let replacement = format!("{replacement_prefix}{preserved_tail}");
+    assert_eq!(replacement.len(), old_prefix.len() + preserved_tail.len());
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap()
+        .write_all(replacement.as_bytes())
+        .unwrap();
+
+    let batch = cursor.read_new().unwrap();
+    assert_eq!(batch.records.len(), 2);
+    assert!(batch.records[0].get("new").is_some());
+}
+
+#[test]
+fn jsonl_generation_guard_does_not_reset_on_ordinary_append() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("events.jsonl");
+    fs::write(&path, b"{\"n\":1}\n").unwrap();
+    let mut cursor = JsonlCursor::new(path.clone(), ReadLimits::default());
+    assert_eq!(cursor.read_new().unwrap().records[0]["n"], 1);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"{\"n\":2}\n")
+        .unwrap();
+    let batch = cursor.read_new().unwrap();
+    assert_eq!(batch.records.len(), 1);
+    assert_eq!(batch.records[0]["n"], 2);
+}
+
+#[test]
 fn sanitizer_strips_terminal_protocol_and_bounds_output() {
     let hostile =
         b"ok\x1b[31mred\x1b[0m\x1b]52;c;SECRET\x07\x1bPpayload\x1b\\\r\n\xe2\x80\xaeevil\0end";
@@ -281,6 +332,50 @@ fn alternate_planner_escalation_requires_independent_provider_and_planner_budget
     context.planner_provider_family = Some("provider-b".into());
     context.planner_calls_remaining = 0;
     assert!(CompiledPolicy.authorize(&action, &context).is_err());
+}
+
+#[test]
+fn independent_second_opinion_requires_two_calls_and_every_safe_context_gate() {
+    let action = Action::new(
+        "second-opinion",
+        ActionKind::Escalate {
+            level: "independent_second_opinion".into(),
+        },
+        "independent review",
+        "fp",
+        30,
+    );
+    let mut safe = PolicyContext::safe();
+    safe.evidence_fingerprint = Some("fp".into());
+    safe.failed_provider_family = Some("provider-a".into());
+    safe.planner_provider_family = Some("provider-b".into());
+    safe.planner_calls_remaining = 2;
+    assert!(CompiledPolicy.authorize(&action, &safe).is_ok());
+
+    for mutate in [
+        |context: &mut PolicyContext| context.planner_calls_remaining = 1,
+        |context: &mut PolicyContext| context.planner_provider_family = None,
+        |context: &mut PolicyContext| context.failed_provider_family = None,
+        |context: &mut PolicyContext| context.planner_provider_family = Some("provider-a".into()),
+        |context: &mut PolicyContext| context.evidence_current = false,
+        |context: &mut PolicyContext| context.evidence_fingerprint = Some("stale".into()),
+        |context: &mut PolicyContext| context.target_revalidated = false,
+        |context: &mut PolicyContext| context.process_alive = false,
+        |context: &mut PolicyContext| context.pane_matches = false,
+        |context: &mut PolicyContext| context.human_intervened = true,
+        |context: &mut PolicyContext| context.composer_empty = false,
+        |context: &mut PolicyContext| context.cooldown_ready = false,
+        |context: &mut PolicyContext| context.attempts_remaining = 0,
+        |context: &mut PolicyContext| context.planner_concurrency_available = false,
+        |context: &mut PolicyContext| {
+            context.source_rank = 0;
+            context.contradictory_source_rank = Some(1);
+        },
+    ] {
+        let mut denied = safe.clone();
+        mutate(&mut denied);
+        assert!(CompiledPolicy.authorize(&action, &denied).is_err());
+    }
 }
 
 #[test]

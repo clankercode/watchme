@@ -14,6 +14,7 @@ pub struct PolicyContext {
     pub attempts_remaining: u32,
     pub cumulative_wait_remaining_seconds: u64,
     pub planner_calls_remaining: u32,
+    pub planner_concurrency_available: bool,
     pub cooldown_ready: bool,
     pub session_id: Option<String>,
     pub evidence_fingerprint: Option<String>,
@@ -39,6 +40,7 @@ impl PolicyContext {
             attempts_remaining: 1,
             cumulative_wait_remaining_seconds: 86_400,
             planner_calls_remaining: 1,
+            planner_concurrency_available: true,
             cooldown_ready: true,
             session_id: None,
             evidence_fingerprint: None,
@@ -91,6 +93,13 @@ impl CompiledPolicy {
         {
             return Err("planner budget denied");
         }
+        if matches!(action.kind, ActionKind::Escalate { ref level } if level == "independent_second_opinion")
+            && (context.planner_calls_remaining < 2
+                || !context.planner_concurrency_available
+                || !context.composer_empty)
+        {
+            return Err("independent second opinion budget denied");
+        }
         if !action
             .preconditions
             .iter()
@@ -114,6 +123,7 @@ impl CompiledPolicy {
             | ActionKind::Noop => Ok(()),
             ActionKind::Escalate { level } if level == "human_required" => Ok(()),
             ActionKind::Escalate { level } if level == "alternate_planner" => Ok(()),
+            ActionKind::Escalate { level } if level == "independent_second_opinion" => Ok(()),
             ActionKind::SendKeys { keys }
                 if context.composer_empty
                     && keys.iter().all(|k| {
