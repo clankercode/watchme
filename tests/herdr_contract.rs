@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -6,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use watchme::mux::herdr::{Herdr, HerdrContext};
+use watchme::mux::herdr::{Herdr, HerdrContext, SocketMetadata};
 use watchme::mux::{
     ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, SymbolicKey,
 };
@@ -32,6 +33,7 @@ fn response(request: &Value, result: Value) -> Value {
         "schema_version": 1,
         "protocol": PROTOCOL,
         "request_id": request["request_id"],
+        "method": request["method"],
         "ok": true,
         "result": result
     })
@@ -147,6 +149,11 @@ fn inherited_context_metadata_reads_and_auxiliary_contract_are_schema_faithful()
             .iter()
             .all(|request| request["schema_version"] == 1 && request["protocol"] == PROTOCOL)
     );
+    let request_ids: std::collections::HashSet<_> = requests
+        .iter()
+        .map(|request| request["request_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(request_ids.len(), requests.len());
     let read = requests
         .iter()
         .find(|request| request["method"] == "pane_read")
@@ -214,13 +221,21 @@ fn malformed_mismatched_timeout_oversize_and_replaced_identity_fail_closed() {
             reply["request_id"] = json!("wrong");
             Some(reply)
         }),
-        Box::new(|_| None),
+        Box::new(|_| {
+            thread::sleep(Duration::from_millis(160));
+            None
+        }),
         Box::new(|request| Some(response(&request, json!({"blob":"x".repeat(300_000)})))),
     ];
     for handler in cases {
         let (_directory, socket, _) = spawn_fake(move |request, _| handler(request));
         let herdr = Herdr::new(context(socket), Duration::from_millis(40)).unwrap();
-        assert!(herdr.current_target().is_err());
+        let started = std::time::Instant::now();
+        let error = herdr.current_target().unwrap_err();
+        if matches!(error, MuxError::Timeout) {
+            assert!(started.elapsed() >= Duration::from_millis(35));
+            assert!(started.elapsed() < Duration::from_millis(120));
+        }
     }
     let (_directory, socket, _) = spawn_fake(move |request, index| {
         Some(response(
@@ -284,4 +299,127 @@ fn context_rejects_partial_or_unsafe_environment() {
         ))
         .is_err()
     );
+}
+
+#[test]
+fn response_envelope_rejects_wrong_schema_protocol_and_method() {
+    let pid = std::process::id();
+    for field in ["schema_version", "protocol", "method"] {
+        let (_directory, socket, _) = spawn_fake(move |request, _| {
+            let mut reply = response(&request, pane_result(pid, 77));
+            reply[field] = match field {
+                "schema_version" => json!(2),
+                "protocol" => json!("other"),
+                _ => json!("process_info"),
+            };
+            Some(reply)
+        });
+        let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+        assert!(matches!(herdr.current_target(), Err(MuxError::Protocol(_))));
+    }
+}
+
+#[test]
+fn drip_feed_cannot_extend_the_end_to_end_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("drip.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(connection.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        for byte in b"{\"schema_version\":" {
+            if connection.write_all(&[*byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+    });
+    let herdr = Herdr::new(
+        context(path.to_string_lossy().into_owned()),
+        Duration::from_millis(55),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(herdr.current_target(), Err(MuxError::Timeout)));
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    assert!(started.elapsed() < Duration::from_millis(140));
+}
+
+#[test]
+fn socket_policy_rejects_aliases_types_owners_and_writable_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("real.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    assert!(
+        Herdr::new(
+            context(socket.to_string_lossy().into_owned()),
+            Duration::from_millis(50)
+        )
+        .is_ok()
+    );
+    let file = directory.path().join("file");
+    std::fs::write(&file, b"not socket").unwrap();
+    assert!(matches!(
+        Herdr::new(
+            context(file.to_string_lossy().into_owned()),
+            Duration::from_millis(50)
+        ),
+        Err(MuxError::UnsafeSocket(_))
+    ));
+    let alias = directory.path().join("alias.sock");
+    symlink(&socket, &alias).unwrap();
+    assert!(matches!(
+        Herdr::new(
+            context(alias.to_string_lossy().into_owned()),
+            Duration::from_millis(50)
+        ),
+        Err(MuxError::UnsafeSocket(_))
+    ));
+    let real_parent = directory.path().join("real-parent");
+    std::fs::create_dir(&real_parent).unwrap();
+    let nested = real_parent.join("nested.sock");
+    let _nested_listener = UnixListener::bind(&nested).unwrap();
+    let parent_alias = directory.path().join("parent-alias");
+    symlink(&real_parent, &parent_alias).unwrap();
+    assert!(matches!(
+        Herdr::new(
+            context(
+                parent_alias
+                    .join("nested.sock")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            Duration::from_millis(50)
+        ),
+        Err(MuxError::UnsafeSocket(_))
+    ));
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o622)).unwrap();
+    assert!(matches!(
+        Herdr::new(
+            context(socket.to_string_lossy().into_owned()),
+            Duration::from_millis(50)
+        ),
+        Err(MuxError::UnsafeSocket(_))
+    ));
+    assert!(
+        SocketMetadata {
+            uid: u32::MAX,
+            mode: 0o600,
+            is_socket: true
+        }
+        .validate_for_uid(1000)
+        .is_err()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn synchronous_adapter_is_safe_inside_daemon_runtime() {
+    let pid = std::process::id();
+    let (_directory, socket, _) =
+        spawn_fake(move |request, _| Some(response(&request, pane_result(pid, 77))));
+    let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+    assert_eq!(herdr.current_target().unwrap().process.pid, pid);
 }

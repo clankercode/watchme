@@ -1,12 +1,11 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{
     Capture, ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, PaneInfo,
@@ -56,6 +55,32 @@ pub struct Herdr {
     next_request: std::sync::Arc<AtomicU64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SocketMetadata {
+    pub uid: u32,
+    pub mode: u32,
+    pub is_socket: bool,
+}
+
+impl SocketMetadata {
+    pub fn validate_for_uid(self, expected_uid: u32) -> Result<(), MuxError> {
+        if !self.is_socket {
+            return Err(MuxError::UnsafeSocket("path is not a Unix socket".into()));
+        }
+        if self.uid != expected_uid {
+            return Err(MuxError::UnsafeSocket(
+                "socket is not owned by the current user".into(),
+            ));
+        }
+        if self.mode & 0o022 != 0 {
+            return Err(MuxError::UnsafeSocket(
+                "socket is writable by group or others".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSession {
@@ -93,6 +118,7 @@ struct Response<T> {
     schema_version: u16,
     protocol: String,
     request_id: String,
+    method: String,
     ok: bool,
     result: Option<T>,
     error: Option<String>,
@@ -274,7 +300,8 @@ impl Herdr {
         method: &str,
         params: P,
     ) -> Result<T, MuxError> {
-        validate_socket(Path::new(&self.context.socket_path))?;
+        let started = Instant::now();
+        let socket_identity = validate_socket(Path::new(&self.context.socket_path))?;
         let request_id = format!(
             "watchme-{}-{}",
             std::process::id(),
@@ -293,20 +320,46 @@ impl Herdr {
             return Err(MuxError::Protocol("request exceeds byte limit".into()));
         }
         encoded.push(b'\n');
-        let mut stream = UnixStream::connect(&self.context.socket_path)
-            .map_err(|error| MuxError::Command(error.to_string()))?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .map_err(|error| MuxError::Command(error.to_string()))?;
-        stream
-            .set_write_timeout(Some(self.timeout))
-            .map_err(|error| MuxError::Command(error.to_string()))?;
-        stream.write_all(&encoded).map_err(map_io)?;
-        let mut bytes = Vec::new();
-        BufReader::new(stream)
-            .take((MAX_RESPONSE_BYTES + 1) as u64)
-            .read_until(b'\n', &mut bytes)
-            .map_err(map_io)?;
+        let deadline = started.checked_add(self.timeout).ok_or(MuxError::Timeout)?;
+        let socket_path = self.context.socket_path.clone();
+        let transport = move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .map_err(|error| MuxError::Command(error.to_string()))?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(MuxError::Timeout)?;
+            runtime
+                .block_on(async move {
+                    tokio::time::timeout(remaining, async move {
+                        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+                            .await
+                            .map_err(map_io)?;
+                        verify_connected_socket(&stream, Path::new(&socket_path), socket_identity)?;
+                        stream.write_all(&encoded).await.map_err(map_io)?;
+                        let mut bytes = Vec::new();
+                        loop {
+                            let byte = stream.read_u8().await.map_err(map_io)?;
+                            bytes.push(byte);
+                            if bytes.len() > MAX_RESPONSE_BYTES || byte == b'\n' {
+                                break;
+                            }
+                        }
+                        Ok::<_, MuxError>(bytes)
+                    })
+                    .await
+                })
+                .map_err(|_| MuxError::Timeout)?
+        };
+        let bytes = if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(transport)
+                .join()
+                .map_err(|_| MuxError::Command("Herdr transport thread panicked".into()))??
+        } else {
+            transport()?
+        };
         if bytes.len() > MAX_RESPONSE_BYTES {
             return Err(MuxError::Protocol("response exceeds byte limit".into()));
         }
@@ -317,9 +370,13 @@ impl Herdr {
         }
         let response: Response<T> = serde_json::from_slice(&bytes)
             .map_err(|error| MuxError::Protocol(format!("malformed response: {error}")))?;
+        if started.elapsed() >= self.timeout {
+            return Err(MuxError::Timeout);
+        }
         if response.schema_version != HERDR_SCHEMA_VERSION
             || response.protocol != HERDR_PROTOCOL
             || response.request_id != request_id
+            || response.method != method
         {
             return Err(MuxError::Protocol(
                 "response contract or request ID mismatch".into(),
@@ -549,7 +606,13 @@ fn map_io(error: std::io::Error) -> MuxError {
     }
 }
 
-fn validate_socket(path: &Path) -> Result<(), MuxError> {
+#[derive(Clone, Copy)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn validate_socket(path: &Path) -> Result<SocketIdentity, MuxError> {
     if !path.is_absolute() {
         return Err(MuxError::UnsafeSocket("path is not absolute".into()));
     }
@@ -562,18 +625,39 @@ fn validate_socket(path: &Path) -> Result<(), MuxError> {
     }
     let metadata =
         fs::symlink_metadata(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
-    if !metadata.file_type().is_socket() {
-        return Err(MuxError::UnsafeSocket("path is not a Unix socket".into()));
+    SocketMetadata {
+        uid: metadata.uid(),
+        mode: metadata.mode(),
+        is_socket: metadata.file_type().is_socket(),
     }
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
+    .validate_for_uid(rustix::process::geteuid().as_raw())?;
+    Ok(SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn verify_connected_socket(
+    stream: &tokio::net::UnixStream,
+    path: &Path,
+    expected: SocketIdentity,
+) -> Result<(), MuxError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
+    if metadata.dev() != expected.device || metadata.ino() != expected.inode {
         return Err(MuxError::UnsafeSocket(
-            "socket is not owned by the current user".into(),
+            "socket identity changed while connecting".into(),
         ));
     }
-    if metadata.mode() & 0o022 != 0 {
-        return Err(MuxError::UnsafeSocket(
-            "socket is writable by group or others".into(),
-        ));
+    #[cfg(target_os = "linux")]
+    {
+        let credentials = rustix::net::sockopt::socket_peercred(stream)
+            .map_err(|error| MuxError::UnsafeSocket(error.to_string()))?;
+        if credentials.uid != rustix::process::geteuid() {
+            return Err(MuxError::UnsafeSocket(
+                "connected Herdr peer has a different UID".into(),
+            ));
+        }
     }
     Ok(())
 }
