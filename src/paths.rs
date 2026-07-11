@@ -122,7 +122,7 @@ fn runtime_fallback() -> PathBuf {
 ///
 /// Used so managed paths do not retain intermediate symlink components (e.g. `/var`
 /// on macOS) that `O_NOFOLLOW` directory walks cannot traverse.
-fn physicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn physicalize_existing_prefix(path: &Path) -> io::Result<PathBuf> {
     require_absolute_clean(path)?;
     let mut existing = path.to_path_buf();
     let mut missing = Vec::new();

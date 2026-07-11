@@ -1,3 +1,10 @@
+## 0.1.8 — 2026-07-12
+
+### Fixed
+
+- Physicalize JsonStore parent paths before `O_NOFOLLOW` walks so macOS tempfile paths under `/var` (symlink to `/private/var`) no longer fail with ENOTDIR.
+- Skip live tmux recovery unit tests when host tmux cannot emit the 16-field adapter metadata format (common on CI); install tmux on Linux CI runners.
+
 ## 0.1.7 — 2026-07-12
 
 ### Fixed

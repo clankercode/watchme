@@ -214,6 +214,9 @@ impl TrustedParent {
         let parent_path = path
             .parent()
             .ok_or_else(|| StoreError::UnsafePath("state path has no parent".into()))?;
+        // Physicalize so O_NOFOLLOW walks can traverse hosts where ancestors are
+        // symlinks (notably macOS `/var` → `/private/var` under tempdirs).
+        let parent_path = crate::paths::physicalize_existing_prefix(parent_path)?;
         let mut fd = rx(rustix::fs::open("/", DIRECTORY_FLAGS, Mode::empty()))?;
         for component in parent_path.components() {
             match component {
@@ -229,10 +232,10 @@ impl TrustedParent {
                 _ => return Err(StoreError::UnsafePath(parent_path.display().to_string())),
             }
         }
-        verify_directory(&fd, parent_path)?;
+        verify_directory(&fd, &parent_path)?;
         Ok(Self {
             fd,
-            path: parent_path.to_path_buf(),
+            path: parent_path,
             name,
         })
     }
@@ -406,5 +409,29 @@ mod tests {
             .unwrap();
         assert!(anchored.join("state.json").is_file());
         assert!(!victim.join("state.json").exists());
+    }
+
+    #[test]
+    fn write_succeeds_when_parent_path_contains_symlink_ancestor() {
+        // Simulates macOS `/var` → `/private/var` under tempfile paths: TrustedParent
+        // must physicalize existing ancestors before its O_NOFOLLOW directory walk.
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let linked = temp.path().join("linked");
+        symlink(&real, &linked).unwrap();
+        let path = linked.join("state.json");
+        let store = JsonStore::new(path);
+        store.write(&serde_json::json!({"ok": true})).unwrap();
+        assert!(real.join("state.json").is_file());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(real.join("state.json")).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({"ok": true})
+        );
     }
 }

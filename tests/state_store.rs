@@ -485,15 +485,15 @@ fn store_rejects_directory_and_fifo_leaves_without_blocking() {
 }
 
 #[test]
-fn managed_paths_and_store_reject_symlinked_ancestors() {
+fn managed_paths_and_store_physicalize_symlinked_ancestors() {
     let temp = TempDir::new().unwrap();
     let real = temp.path().join("real");
     fs::create_dir(&real).unwrap();
     let linked = temp.path().join("linked");
     symlink(&real, &linked).unwrap();
 
-    // resolve() physicalizes symlink prefixes, so create_owner_only succeeds on the
-    // canonical path. JsonStore still refuses unresolved symlink ancestors.
+    // resolve() and JsonStore both physicalize symlink prefixes so O_NOFOLLOW walks
+    // succeed (e.g. macOS `/var` → `/private/var`). Leaf symlink rejection remains.
     let paths = WatchmePaths::resolve(&linked, None, None, None).unwrap();
     paths.create_owner_only().unwrap();
     assert!(
@@ -503,5 +503,6 @@ fn managed_paths_and_store_reject_symlinked_ancestors() {
     );
 
     let nested = linked.join("state.json");
-    assert!(JsonStore::new(nested).write(&state()).is_err());
+    JsonStore::new(nested).write(&state()).unwrap();
+    assert!(real.join("state.json").is_file());
 }

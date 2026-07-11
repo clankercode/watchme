@@ -53,6 +53,9 @@ jobs:
         run: rustup toolchain install 1.88 --profile minimal
       - name: Select Rust toolchain
         run: rustup default 1.88
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Run tests
         run: cargo test --all-features --locked
       - name: Build release binary
