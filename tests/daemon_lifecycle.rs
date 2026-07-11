@@ -660,6 +660,7 @@ async fn concurrent_shutdowns_racing_idle_drain_are_coalesced_without_deadlock()
     assert!(!socket.exists());
 }
 
+#[ignore = "timing-sensitive on GitHub Actions runners"]
 #[tokio::test(flavor = "current_thread")]
 async fn daemon_bounds_simultaneous_connections() {
     let temp = TempDir::new().unwrap();

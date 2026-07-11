@@ -39,14 +39,17 @@ fn state() -> WatcherState {
 
 #[test]
 fn xdg_paths_use_safe_fallbacks_and_explicit_overrides() {
-    let fallback = WatchmePaths::resolve(Path::new("/home/alice"), None, None, None).unwrap();
+    // Use a synthetic home that is not a firmlink/symlink ancestor on the host
+    // (macOS CI maps `/home` under `/System/Volumes/Data/home`).
+    let home = Path::new("/watchme-xdg-test-home");
+    let fallback = WatchmePaths::resolve(home, None, None, None).unwrap();
     assert_eq!(
         fallback.config_dir(),
-        Path::new("/home/alice/.config/watchme")
+        Path::new("/watchme-xdg-test-home/.config/watchme")
     );
     assert_eq!(
         fallback.state_dir(),
-        Path::new("/home/alice/.local/state/watchme")
+        Path::new("/watchme-xdg-test-home/.local/state/watchme")
     );
     let expected_runtime = fs::canonicalize("/tmp")
         .unwrap_or_else(|_| Path::new("/tmp").to_path_buf())
@@ -54,7 +57,7 @@ fn xdg_paths_use_safe_fallbacks_and_explicit_overrides() {
     assert_eq!(fallback.runtime_dir(), expected_runtime);
 
     let overridden = WatchmePaths::resolve(
-        Path::new("/home/alice"),
+        home,
         Some(Path::new("/cfg")),
         Some(Path::new("/state")),
         Some(Path::new("/run/user/1000")),

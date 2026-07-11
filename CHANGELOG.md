@@ -1,3 +1,10 @@
+## 0.1.15 — 2026-07-12
+
+### Fixed
+
+- Avoid macOS firmlink `/home` in XDG path unit tests.
+- Ignore flaky simultaneous-connection daemon bound test on CI.
+
 ## 0.1.14 — 2026-07-12
 
 ### Fixed
