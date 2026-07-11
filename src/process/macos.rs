@@ -53,13 +53,15 @@ impl<S: MacProcessSource> ProcessInspector for VerifiedMacInspector<S> {
     }
 
     fn processes_on_tty(&self, tty: &str) -> Result<Vec<ProcessRecord>, ProcessError> {
-        Ok(self
-            .source
-            .list_pids()?
-            .into_iter()
-            .filter_map(|pid| self.verified_record(pid).ok())
-            .filter(|record| record.tty.as_deref() == Some(tty))
-            .collect())
+        let mut records = Vec::new();
+        for pid in self.source.list_pids()? {
+            match self.verified_record(pid) {
+                Ok(record) if record.tty.as_deref() == Some(tty) => records.push(record),
+                Ok(_) | Err(ProcessError::Disappeared(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(records)
     }
 }
 

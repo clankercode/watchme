@@ -282,6 +282,34 @@ struct FakeMacSource {
     starts: std::cell::RefCell<Vec<u64>>,
 }
 
+struct PartiallyBrokenMacSource {
+    broken: ProcessError,
+}
+
+impl MacProcessSource for PartiallyBrokenMacSource {
+    fn start_time(&self, _pid: u32) -> Result<u64, ProcessError> {
+        Ok(100)
+    }
+    fn ps_record(&self, pid: u32) -> Result<Vec<u8>, ProcessError> {
+        if pid == 42 {
+            Ok(b"42 7 40 30 1000 ttys004 /opt/claude".to_vec())
+        } else {
+            Err(match &self.broken {
+                ProcessError::Malformed { pid, reason } => ProcessError::Malformed {
+                    pid: *pid,
+                    reason: reason.clone(),
+                },
+                ProcessError::Inspection(reason) => ProcessError::Inspection(reason.clone()),
+                ProcessError::Disappeared(pid) => ProcessError::Disappeared(*pid),
+                other => ProcessError::Inspection(other.to_string()),
+            })
+        }
+    }
+    fn list_pids(&self) -> Result<Vec<u32>, ProcessError> {
+        Ok(vec![42, 43])
+    }
+}
+
 impl MacProcessSource for FakeMacSource {
     fn start_time(&self, pid: u32) -> Result<u64, ProcessError> {
         self.calls.borrow_mut().push(format!("start:{pid}"));
@@ -328,6 +356,24 @@ fn macos_tty_enumeration_verifies_each_pid_before_reading_its_row() {
         inspector.source().calls.borrow().as_slice(),
         ["list", "start:42", "ps:42", "start:42"]
     );
+}
+
+#[test]
+fn macos_enumeration_propagates_malformed_or_permission_errors_but_omits_disappeared() {
+    for broken in [
+        ProcessError::Malformed {
+            pid: 43,
+            reason: "bad row".into(),
+        },
+        ProcessError::Inspection("permission denied".into()),
+    ] {
+        let inspector = VerifiedMacInspector::new(PartiallyBrokenMacSource { broken });
+        assert!(inspector.processes_on_tty("/dev/ttys004").is_err());
+    }
+    let inspector = VerifiedMacInspector::new(PartiallyBrokenMacSource {
+        broken: ProcessError::Disappeared(43),
+    });
+    assert_eq!(inspector.processes_on_tty("/dev/ttys004").unwrap().len(), 1);
 }
 
 #[test]

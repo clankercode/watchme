@@ -349,8 +349,8 @@ fn monitor_process_lifecycles(
                     .is_ok()
                 {
                     let _ = scheduler.send(SchedulerEvent::Stop(watcher.watcher_id.clone()));
+                    monitors.remove(&watcher.watcher_id);
                 }
-                monitors.remove(&watcher.watcher_id);
             }
         }
     }
@@ -764,6 +764,55 @@ mod process_lifecycle_tests {
         ));
         assert!(scheduler.snapshot().await.unwrap().is_empty());
         assert!(monitors.is_empty());
+        scheduler.send(SchedulerEvent::Shutdown).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aged_termination_latches_across_store_failure_and_beats_late_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        let state_path = state_dir.join("watchers.json");
+        let old = process(40);
+        let mut registry = registry(&state_path, old.identity());
+        let mut monitor = LifecycleMonitor::with_reexec_grace(old.identity(), 2_000);
+        assert_eq!(
+            monitor.observe(
+                &FakeInspector(HashMap::new()),
+                now_ms().saturating_sub(3_000)
+            ),
+            LifecycleDecision::Grace
+        );
+        let mut monitors = BTreeMap::from([("watcher".into(), monitor)]);
+        std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_dir(&state_dir).unwrap();
+        let (scheduler, runner) = Scheduler::new(Duration::from_secs(60), true);
+        scheduler
+            .send(SchedulerEvent::Register("watcher".into()))
+            .unwrap();
+        let task = tokio::spawn(runner.run());
+        monitor_process_lifecycles(
+            &mut registry,
+            &scheduler,
+            &FakeInspector(HashMap::new()),
+            &mut monitors,
+        );
+        assert!(monitors.contains_key("watcher"));
+        assert_eq!(scheduler.snapshot().await.unwrap().len(), 1);
+        std::fs::create_dir(&state_dir).unwrap();
+        monitor_process_lifecycles(
+            &mut registry,
+            &scheduler,
+            &FakeInspector(HashMap::from([(41, process(41))])),
+            &mut monitors,
+        );
+        assert!(matches!(
+            registry.get("watcher").unwrap().lifecycle,
+            WatcherLifecycle::TargetTerminated
+        ));
+        assert!(monitors.is_empty());
+        assert!(scheduler.snapshot().await.unwrap().is_empty());
         scheduler.send(SchedulerEvent::Shutdown).unwrap();
         task.await.unwrap();
     }

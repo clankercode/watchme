@@ -99,10 +99,10 @@ impl ProcessInspector for LinuxProcessInspector {
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
         });
         for pid in collect_proc_pid_names(names)? {
-            if let Ok(process) = self.read_process(pid)
-                && process.tty.as_deref() == Some(tty)
-            {
-                processes.push(process);
+            match self.read_process(pid) {
+                Ok(process) if process.tty.as_deref() == Some(tty) => processes.push(process),
+                Ok(_) | Err(ProcessError::Disappeared(_)) => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(processes)
