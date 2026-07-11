@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://watchme.local/schemas/event.schema.json",
+  "title": "WatchMe Normalized Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "observed_at",
+    "watcher_id",
+    "target_identity_hash",
+    "source",
+    "category",
+    "confidence",
+    "terminal",
+    "evidence_fingerprint",
+    "summary",
+    "policy_hint"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "event_id": { "$ref": "#/$defs/id" },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "monotonic_sequence": { "type": "integer", "minimum": 0 },
+    "watcher_id": { "$ref": "#/$defs/id" },
+    "target_identity_hash": { "$ref": "#/$defs/hash" },
+    "agent_id": { "type": ["string", "null"], "maxLength": 64 },
+    "session_id": { "type": ["string", "null"], "maxLength": 256 },
+    "provider_family": { "type": ["string", "null"], "maxLength": 64 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source_id", "rule_or_field"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "typed_api",
+            "hook",
+            "structured_log",
+            "process_metadata",
+            "herdr_agent_state",
+            "screen_detection",
+            "planner",
+            "internal"
+          ]
+        },
+        "source_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "rule_or_field": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "source_version": { "type": ["string", "null"], "maxLength": 128 }
+      }
+    },
+    "category": {
+      "enum": [
+        "working", "idle", "waiting_for_model", "waiting_for_tool", "waiting_for_user",
+        "permission_prompt", "question_prompt", "usage_limit", "session_limit", "weekly_limit",
+        "model_credit_exhausted", "transient_overload", "capacity_block", "authentication_failure",
+        "billing_failure", "invalid_request", "model_unavailable", "safety_block", "paused_goal",
+        "blocked_goal", "context_limit", "terminal_failure", "crashed", "terminated",
+        "unknown_blocked", "recovered", "human_intervention"
+      ]
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "terminal": { "type": "boolean" },
+    "evidence_fingerprint": { "$ref": "#/$defs/hash" },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
+    "redacted_evidence": { "type": ["string", "null"], "maxLength": 4000 },
+    "reset": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_text", "parsed_at", "confidence"],
+          "properties": {
+            "source_text": { "type": "string", "minLength": 1, "maxLength": 500 },
+            "parsed_at": { "type": "string", "format": "date-time" },
+            "timezone": { "type": ["string", "null"], "maxLength": 128 },
+            "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+            "margin_seconds": { "type": "integer", "minimum": 0, "maximum": 3600 }
+          }
+        }
+      ]
+    },
+    "policy_hint": {
+      "enum": [
+        "observe_only",
+        "deterministic_action_allowed",
+        "wait_allowed",
+        "planner_allowed",
+        "human_required",
+        "stop_watching"
+      ]
+    },
+    "supersedes_event_id": { "type": ["string", "null"], "maxLength": 96 },
+    "metadata": {
+      "type": "object",
+      "maxProperties": 32,
+      "additionalProperties": {
+        "type": ["string", "number", "integer", "boolean", "null"]
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "hash": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 128,
+      "pattern": "^[A-Fa-f0-9]+$"
+    }
+  }
+}
