@@ -309,7 +309,9 @@ fn validate_literal(value: &str) -> Result<(), MuxError> {
 fn truncate_capture(output: &[u8], max_bytes: usize) -> Result<(String, usize, bool), MuxError> {
     let valid_bytes = match std::str::from_utf8(output) {
         Ok(_) => output,
-        Err(error) if error.error_len().is_none() => &output[..error.valid_up_to()],
+        Err(error) if error.error_len().is_none() && output.len() > max_bytes => {
+            &output[..error.valid_up_to()]
+        }
         Err(_) => return Err(MuxError::InvalidUtf8),
     };
     let complete = std::str::from_utf8(valid_bytes).map_err(|_| MuxError::InvalidUtf8)?;
@@ -635,6 +637,10 @@ mod tests {
             truncate_capture(&emoji[..2], 1).unwrap(),
             (String::new(), 0, true)
         );
+        assert!(matches!(
+            truncate_capture(&emoji[..2], 10),
+            Err(MuxError::InvalidUtf8)
+        ));
         assert_eq!(
             truncate_capture("a😀".as_bytes(), 3).unwrap(),
             ("a".into(), 1, true)
