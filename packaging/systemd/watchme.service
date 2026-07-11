@@ -1,0 +1,19 @@
+[Unit]
+Description=WatchMe local coding-agent supervisor
+Documentation=https://github.com/clankercode/watchme
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/watchme daemon run
+Restart=on-failure
+RestartSec=2
+# Lazy registration does not require this unit; it is opt-in for users who want
+# a resident supervisor. Stay conservative: no ambient network, no secrets.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/watchme %h/.local/state/watchme %t/watchme
+
+[Install]
+WantedBy=default.target

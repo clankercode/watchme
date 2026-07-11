@@ -601,8 +601,11 @@ fn local_runtime() -> Result<tokio::runtime::Runtime, CliFailure> {
 
 fn run_daemon() -> Result<(), CliFailure> {
     let paths = runtime_paths()?;
+    let config = load_config(&paths).unwrap_or_else(|_| Config::default());
+    let idle_grace = Duration::from_secs(config.daemon.idle_grace_seconds.max(1));
+    let stay_resident = config.daemon.stay_resident;
     local_runtime()?
-        .block_on(daemon::run(&paths, Duration::from_secs(30), false))
+        .block_on(daemon::run(&paths, idle_grace, stay_resident))
         .map_err(|error| WatchmeError::RetryableIntegration(error.to_string()).into())
 }
 

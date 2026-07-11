@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 #[test]
@@ -299,4 +299,87 @@ fn public_claude_hook_lifecycle_is_dry_run_safe_and_has_no_registration_alias() 
         .stdout(predicate::str::contains("would install Claude hook"))
         .stdout(predicate::str::contains("--marker '"));
     assert!(!settings.exists());
+}
+
+#[test]
+fn daemon_run_honors_config_stay_resident_and_idle_grace() {
+    use std::process::{Command as StdCommand, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn spawn_daemon(
+        temp: &tempfile::TempDir,
+        stay_resident: bool,
+    ) -> (std::process::Child, PathBuf) {
+        let config = temp.path().join(format!("config-{}", stay_resident));
+        let state = temp.path().join(format!("state-{}", stay_resident));
+        let runtime = temp.path().join(format!("run-{}", stay_resident));
+        fs::create_dir_all(config.join("watchme")).unwrap();
+        fs::create_dir_all(state.join("watchme")).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        #[cfg(unix)]
+        {
+            fs::set_permissions(config.join("watchme"), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(state.join("watchme"), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(
+            config.join("watchme/config.toml"),
+            format!(
+                "config_version = 1\n\n[daemon]\nidle_grace_seconds = 1\nstay_resident = {stay_resident}\n"
+            ),
+        )
+        .unwrap();
+
+        let child = StdCommand::new(env!("CARGO_BIN_EXE_watchme"))
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .args(["daemon", "run"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let sock = runtime.join("watchme/daemon.sock");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !sock.exists() {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            sock.exists(),
+            "daemon socket missing for stay_resident={stay_resident}"
+        );
+        (child, runtime)
+    }
+
+    let temp = tempdir().unwrap();
+
+    // Without stay_resident, idle_grace=1 must stop an empty daemon promptly.
+    let (mut ephemeral, runtime_ephemeral) = spawn_daemon(&temp, false);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline && ephemeral.try_wait().unwrap().is_none() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        ephemeral.try_wait().unwrap().is_some(),
+        "empty daemon should exit after configured idle_grace when stay_resident=false"
+    );
+    drop(runtime_ephemeral);
+
+    // With stay_resident=true the daemon must survive past idle_grace.
+    let (mut resident, runtime_resident) = spawn_daemon(&temp, true);
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        resident.try_wait().unwrap().is_none(),
+        "daemon exited despite stay_resident=true in config"
+    );
+    let _ = StdCommand::new(env!("CARGO_BIN_EXE_watchme"))
+        .env("HOME", temp.path())
+        .env("XDG_CONFIG_HOME", temp.path().join("config-true"))
+        .env("XDG_STATE_HOME", temp.path().join("state-true"))
+        .env("XDG_RUNTIME_DIR", &runtime_resident)
+        .args(["daemon", "stop"])
+        .status();
+    let _ = resident.wait();
 }

@@ -1,0 +1,52 @@
+.TH WATCHME 1 "2026-07-12" "watchme 0.1.0" "User Commands"
+.SH NAME
+watchme \- local supervisor for long-running coding-agent sessions
+.SH SYNOPSIS
+.B watchme
+[\fICOMMAND\fR]
+.PP
+.B WatchMe
+is an uppercase compatibility alias installed beside
+.BR watchme .
+.SH DESCRIPTION
+WatchMe discovers the current tmux or Herdr pane, identifies the coding-agent
+process, observes structured hooks and logs before terminal captures, applies
+deterministic recoveries, and escalates unsafe or ambiguous cases to a human.
+.PP
+Invoking the binary with no arguments registers the current agent context when
+detection succeeds. Outside a supported context it prints guidance and exits
+non-zero.
+.SH COMMANDS
+.TP
+.B status [ID] [--json]
+Show daemon and watcher status.
+.TP
+.B list [--json]
+List watchers.
+.TP
+.B doctor [--strict] [--json]
+Run local diagnostics.
+.TP
+.B daemon run|status|stop
+Manage the per-user supervisor.
+.TP
+.B hooks install-claude|remove-claude
+Install or remove the owner-only Claude StopFailure hook.
+.TP
+.B stop --all|--json
+Stop watchers.
+.TP
+.B config path|check|show
+Inspect configuration.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/watchme/
+Owner-only configuration directory.
+.TP
+.I $XDG_STATE_HOME/watchme/
+Owner-only durable state and audit log.
+.TP
+.I $XDG_RUNTIME_DIR/watchme/
+Owner-only runtime directory and daemon socket.
+.SH SEE ALSO
+docs/commands.md, docs/hooks.md, docs/privacy.md

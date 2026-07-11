@@ -69,4 +69,22 @@ WatchMe therefore implements and tests a fixed, local bridge contract rather tha
 
 The schema-faithful fake covers `pane_info`, `process_info`, bounded recent unwrapped `pane_read`, separate control-safe `send_text` and allowlisted symbolic `send_keys`, `agent_session`, `agent_state_events`, and `notification`. The client rejects partial, malformed, oversized, wrong-version, wrong-protocol, wrong-method, and mismatched-request responses. Success and failure are an exact union: success requires a non-null result and no error, while failure requires a non-null error and no result. One monotonic deadline covers connection, peer verification, write, response read, and parse; held or byte-dripping peers cannot renew it. It requires an absolute, canonical Unix socket owned by the current UID and not writable by group or others, rechecks the pathname device/inode after connecting, and uses Tokio's portable Unix peer-credential API on both Linux and macOS; unavailable or mismatched credentials fail closed. Target process, pane, and composer safety are revalidated at action boundaries, and terminal reads receive a post-read identity check. Persisted Herdr server identity combines the canonical socket path and provider-returned server ID, so either replacement changes target identity.
 
-`config/herdr-plugin.example.toml` is an optional bridge configuration example only; it has no core UI dependency and is not represented as a verified upstream Herdr plugin format.
+`config/herdr-plugin.example.toml` is an optional bridge configuration example only; it has no core UI dependency and is not represented as a verified upstream Herdr plugin format. The packaging helper `packaging/herdr/watchme-action.example.toml` is the same illustrative contract, installable via `scripts/install.sh --with-herdr-action`.
+
+## tmux
+
+Probe date: 2026-07-12. Host reports `tmux 3.6b`. Real integration tests use isolated `tmux -L` sockets with fake agent processes. Identity uses immutable server/session/window/pane identifiers plus process start-time correlation.
+
+## Support tier summary
+
+| Surface | Tier | Evidence |
+|---|---|---|
+| Claude Code 2.1.207 structured StopFailure hook | structured recovery (when correlated) | hook installer + fixture/e2e tests; live menu not established |
+| Claude Code terminal rate-limit menu | deterministic terminal recovery (fixture-only on this host) | fixtures; live probe blocked by first-run UI |
+| Codex blocked durable goal | structured / deterministic resume | fixture + recovery tests for `/goal resume` |
+| Herdr | contract-tested adapter | schema-faithful fake; live skipped (binary absent) |
+| tmux 3.6b | first-class multiplexer | real integration tests |
+| Bundled generic manifests (opencode, pi, hermes, …) | observation-only to planner-assisted per manifest | bundled manifests + loader tests |
+| Untested / unknown agents | untested → safe degradation | `unknown.toml` + doctor/providers |
+
+Windows is out of scope for v1.

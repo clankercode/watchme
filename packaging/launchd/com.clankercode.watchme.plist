@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Optional LaunchAgent for a resident WatchMe supervisor.
+     Copy to ~/Library/LaunchAgents/ and load with launchctl.
+     Default WatchMe starts lazily on registration and does not require this. -->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.clankercode.watchme</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/REPLACE/.local/bin/watchme</string>
+      <string>daemon</string>
+      <string>run</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE/.local/state/watchme/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE/.local/state/watchme/launchd.err.log</string>
+  </dict>
+</plist>
