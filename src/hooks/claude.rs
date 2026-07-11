@@ -172,7 +172,12 @@ pub fn transcript_matches_binding(
     let Ok(canonical) = fs::canonicalize(path) else {
         return false;
     };
-    if canonical != expected || canonical.to_string_lossy() != binding.canonical_path {
+    // macOS tempdirs often live under /var -> /private/var. Callers may pass
+    // either form; compare after resolving both sides to the same physical path.
+    let Ok(expected_canonical) = fs::canonicalize(expected) else {
+        return false;
+    };
+    if canonical != expected_canonical || canonical.to_string_lossy() != binding.canonical_path {
         return false;
     }
     bind_transcript(&canonical).is_ok_and(|current| {

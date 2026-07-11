@@ -1,3 +1,10 @@
+## 0.1.10 — 2026-07-12
+
+### Fixed
+
+- Decode C-style octal escapes in tmux `display-message` metadata so Ubuntu tmux 3.4 (`\037`) and newer raw U+001F separators both parse as the 16-field adapter contract.
+- Canonicalize both sides of Claude transcript binding checks so macOS `/var` → `/private/var` temp paths still correlate StopFailure hooks.
+
 ## 0.1.9 — 2026-07-12
 
 ### Fixed

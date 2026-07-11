@@ -204,8 +204,52 @@ impl Multiplexer for Tmux {
     }
 }
 
+/// Older tmux builds (notably Ubuntu 3.4) escape control bytes in
+/// `display-message -p` output as C octal sequences (`\037` for U+001F).
+/// Newer builds emit the raw separator. Accept both so Linux CI and local
+/// hosts parse the same 16-field adapter contract.
+fn decode_tmux_display_escapes(value: &str) -> Result<String, MuxError> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && index + 1 < bytes.len() {
+            let next = bytes[index + 1];
+            if next == b'\\' {
+                out.push(b'\\');
+                index += 2;
+                continue;
+            }
+            if (b'0'..=b'7').contains(&next) {
+                let mut code = 0_u16;
+                let mut digits = 0;
+                while digits < 3 && index + 1 + digits < bytes.len() {
+                    let digit = bytes[index + 1 + digits];
+                    if !(b'0'..=b'7').contains(&digit) {
+                        break;
+                    }
+                    code = (code << 3) | u16::from(digit - b'0');
+                    digits += 1;
+                }
+                if code > 0xff {
+                    return Err(MuxError::Malformed(
+                        "tmux octal escape out of byte range".into(),
+                    ));
+                }
+                out.push(code as u8);
+                index += 1 + digits;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).map_err(|_| MuxError::InvalidUtf8)
+}
+
 fn parse_metadata(value: &str) -> Result<PaneInfo, MuxError> {
-    let fields: Vec<_> = value.split(FIELD_SEPARATOR).collect();
+    let decoded = decode_tmux_display_escapes(value)?;
+    let fields: Vec<_> = decoded.split(FIELD_SEPARATOR).collect();
     if fields.len() != 16 {
         return Err(MuxError::Malformed(format!(
             "expected 16 fields, got {}",
@@ -448,6 +492,20 @@ mod tests {
     fn metadata_rejects_malformed_records() {
         assert!(parse_metadata("short").is_err());
     }
+
+    #[test]
+    fn metadata_accepts_tmux_octal_escaped_unit_separators() {
+        // Ubuntu tmux 3.4 emits `\037` instead of raw U+001F in display-message.
+        let escaped = metadata("0", "", "", "").replace(FIELD_SEPARATOR, "\\037");
+        assert!(
+            !escaped.contains(FIELD_SEPARATOR),
+            "fixture must use escaped separators only"
+        );
+        let info = parse_metadata(&escaped).expect("escaped separators must parse");
+        assert_eq!(info.identity.pane_id.as_str(), "%4");
+        assert!(!info.dead);
+    }
+
     #[test]
     fn argument_validation_rejects_control_boundaries() {
         assert!(validate_argument("a\nb").is_err());

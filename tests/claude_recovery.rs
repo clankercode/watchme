@@ -405,7 +405,14 @@ fn transcript_binding_rejects_replacement_without_treating_mutable_contents_as_i
     let temp = tempdir().unwrap();
     #[cfg(unix)]
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let transcript = temp.path().join("session.jsonl");
+    // Reproduce macOS /var -> /private/var: callers often pass the non-canonical
+    // path while the binding stores canonicalize().
+    let alias_root = temp.path().join("alias-root");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(temp.path(), &alias_root).unwrap();
+    #[cfg(not(unix))]
+    fs::create_dir(&alias_root).unwrap();
+    let transcript = alias_root.join("session.jsonl");
     fs::write(&transcript, "same-length-evidence\n").unwrap();
     #[cfg(unix)]
     fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
