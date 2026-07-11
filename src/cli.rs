@@ -423,7 +423,9 @@ impl RegistrationContextDetector for ProductionContextDetector {
                 .current_target()
                 .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
             let resolved_tty = resolved.identity.tty.as_deref().unwrap_or_default();
-            if normalize_tty(resolved_tty) != normalize_tty(&pane.tty) {
+            if normalize_tty(resolved_tty)
+                != normalize_tty(pane.process.tty.as_deref().unwrap_or_default())
+            {
                 return Err(WatchmeError::UnsupportedContext(
                     "agent process and tmux pane TTY identities do not match".into(),
                 ));
