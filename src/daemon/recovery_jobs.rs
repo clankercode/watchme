@@ -10,10 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::recovery_runtime::execute_recovery_action_with_cancellation;
-use super::{
-    ObservationClock, ObservationResult, Observer, Registry, SystemObservationClock,
-    WatcherLifecycle, now_ms,
-};
+use super::{ObservationClock, ObservationResult, Observer, Registry, WatcherLifecycle, now_ms};
 use crate::daemon::runtime_services::recover_stale_durable_actions;
 
 const RECOVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -91,6 +88,7 @@ impl RecoverySupervisor {
 pub(super) async fn run_observation_monitor_with_recovery(
     registry: Arc<tokio::sync::Mutex<Registry>>,
     observer: Arc<dyn Observer>,
+    clock: Arc<dyn ObservationClock>,
     recovery: Arc<DaemonRecoveryEngine>,
     owner: crate::recovery::transaction::OwnerIdentity,
     recovery_supervisor: Arc<RecoverySupervisor>,
@@ -98,7 +96,7 @@ pub(super) async fn run_observation_monitor_with_recovery(
     run_observation_loop(
         registry,
         observer,
-        Arc::new(SystemObservationClock::new()),
+        clock,
         0,
         Some(recovery),
         Some(owner),

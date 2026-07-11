@@ -661,10 +661,32 @@ fn verified(before: &LiveEvidence, after: &LiveEvidence, outcomes: &[Condition])
                 state == "WORKING" && after.event.category == EventCategory::Working
             }),
         "AGENT_IDLE" => after.event.category == EventCategory::Idle,
-        "BLOCK_CLEARED" | "MENU_DISMISSED" => !after.event.category.is_actionable(),
+        "BLOCK_CLEARED" => !after.event.category.is_actionable(),
+        // Selecting Claude's semantic wait row deliberately produces a new,
+        // structured limit event rather than a generic working state. That
+        // higher-ranked correlated event proves the menu is no longer the
+        // active UI and supplies the reset deadline for the next transaction.
+        "MENU_DISMISSED" => {
+            !after.event.category.is_actionable()
+                || claude_menu_became_structured_wait(before, after)
+        }
         "PROCESS_TERMINATED" => after.event.category == EventCategory::Terminated,
         _ => false,
     })
+}
+
+fn claude_menu_became_structured_wait(before: &LiveEvidence, after: &LiveEvidence) -> bool {
+    before.event.source.kind == crate::model::SourceKind::ScreenDetection
+        && before.event.source.source_id == "claude"
+        && before.event.source.rule_or_field == "labelled_wait_menu"
+        && after.event.source.kind == crate::model::SourceKind::Hook
+        && after.event.source.source_id == "claude_stop_failure"
+        && matches!(
+            after.event.category,
+            EventCategory::UsageLimit | EventCategory::SessionLimit | EventCategory::WeeklyLimit
+        )
+        && after.event.policy_hint == crate::model::PolicyHint::WaitAllowed
+        && after.event.metadata.contains_key("claude_reset_at")
 }
 
 fn verified_claude_progress(

@@ -345,9 +345,17 @@ impl Registry {
                         .map_err(|reason| RegistryError::Corrupt(reason.into()))?;
                     watcher.lifecycle = WatcherLifecycle::Observing;
                 }
-                if matches!(watcher.lifecycle, WatcherLifecycle::Waiting { .. })
-                    && event.metadata.get("claude_resume") == Some(&serde_json::Value::Bool(true))
-                    && machine.state() == RecoveryState::Recovered
+                let fresh_claude_limit_after_menu = machine.state() == RecoveryState::Recovered
+                    && event.source.kind == crate::model::SourceKind::Hook
+                    && event.source.source_id == "claude_stop_failure"
+                    && event.policy_hint == crate::model::PolicyHint::WaitAllowed
+                    && event.metadata.contains_key("claude_reset_at")
+                    && machine.current_fingerprint() != Some(event.evidence_fingerprint.as_str());
+                if machine.state() == RecoveryState::Recovered
+                    && ((matches!(watcher.lifecycle, WatcherLifecycle::Waiting { .. })
+                        && event.metadata.get("claude_resume")
+                            == Some(&serde_json::Value::Bool(true)))
+                        || fresh_claude_limit_after_menu)
                 {
                     machine
                         .apply(RecoveryCommand::RearmAfterWait)

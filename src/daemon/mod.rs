@@ -98,6 +98,33 @@ pub async fn run_with_components(
     observer: std::sync::Arc<dyn Observer>,
     recipes: std::sync::Arc<dyn crate::recovery::engine::RecipeProvider>,
 ) -> io::Result<()> {
+    run_with_components_and_clock(
+        paths,
+        idle_grace,
+        stay_resident,
+        peer_credentials,
+        observer,
+        recipes,
+        std::sync::Arc::new(SystemObservationClock::new()),
+    )
+    .await
+}
+
+/// Runs the daemon with an observation clock supplied by its host.
+///
+/// This is primarily useful to deterministic integration harnesses. Production
+/// callers should use [`run`] or [`run_with_components`], both of which use a
+/// monotonic system clock.
+#[doc(hidden)]
+pub async fn run_with_components_and_clock(
+    paths: &WatchmePaths,
+    idle_grace: Duration,
+    stay_resident: bool,
+    peer_credentials: impl PeerCredentialProvider,
+    observer: std::sync::Arc<dyn Observer>,
+    recipes: std::sync::Arc<dyn crate::recovery::engine::RecipeProvider>,
+    observation_clock: std::sync::Arc<dyn ObservationClock>,
+) -> io::Result<()> {
     paths.create_owner_only()?;
     let lock_path = paths.runtime_dir().join("daemon.lock");
     let _lock = DaemonLock::acquire(
@@ -142,6 +169,7 @@ pub async fn run_with_components(
     let mut observation_task = Some(tokio::spawn(run_observation_monitor_with_recovery(
         registry.clone(),
         observer,
+        observation_clock,
         recovery_engine,
         recovery_owner,
         recovery_supervisor.clone(),

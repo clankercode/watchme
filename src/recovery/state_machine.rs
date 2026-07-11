@@ -131,6 +131,11 @@ impl RecoveryMachine {
     pub const fn last_attempt_monotonic_seconds(&self) -> Option<u64> {
         self.last_attempt_mono
     }
+    /// Fingerprint that currently owns the recovery state, when one exists.
+    /// Callers use this only to refuse rearming an already completed action.
+    pub fn current_fingerprint(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
     pub fn restore_for_restart(mut self) -> Result<Self, &'static str> {
         if self.schema_version != 1 {
             return Err("unsupported recovery schema");
