@@ -1,0 +1,6 @@
+.idea
+target
+Cargo.lock
+src/osx_libproc_bindings.rs
+coverage.info
+*.profraw

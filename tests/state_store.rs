@@ -11,7 +11,9 @@ use watchme::model::{
     TargetIdentity, WATCHER_STATE_SCHEMA_VERSION, WatcherLifecycle, WatcherState,
 };
 use watchme::paths::WatchmePaths;
-use watchme::store::{JsonStore, LoadOutcome, StoreError};
+#[cfg(target_os = "linux")]
+use watchme::store::StoreError;
+use watchme::store::{JsonStore, LoadOutcome};
 
 fn process() -> ProcessIdentity {
     let mut identity = ProcessIdentity::new(42, 1_234_567);
@@ -310,6 +312,7 @@ fn store_refuses_to_read_or_replace_symlinks() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn store_rejects_directory_and_fifo_leaves_without_blocking() {
     use std::sync::mpsc;
     use std::time::Duration;

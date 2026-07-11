@@ -1,6 +1,8 @@
 # Third-party notices and clean-room guidance
 
-This bundle contains original specifications, schemas, synthetic fixtures, and reference scripts prepared from public documentation and repository research. It does not include third-party source files or binaries.
+`libproc` 0.14.11 is vendored under its MIT license with a target-aware build-script patch. The patch uses the crate's shipped generated macOS bindings for non-macOS cross-target checking and retains native bindgen generation on macOS. See `vendor/libproc/LICENSE`.
+
+This bundle contains original specifications, schemas, synthetic fixtures, and reference scripts prepared from public documentation and repository research. Except for the explicitly listed vendored `libproc` dependency, it does not include third-party source files or binaries.
 
 ## amux
 

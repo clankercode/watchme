@@ -54,8 +54,19 @@ pub fn validate_peer_uid(peer_uid: u32, owner_uid: u32) -> io::Result<()> {
 }
 
 pub fn validate_stream_owner(stream: &UnixStream, owner_uid: u32) -> io::Result<()> {
-    let credentials = rustix::net::sockopt::socket_peercred(stream).map_err(io::Error::from)?;
-    validate_peer_uid(credentials.uid.as_raw(), owner_uid)
+    #[cfg(target_os = "linux")]
+    {
+        let credentials = rustix::net::sockopt::socket_peercred(stream).map_err(io::Error::from)?;
+        validate_peer_uid(credentials.uid.as_raw(), owner_uid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (stream, owner_uid);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "synchronous IPC peer credentials require native macOS support",
+        ))
+    }
 }
 
 pub async fn read_request<R: AsyncRead + Unpin>(

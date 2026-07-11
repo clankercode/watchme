@@ -6,7 +6,6 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use watchme::mux::herdr::{
     ConnectedSocketEvidence, ConnectedSocketEvidenceProvider, Herdr, HerdrContext, SocketMetadata,
 };
@@ -27,6 +26,26 @@ struct Unsafe;
 impl ComposerSafety for Unsafe {
     fn observe(&self, _: &MuxIdentity) -> Result<ComposerState, MuxError> {
         Ok(ComposerState::Unsafe)
+    }
+}
+
+struct CountingSafety(std::sync::atomic::AtomicUsize);
+impl ComposerSafety for CountingSafety {
+    fn observe(&self, _: &MuxIdentity) -> Result<ComposerState, MuxError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ComposerState::Safe)
+    }
+}
+
+struct UnsafeAfterCommit(std::sync::atomic::AtomicUsize);
+impl ComposerSafety for UnsafeAfterCommit {
+    fn observe(&self, _: &MuxIdentity) -> Result<ComposerState, MuxError> {
+        let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(if call < 2 {
+            ComposerState::Safe
+        } else {
+            ComposerState::Unsafe
+        })
     }
 }
 
@@ -53,18 +72,41 @@ fn pane_result(pid: u32, start_time: u64) -> Value {
     })
 }
 
-fn spawn_fake<F>(handler: F) -> (TempDir, String, Arc<Mutex<Vec<Value>>>)
+struct FakeServer {
+    _directory: tempfile::TempDir,
+    path: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for FakeServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::os::unix::net::UnixStream::connect(&self.path);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_fake<F>(handler: F) -> (FakeServer, String, Arc<Mutex<Vec<Value>>>)
 where
     F: Fn(Value, usize) -> Option<Value> + Send + 'static,
 {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("herdr.sock");
     let listener = UnixListener::bind(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&requests);
-    thread::spawn(move || {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let should_stop = Arc::clone(&stop);
+    let server_thread = thread::spawn(move || {
         for (index, connection) in listener.incoming().enumerate() {
             let mut connection = connection.unwrap();
+            if should_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             let mut line = String::new();
             BufReader::new(connection.try_clone().unwrap())
                 .read_line(&mut line)
@@ -80,7 +122,17 @@ where
             }
         }
     });
-    (directory, path.to_string_lossy().into_owned(), requests)
+    let path = path.to_string_lossy().into_owned();
+    (
+        FakeServer {
+            _directory: directory,
+            path: path.clone(),
+            stop,
+            thread: Some(server_thread),
+        },
+        path,
+        requests,
+    )
 }
 
 fn context(socket_path: String) -> HerdrContext {
@@ -167,6 +219,67 @@ fn inherited_context_metadata_reads_and_auxiliary_contract_are_schema_faithful()
 }
 
 #[test]
+fn request_ids_do_not_reset_across_adapter_instances() {
+    let pid = std::process::id();
+    let (_first_server, first_socket, first_requests) =
+        spawn_fake(move |request, _| Some(response(&request, pane_result(pid, 77))));
+    let (_second_server, second_socket, second_requests) =
+        spawn_fake(move |request, _| Some(response(&request, pane_result(pid, 77))));
+    Herdr::new(context(first_socket), Duration::from_millis(200))
+        .unwrap()
+        .current_target()
+        .unwrap();
+    Herdr::new(context(second_socket), Duration::from_millis(200))
+        .unwrap()
+        .current_target()
+        .unwrap();
+    assert_ne!(
+        first_requests.lock().unwrap()[0]["request_id"],
+        second_requests.lock().unwrap()[0]["request_id"]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_adapter_instances_use_distinct_request_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("concurrent.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pid = std::process::id();
+    let server = tokio::spawn(async move {
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.unwrap();
+                bytes.push(byte);
+                if byte == b'\n' {
+                    break;
+                }
+            }
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            ids.push(request["request_id"].as_str().unwrap().to_owned());
+            let mut reply = serde_json::to_vec(&response(&request, pane_result(pid, 77))).unwrap();
+            reply.push(b'\n');
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &reply)
+                .await
+                .unwrap();
+        }
+        ids
+    });
+    let socket = socket.to_string_lossy().into_owned();
+    let first = Herdr::new(context(socket.clone()), Duration::from_millis(200)).unwrap();
+    let second = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+    let (first_result, second_result) =
+        tokio::join!(first.current_target_async(), second.current_target_async());
+    first_result.unwrap();
+    second_result.unwrap();
+    let ids = server.await.unwrap();
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
 fn safe_input_is_literal_or_symbolic_and_revalidates_before_and_after() {
     let pid = std::process::id();
     let (_directory, socket, requests) = spawn_fake(move |request, _| {
@@ -211,6 +324,56 @@ fn safe_input_is_literal_or_symbolic_and_revalidates_before_and_after() {
             .unwrap()["params"]["keys"],
         json!(["Enter"])
     );
+}
+
+#[test]
+fn successful_send_has_precommit_and_postaction_composer_evidence() {
+    let pid = std::process::id();
+    let (_server, socket, _) = spawn_fake(move |request, _| {
+        Some(response(
+            &request,
+            match request["method"].as_str().unwrap() {
+                "pane_info" => pane_result(pid, 77),
+                "send_text" => json!({"accepted":true}),
+                other => panic!("unexpected {other}"),
+            },
+        ))
+    });
+    let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+    let identity = herdr.current_target().unwrap();
+    let safety = CountingSafety(std::sync::atomic::AtomicUsize::new(0));
+    herdr.send_literal(&identity, "hello", &safety).unwrap();
+    assert_eq!(safety.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
+#[test]
+fn postaction_composer_refusal_is_not_claimed_as_success() {
+    let pid = std::process::id();
+    let (_server, socket, requests) = spawn_fake(move |request, _| {
+        Some(response(
+            &request,
+            match request["method"].as_str().unwrap() {
+                "pane_info" => pane_result(pid, 77),
+                "send_keys" => json!({"accepted":true}),
+                other => panic!("unexpected {other}"),
+            },
+        ))
+    });
+    let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+    let identity = herdr.current_target().unwrap();
+    let safety = UnsafeAfterCommit(std::sync::atomic::AtomicUsize::new(0));
+    assert!(matches!(
+        herdr.send_key(&identity, SymbolicKey::Enter, &safety),
+        Err(MuxError::IdentityChanged(_))
+    ));
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "send_keys")
+    );
+    assert_eq!(safety.0.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
 
 #[test]
@@ -419,11 +582,44 @@ fn socket_policy_rejects_aliases_types_owners_and_writable_modes() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn synchronous_adapter_is_safe_inside_daemon_runtime() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("async.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     let pid = std::process::id();
-    let (_directory, socket, _) =
-        spawn_fake(move |request, _| Some(response(&request, pane_result(pid, 77))));
-    let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
-    assert_eq!(herdr.current_target().unwrap().process.pid, pid);
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request_bytes = Vec::new();
+        loop {
+            let byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.unwrap();
+            request_bytes.push(byte);
+            if byte == b'\n' {
+                break;
+            }
+        }
+        let request: Value = serde_json::from_slice(&request_bytes).unwrap();
+        let mut encoded = serde_json::to_vec(&response(&request, pane_result(pid, 77))).unwrap();
+        encoded.push(b'\n');
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &encoded)
+            .await
+            .unwrap();
+    });
+    let herdr = Herdr::new(
+        context(socket.to_string_lossy().into_owned()),
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    assert!(matches!(herdr.current_target(), Err(MuxError::Command(_))));
+    let timer_progressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progressed = Arc::clone(&timer_progressed);
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        progressed.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert_eq!(herdr.current_target_async().await.unwrap().process.pid, pid);
+    timer.await.unwrap();
+    peer.await.unwrap();
+    assert!(timer_progressed.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[test]

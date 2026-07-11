@@ -19,6 +19,13 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_CAPTURE_LINES: usize = 10_000;
 const MAX_CAPTURE_BYTES: usize = 128 * 1024;
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static REQUEST_NONCE: std::sync::LazyLock<u128> = std::sync::LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+});
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HerdrContext {
@@ -52,7 +59,6 @@ impl HerdrContext {
 pub struct Herdr {
     context: HerdrContext,
     timeout: Duration,
-    next_request: std::sync::Arc<AtomicU64>,
     evidence_provider: std::sync::Arc<dyn ConnectedSocketEvidenceProvider>,
 }
 
@@ -181,7 +187,6 @@ impl Herdr {
         Ok(Self {
             context,
             timeout,
-            next_request: std::sync::Arc::new(AtomicU64::new(1)),
             evidence_provider,
         })
     }
@@ -270,6 +275,16 @@ impl Herdr {
             .map(|pane| self.map_pane(pane))
     }
 
+    async fn pane_async(&self, method: &str) -> Result<PaneInfo, MuxError> {
+        self.call_async::<_, WirePane>(method, self.target_params())
+            .await
+            .map(|pane| self.map_pane(pane))
+    }
+
+    pub async fn current_target_async(&self) -> Result<MuxIdentity, MuxError> {
+        Ok(self.pane_async("pane_info").await?.identity)
+    }
+
     fn map_pane(&self, pane: WirePane) -> PaneInfo {
         let mut process = ProcessIdentity::new(pane.process.pid, pane.process.start_time);
         process.executable = pane.process.executable;
@@ -310,12 +325,36 @@ impl Herdr {
         method: &str,
         params: P,
     ) -> Result<T, MuxError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(MuxError::Command(
+                "synchronous Herdr request cannot run inside a Tokio runtime; use the async API"
+                    .into(),
+            ));
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|error| MuxError::Command(error.to_string()))?
+            .block_on(self.call_async(method, params))
+    }
+
+    async fn call_async<P: Serialize, T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<T, MuxError> {
         let started = Instant::now();
         let socket_identity = validate_socket(Path::new(&self.context.socket_path))?;
+        let sequence = NEXT_REQUEST_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| MuxError::Protocol("request ID space exhausted".into()))?;
         let request_id = format!(
-            "watchme-{}-{}",
+            "watchme-{}-{}-{sequence}",
             std::process::id(),
-            self.next_request.fetch_add(1, Ordering::Relaxed)
+            *REQUEST_NONCE
         );
         let request = Request {
             schema_version: HERDR_SCHEMA_VERSION,
@@ -333,49 +372,32 @@ impl Herdr {
         let deadline = started.checked_add(self.timeout).ok_or(MuxError::Timeout)?;
         let socket_path = self.context.socket_path.clone();
         let evidence_provider = std::sync::Arc::clone(&self.evidence_provider);
-        let transport = move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .enable_time()
-                .build()
-                .map_err(|error| MuxError::Command(error.to_string()))?;
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(MuxError::Timeout)?;
-            runtime
-                .block_on(async move {
-                    tokio::time::timeout(remaining, async move {
-                        let mut stream = tokio::net::UnixStream::connect(&socket_path)
-                            .await
-                            .map_err(map_io)?;
-                        verify_connected_socket(
-                            &stream,
-                            Path::new(&socket_path),
-                            socket_identity,
-                            evidence_provider.as_ref(),
-                        )?;
-                        stream.write_all(&encoded).await.map_err(map_io)?;
-                        let mut bytes = Vec::new();
-                        loop {
-                            let byte = stream.read_u8().await.map_err(map_io)?;
-                            bytes.push(byte);
-                            if bytes.len() > MAX_RESPONSE_BYTES || byte == b'\n' {
-                                break;
-                            }
-                        }
-                        Ok::<_, MuxError>(bytes)
-                    })
-                    .await
-                })
-                .map_err(|_| MuxError::Timeout)?
-        };
-        let bytes = if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::spawn(transport)
-                .join()
-                .map_err(|_| MuxError::Command("Herdr transport thread panicked".into()))??
-        } else {
-            transport()?
-        };
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(MuxError::Timeout)?;
+        let bytes = tokio::time::timeout(remaining, async move {
+            let mut stream = tokio::net::UnixStream::connect(&socket_path)
+                .await
+                .map_err(map_io)?;
+            verify_connected_socket(
+                &stream,
+                Path::new(&socket_path),
+                socket_identity,
+                evidence_provider.as_ref(),
+            )?;
+            stream.write_all(&encoded).await.map_err(map_io)?;
+            let mut bytes = Vec::new();
+            loop {
+                let byte = stream.read_u8().await.map_err(map_io)?;
+                bytes.push(byte);
+                if bytes.len() > MAX_RESPONSE_BYTES || byte == b'\n' {
+                    break;
+                }
+            }
+            Ok::<_, MuxError>(bytes)
+        })
+        .await
+        .map_err(|_| MuxError::Timeout)??;
         if bytes.len() > MAX_RESPONSE_BYTES {
             return Err(MuxError::Protocol("response exceeds byte limit".into()));
         }
@@ -544,7 +566,8 @@ impl Multiplexer for Herdr {
         if !accepted.accepted {
             return Err(MuxError::Protocol("Herdr refused literal input".into()));
         }
-        self.validate_identity(identity)
+        self.validate_identity(identity)?;
+        require_safe(safety, identity)
     }
     fn send_key(
         &self,
@@ -580,7 +603,8 @@ impl Multiplexer for Herdr {
         if !accepted.accepted {
             return Err(MuxError::Protocol("Herdr refused symbolic input".into()));
         }
-        self.validate_identity(identity)
+        self.validate_identity(identity)?;
+        require_safe(safety, identity)
     }
 }
 
