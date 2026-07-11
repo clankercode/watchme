@@ -112,7 +112,15 @@ impl Multiplexer for Tmux {
         self.query(&identity.pane_id)
     }
     fn validate_identity(&self, expected: &MuxIdentity) -> Result<(), MuxError> {
-        let actual = self.query(&expected.pane_id)?.identity;
+        let actual = self
+            .query(&expected.pane_id)
+            .map_err(|error| {
+                MuxError::IdentityChanged(format!(
+                    "pane {} is no longer the recorded target: {error}",
+                    expected.pane_id
+                ))
+            })?
+            .identity;
         if actual.provider == expected.provider
             && actual.server == expected.server
             && actual.session_id == expected.session_id
@@ -150,14 +158,11 @@ impl Multiplexer for Tmux {
             &capture_arguments(&identity.pane_id, &start_line),
             max_bytes.saturating_add(1),
         )?;
-        let truncated = output.len() > max_bytes;
-        let selected = &output[..output.len().min(max_bytes)];
-        let text = std::str::from_utf8(selected)
-            .map_err(|_| MuxError::InvalidUtf8)?
-            .to_owned();
+        self.validate_identity(identity)?;
+        let (text, bytes, truncated) = truncate_capture(&output, max_bytes)?;
         Ok(Capture {
             text,
-            bytes: selected.len(),
+            bytes,
             truncated,
             elapsed: start.elapsed(),
         })
@@ -171,6 +176,7 @@ impl Multiplexer for Tmux {
         validate_literal(text)?;
         self.validate_identity(identity)?;
         require_safe(safety, identity)?;
+        self.validate_identity(identity)?;
         self.run(&literal_arguments(&identity.pane_id, text), OUTPUT_LIMIT)?;
         Ok(())
     }
@@ -182,6 +188,7 @@ impl Multiplexer for Tmux {
     ) -> Result<(), MuxError> {
         self.validate_identity(identity)?;
         require_safe(safety, identity)?;
+        self.validate_identity(identity)?;
         self.run(&symbolic_arguments(&identity.pane_id, key), OUTPUT_LIMIT)?;
         Ok(())
     }
@@ -295,6 +302,19 @@ fn validate_literal(value: &str) -> Result<(), MuxError> {
     Ok(())
 }
 
+fn truncate_capture(output: &[u8], max_bytes: usize) -> Result<(String, usize, bool), MuxError> {
+    let complete = std::str::from_utf8(output).map_err(|_| MuxError::InvalidUtf8)?;
+    let mut boundary = output.len().min(max_bytes);
+    while !complete.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    Ok((
+        complete[..boundary].to_owned(),
+        boundary,
+        output.len() > max_bytes,
+    ))
+}
+
 fn capture_arguments<'a>(pane: &'a str, start_line: &'a str) -> [&'a str; 7] {
     ["capture-pane", "-p", "-J", "-S", start_line, "-t", pane]
 }
@@ -320,21 +340,7 @@ fn process_matches(
     expected: &crate::model::ProcessIdentity,
     actual: &crate::model::ProcessIdentity,
 ) -> bool {
-    expected.pid == actual.pid
-        && expected.start_time == actual.start_time
-        && option_matches(&expected.executable, &actual.executable)
-        && option_matches(&expected.argv_digest, &actual.argv_digest)
-        && option_matches(&expected.uid, &actual.uid)
-        && option_matches(&expected.process_group_id, &actual.process_group_id)
-        && option_matches(&expected.session_leader_id, &actual.session_leader_id)
-        && option_matches(&expected.tty, &actual.tty)
-        && option_matches(&expected.parent_digest, &actual.parent_digest)
-}
-
-fn option_matches<T: Eq>(expected: &Option<T>, actual: &Option<T>) -> bool {
-    expected
-        .as_ref()
-        .is_none_or(|value| actual.as_ref() == Some(value))
+    expected == actual
 }
 
 fn run_bounded(
@@ -357,7 +363,7 @@ fn run_bounded(
             let mut result = Vec::new();
             let mut buffer = [0; 8192];
             loop {
-                let read = stream.read(&mut buffer).unwrap_or(0);
+                let read = stream.read(&mut buffer)?;
                 if read == 0 {
                     break;
                 }
@@ -366,18 +372,23 @@ fn run_bounded(
                     result.extend_from_slice(&buffer[..read.min(remaining)]);
                 }
             }
-            result
+            Ok::<_, std::io::Error>(result)
         })
     };
     let out_thread = reader(Box::new(stdout));
     let err_thread = reader(Box::new(stderr));
     let started = Instant::now();
     let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| MuxError::Command(error.to_string()))?
-        {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_thread.join();
+                let _ = err_thread.join();
+                return Err(MuxError::Command(error.to_string()));
+            }
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
@@ -390,10 +401,12 @@ fn run_bounded(
     };
     let output = out_thread
         .join()
-        .map_err(|_| MuxError::Command("stdout reader panicked".into()))?;
+        .map_err(|_| MuxError::Command("stdout reader panicked".into()))?
+        .map_err(|error| MuxError::Command(format!("stdout read failed: {error}")))?;
     let error = err_thread
         .join()
-        .map_err(|_| MuxError::Command("stderr reader panicked".into()))?;
+        .map_err(|_| MuxError::Command("stderr reader panicked".into()))?
+        .map_err(|error| MuxError::Command(format!("stderr read failed: {error}")))?;
     if !status.success() {
         return Err(MuxError::Command(
             String::from_utf8_lossy(&error).trim().to_owned(),
@@ -581,5 +594,26 @@ mod tests {
                 .iter()
                 .all(|actual| !process_matches(&expected, actual))
         );
+        let absent = crate::model::ProcessIdentity::new(1, 2);
+        let mut present = absent.clone();
+        present.executable = Some("appeared".into());
+        assert!(!process_matches(&absent, &present));
+        assert!(!process_matches(&present, &absent));
+    }
+
+    #[test]
+    fn unicode_truncation_uses_previous_scalar_boundary() {
+        assert_eq!(
+            truncate_capture("aλz".as_bytes(), 2).unwrap(),
+            ("a".into(), 1, true)
+        );
+        assert_eq!(
+            truncate_capture("aλz".as_bytes(), 3).unwrap(),
+            ("aλ".into(), 3, true)
+        );
+        assert!(matches!(
+            truncate_capture(&[0xff], 1),
+            Err(MuxError::InvalidUtf8)
+        ));
     }
 }

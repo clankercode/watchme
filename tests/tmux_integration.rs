@@ -14,6 +14,34 @@ impl ComposerSafety for Composer {
     }
 }
 
+struct ReplacingComposer<'a> {
+    socket: &'a str,
+    pane: &'a str,
+    session: &'a str,
+}
+impl ComposerSafety for ReplacingComposer<'_> {
+    fn observe(&self, _: &MuxIdentity) -> Result<ComposerState, MuxError> {
+        Command::new("tmux")
+            .args(["-L", self.socket, "kill-pane", "-t", self.pane])
+            .output()
+            .unwrap();
+        Command::new("tmux")
+            .args([
+                "-L",
+                self.socket,
+                "new-window",
+                "-d",
+                "-t",
+                self.session,
+                "sleep",
+                "30",
+            ])
+            .output()
+            .unwrap();
+        Ok(ComposerState::Safe)
+    }
+}
+
 struct ServerGuard(String);
 impl Drop for ServerGuard {
     fn drop(&mut self) {
@@ -138,28 +166,15 @@ fn private_tmux_server_captures_sends_and_refuses_stale_identity() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    Command::new("tmux")
-        .args(["-L", &socket, "kill-pane", "-t", &identity.pane_id])
-        .status()
-        .unwrap();
-    assert!(
-        Command::new("tmux")
-            .args([
-                "-L",
-                &socket,
-                "new-window",
-                "-d",
-                "-t",
-                target,
-                "sh",
-                "-c",
-                "printf replacement; sleep 30"
-            ])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(tmux.send_literal(&identity, "must refuse", &safe).is_err());
+    let replacing = ReplacingComposer {
+        socket: &socket,
+        pane: &identity.pane_id,
+        session: target,
+    };
+    assert!(matches!(
+        tmux.send_literal(&identity, "must refuse", &replacing),
+        Err(MuxError::IdentityChanged(_))
+    ));
     assert!(
         Command::new("tmux")
             .args(["-L", &socket, "kill-server"])
