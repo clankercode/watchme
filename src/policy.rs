@@ -143,7 +143,12 @@ fn precondition_holds(condition: &crate::model::Condition, context: &PolicyConte
         "NO_HUMAN_INTERVENTION" => !context.human_intervened,
         "CURRENT_TIME_AT_OR_AFTER" => text()
             .zip(context.wall_time_rfc3339.as_deref())
-            .is_some_and(|(required, current)| current >= required),
+            .is_some_and(|(required, current)| {
+                chrono::DateTime::parse_from_rfc3339(required)
+                    .ok()
+                    .zip(chrono::DateTime::parse_from_rfc3339(current).ok())
+                    .is_some_and(|(required, current)| current >= required)
+            }),
         _ => false,
     }
 }

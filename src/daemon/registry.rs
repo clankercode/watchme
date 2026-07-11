@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
-use crate::recovery::state_machine::RecoveryMachine;
+use crate::recovery::state_machine::{RecoveryCommand, RecoveryMachine, RecoveryState};
 use crate::store::{JsonStore, LoadOutcome, StoreError};
 
 #[derive(Debug, Error)]
@@ -178,6 +178,30 @@ impl Registry {
         self.watchers = updated;
         Ok(())
     }
+    pub fn apply_recovery_transition(
+        &mut self,
+        id: &str,
+        command: RecoveryCommand,
+        now: u64,
+    ) -> Result<RecoveryState, RegistryError> {
+        let mut updated = self.watchers.clone();
+        let watcher = updated
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::Unknown(id.into()))?;
+        let machine = watcher
+            .recovery
+            .as_mut()
+            .ok_or_else(|| RegistryError::Corrupt("missing recovery state".into()))?;
+        machine
+            .apply(command)
+            .map_err(|reason| RegistryError::Corrupt(reason.into()))?;
+        let state = machine.state();
+        watcher.revision = next_revision(watcher)?;
+        watcher.updated_at_unix_ms = now;
+        self.persist_watchers(&updated)?;
+        self.watchers = updated;
+        Ok(state)
+    }
     pub fn persist_observation_schedule(
         &mut self,
         id: &str,
@@ -194,6 +218,17 @@ impl Registry {
         self.persist_watchers(&updated)?;
         self.watchers = updated;
         Ok(())
+    }
+    pub fn wake_observation(&mut self, id: &str, now: u64) -> Result<(), RegistryError> {
+        let watcher = self
+            .get(id)
+            .ok_or_else(|| RegistryError::Unknown(id.into()))?;
+        if watcher.observation_schedule.event_wake_pending {
+            return Ok(());
+        }
+        let mut schedule = watcher.observation_schedule.clone();
+        schedule.event_wake_pending = true;
+        self.persist_observation_schedule(id, schedule, now)
     }
 
     fn persist_watchers(

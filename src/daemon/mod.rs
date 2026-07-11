@@ -16,9 +16,20 @@ use crate::paths::WatchmePaths;
 use crate::process::{LifecycleDecision, LifecycleMonitor, ProcessInspector};
 use crate::store::JsonStore;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 
 pub const MAX_CONNECTIONS: usize = 32;
 const PROCESS_REEXEC_GRACE_MS: u64 = 2_000;
+pub trait Observer: Send + Sync + 'static {
+    fn observe<'a>(&'a self, watcher_id: &'a str) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+struct NoopObserver;
+impl Observer for NoopObserver {
+    fn observe<'a>(&'a self, _: &'a str) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -225,6 +236,10 @@ pub async fn run_with_peer_provider(
     let mut connection_tasks = tokio::task::JoinSet::new();
     let mut scheduler_task = tokio::spawn(runner.run());
     let lifecycle_task = tokio::spawn(run_lifecycle_monitor(registry.clone(), scheduler.clone()));
+    let observation_task = tokio::spawn(run_observation_monitor(
+        registry.clone(),
+        std::sync::Arc::new(NoopObserver),
+    ));
     let timeout = Duration::from_secs(2);
     let result = loop {
         let accepted = tokio::select! {
@@ -284,7 +299,61 @@ pub async fn run_with_peer_provider(
     }
     lifecycle_task.abort();
     let _ = lifecycle_task.await;
+    observation_task.abort();
+    let _ = observation_task.await;
     result
+}
+
+pub async fn run_observation_monitor(
+    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+    observer: std::sync::Arc<dyn Observer>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let now = now_ms();
+        let due = {
+            let mut guard = registry.lock().await;
+            let mut due = Vec::new();
+            for watcher in guard.list() {
+                if matches!(
+                    watcher.lifecycle,
+                    WatcherLifecycle::Paused
+                        | WatcherLifecycle::Stopped { .. }
+                        | WatcherLifecycle::TargetTerminated
+                ) {
+                    continue;
+                }
+                let schedule = &watcher.observation_schedule;
+                if schedule.event_wake_pending || schedule.next_due_monotonic_ms <= now {
+                    let mut next = schedule.clone();
+                    next.last_check_monotonic_ms = Some(now);
+                    next.event_wake_pending = false;
+                    next.interval_sequence = next.interval_sequence.saturating_add(1);
+                    let hash = watcher
+                        .watcher_id
+                        .bytes()
+                        .fold(next.interval_sequence, |acc, byte| {
+                            acc.wrapping_mul(109).wrapping_add(u64::from(byte))
+                        });
+                    let jitter = (hash % 11) as i64 - 5;
+                    next.next_due_monotonic_ms =
+                        now.saturating_add_signed((60_000i64 + jitter * 1_000).max(1));
+                    if guard
+                        .persist_observation_schedule(&watcher.watcher_id, next, now)
+                        .is_ok()
+                    {
+                        due.push(watcher.watcher_id)
+                    }
+                }
+            }
+            due
+        };
+        for id in due {
+            let _ = tokio::time::timeout(Duration::from_secs(5), observer.observe(&id)).await;
+        }
+    }
 }
 
 async fn run_lifecycle_monitor(

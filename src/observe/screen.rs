@@ -129,6 +129,65 @@ pub fn live_bottom(input: &[u8], max_bytes: usize, max_lines: usize) -> String {
     }
     lines.join("\n")
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LineProvenance {
+    LiveOutput,
+    Transcript,
+    CodeFence,
+    Pasted,
+    Quote,
+    Chrome,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScreenLine {
+    pub text: String,
+    pub provenance: LineProvenance,
+}
+#[derive(Clone, Debug)]
+pub struct LiveScreen {
+    lines: Vec<ScreenLine>,
+    trusted_boundary: Option<usize>,
+    touches_bottom: bool,
+}
+impl LiveScreen {
+    pub fn from_adapter(
+        lines: Vec<ScreenLine>,
+        trusted_boundary: Option<usize>,
+        touches_bottom: bool,
+    ) -> Self {
+        Self {
+            lines,
+            trusted_boundary,
+            touches_bottom,
+        }
+    }
+    pub fn actionable_bottom(&self, max_lines: usize) -> Option<String> {
+        let boundary = self.trusted_boundary?;
+        if !self.touches_bottom || boundary >= self.lines.len() {
+            return None;
+        }
+        let eligible: Vec<_> = self.lines[boundary..]
+            .iter()
+            .filter(|line| line.provenance == LineProvenance::LiveOutput)
+            .collect();
+        if eligible.is_empty() || self.lines.last()?.provenance != LineProvenance::LiveOutput {
+            return None;
+        }
+        Some(
+            eligible
+                .into_iter()
+                .rev()
+                .take(max_lines)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+}
 pub fn sanitize_terminal(input: &[u8], max_bytes: usize, max_lines: usize) -> String {
     TerminalSanitizer::default().feed(input, max_bytes, max_lines)
 }

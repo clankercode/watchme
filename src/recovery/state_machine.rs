@@ -27,6 +27,44 @@ pub struct ClockSnapshot {
     pub monotonic_seconds: u64,
     pub wall_seconds: i64,
 }
+#[derive(Clone, Debug)]
+pub enum RecoveryCommand {
+    Revalidated,
+    Confirm {
+        fingerprint: String,
+    },
+    BeginAction {
+        fingerprint: String,
+        clock: ClockSnapshot,
+    },
+    ActionFailed {
+        fingerprint: String,
+        wait: Duration,
+        clock: ClockSnapshot,
+    },
+    ActionSucceeded {
+        fingerprint: String,
+    },
+    ReservePlanner,
+}
+impl RecoveryMachine {
+    pub fn apply(&mut self, command: RecoveryCommand) -> Result<(), &'static str> {
+        match command {
+            RecoveryCommand::Revalidated => self.revalidated(),
+            RecoveryCommand::Confirm { fingerprint } => self.confirm(&fingerprint),
+            RecoveryCommand::BeginAction { fingerprint, clock } => {
+                self.begin_action(&fingerprint, clock)
+            }
+            RecoveryCommand::ActionFailed {
+                fingerprint,
+                wait,
+                clock,
+            } => self.action_failed(&fingerprint, wait, clock),
+            RecoveryCommand::ActionSucceeded { fingerprint } => self.action_succeeded(&fingerprint),
+            RecoveryCommand::ReservePlanner => self.reserve_planner_call(),
+        }
+    }
+}
 impl ClockSnapshot {
     pub const fn new(monotonic_seconds: u64, wall_seconds: i64) -> Self {
         Self {
