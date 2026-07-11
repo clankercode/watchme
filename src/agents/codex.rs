@@ -209,6 +209,66 @@ fn snapshot_from_value(value: &serde_json::Value) -> Option<CodexGoalSnapshot> {
     })
 }
 
+/// Rebuild nested App Server / rollout JSON from a flat goal snapshot.
+/// Same shape as the Rollout arm of post-resume verify so
+/// [`normalize_structured_source`] / [`trusted_goal_progress_event`] can read
+/// `goal.status` rather than a Serialize-flat `goal_status` field.
+pub fn structured_value_from_snapshot(snapshot: &CodexGoalSnapshot) -> serde_json::Value {
+    let mut goal = serde_json::Map::new();
+    if let Some(status) = &snapshot.goal_status {
+        goal.insert("status".into(), serde_json::Value::String(status.clone()));
+    }
+    if let Some(text) = &snapshot.goal_text {
+        goal.insert("text".into(), serde_json::Value::String(text.clone()));
+    }
+    let mut runtime = serde_json::Map::new();
+    if let Some(runtime_type) = &snapshot.runtime_type {
+        runtime.insert(
+            "type".into(),
+            serde_json::Value::String(runtime_type.clone()),
+        );
+    }
+    runtime.insert(
+        "active_flags".into(),
+        serde_json::Value::Array(
+            snapshot
+                .active_flags
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "thread_id".into(),
+        serde_json::Value::String(snapshot.thread_id.clone()),
+    );
+    value.insert("goal".into(), serde_json::Value::Object(goal));
+    value.insert("runtime_status".into(), serde_json::Value::Object(runtime));
+    if snapshot.last_error_category.is_some() || snapshot.last_error_terminal {
+        let mut error = serde_json::Map::new();
+        if let Some(category) = &snapshot.last_error_category {
+            error.insert(
+                "category".into(),
+                serde_json::Value::String(category.clone()),
+            );
+        }
+        error.insert(
+            "terminal".into(),
+            serde_json::Value::Bool(snapshot.last_error_terminal),
+        );
+        value.insert("last_error".into(), serde_json::Value::Object(error));
+    }
+    if let Some(tail) = &snapshot.screen_tail {
+        value.insert(
+            "screen_tail".into(),
+            serde_json::Value::String(tail.clone()),
+        );
+    }
+    serde_json::Value::Object(value)
+}
+
 fn normalize_status(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }

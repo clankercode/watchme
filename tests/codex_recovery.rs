@@ -6,11 +6,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use tempfile::tempdir;
 use watchme::agents::codex::{
-    CodexRecipes, CodexRecoveryPlan, CodexSessionReference, capacity_backoff_seconds,
-    classify_goal_snapshot, correlated_rollout_event, mark_resume_sent,
+    CodexRecipes, CodexRecoveryPlan, CodexSessionReference, ProbedCodexSource,
+    capacity_backoff_seconds, classify_goal_snapshot, correlated_rollout_event, mark_resume_sent,
     normalize_structured_source, observe_codex_event, parse_fixture_record,
     probe_structured_source, resume_candidate_event, structured_goal_event,
-    trusted_goal_progress_event,
+    structured_value_from_snapshot, trusted_goal_progress_event,
 };
 use watchme::daemon::{GenericObserver, Observer};
 use watchme::model::{
@@ -466,6 +466,74 @@ fn human_required_capacity_lookalikes_produce_no_input_recipe() {
             );
         }
     }
+}
+
+#[test]
+fn app_server_probed_source_yields_trusted_progress_when_goal_active() {
+    // Preferred App Server probe → post-resume verify must preserve goal.status
+    // nesting. Serializing the flat CodexGoalSnapshot (as fresh_codex_progress
+    // used to) must still produce a progress event when the goal is active.
+    let cwd = std::env::current_dir().unwrap();
+    let temp = tempfile::TempDir::new_in(&cwd).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let snapshot_path = temp.path().join("app-server-goal.json");
+    fs::write(
+        &snapshot_path,
+        r#"{"thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"active"},"runtime_status":{"type":"active","active_flags":[]}}"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&snapshot_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let rollout = temp.path().join("rollout.jsonl");
+    fs::write(&rollout, "").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut watcher = bound_codex_watcher(temp.path(), &rollout, "thr_demo");
+    watcher
+        .codex_session
+        .as_mut()
+        .unwrap()
+        .app_server_state_path = Some(snapshot_path.to_string_lossy().into());
+
+    let probed = probe_structured_source(&watcher).expect("App Server probe");
+    let ProbedCodexSource::AppServer { snapshot, .. } = probed else {
+        panic!("expected App Server preferred source");
+    };
+    assert_eq!(snapshot.goal_status.as_deref(), Some("active"));
+
+    let mut baseline = codex_watcher(
+        EventCategory::WaitingForModel,
+        PolicyHint::DeterministicActionAllowed,
+        false,
+    )
+    .last_observation
+    .unwrap();
+    baseline
+        .metadata
+        .insert("codex_resume".into(), serde_json::Value::Bool(true));
+    baseline.metadata.insert(
+        "codex_thread_id".into(),
+        serde_json::Value::String("thr_demo".into()),
+    );
+    baseline.metadata.insert(
+        "codex_resume_session".into(),
+        serde_json::Value::String("a".repeat(64)),
+    );
+    baseline.observed_at = "2026-07-12T00:05:00Z".into();
+
+    // Mirror the App Server arm of fresh_codex_progress: rebuild nested JSON
+    // (goal.status) from the flat snapshot, then verify trusted progress.
+    let structured = structured_value_from_snapshot(&snapshot);
+    let progress =
+        trusted_goal_progress_event(&watcher, &baseline, &structured, "2026-07-12T00:06:00Z")
+            .expect("App Server active goal must yield post-resume progress");
+    assert_eq!(progress.category, EventCategory::Working);
+    assert_eq!(progress.metadata["goal_state"], "active");
+    assert_eq!(progress.metadata["codex_post_resume_progress"], true);
 }
 
 #[test]

@@ -166,7 +166,7 @@ fn fresh_codex_progress(
     let source = crate::agents::codex::probe_structured_source(watcher)?;
     let structured = match source {
         crate::agents::codex::ProbedCodexSource::AppServer { snapshot, .. } => {
-            serde_json::to_value(&snapshot).ok()?
+            crate::agents::codex::structured_value_from_snapshot(&snapshot)
         }
         crate::agents::codex::ProbedCodexSource::Rollout { path, thread_id } => {
             let event = crate::agents::codex::correlated_rollout_event(watcher, &path, &thread_id)?;
@@ -980,6 +980,87 @@ mod tests {
         assert!(capture_source_matches(&watcher, "structured_state"));
         assert!(!capture_source_matches(&watcher, "screen_recent"));
         assert!(!capture_source_matches(&watcher, "log_tail"));
+    }
+
+    #[test]
+    fn app_server_fresh_codex_progress_emits_when_goal_active() {
+        use crate::agents::codex::CodexSessionReference;
+        use std::fs;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::TempDir::new_in(&cwd).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let snapshot_path = temp.path().join("app-server-goal.json");
+        fs::write(
+            &snapshot_path,
+            r#"{"thread_id":"thr_demo","goal":{"text":"Finish the refactor","status":"pursuing"},"runtime_status":{"type":"active","active_flags":[]}}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&snapshot_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let rollout = temp.path().join("rollout.jsonl");
+        fs::write(&rollout, "").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&rollout, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut process = ProcessIdentity::new(std::process::id(), 42);
+        process.executable = Some("codex".into());
+        let mut watcher = WatcherState::new(
+            "codex-app-server-progress".into(),
+            TargetIdentity::process(process),
+            WatcherLifecycle::Observing,
+            1,
+            1,
+        );
+        let binding = crate::agents::codex::bind_rollout(&rollout).expect("rollout bind");
+        watcher
+            .set_codex_session(CodexSessionReference {
+                thread_id: "thr_demo".into(),
+                rollout_path: rollout.to_string_lossy().into(),
+                process_start_time: 42,
+                process_cwd: cwd.to_string_lossy().into(),
+                target_session: None,
+                rollout_binding: Some(binding),
+                app_server_state_path: Some(snapshot_path.to_string_lossy().into()),
+            })
+            .unwrap();
+
+        let mut baseline = Event::new(
+            "codex-resume",
+            "2020-01-01T00:00:00Z",
+            watcher.watcher_id.clone(),
+            target_identity_hash(&watcher.target),
+            EventSource::new(SourceKind::TypedApi, "codex", "goal_resume"),
+            EventCategory::WaitingForModel,
+            1.0,
+            false,
+            "a".repeat(64),
+            "Codex resume candidate",
+            PolicyHint::DeterministicActionAllowed,
+        )
+        .unwrap();
+        baseline
+            .metadata
+            .insert("codex_resume".into(), serde_json::Value::Bool(true));
+        baseline.metadata.insert(
+            "codex_thread_id".into(),
+            serde_json::Value::String("thr_demo".into()),
+        );
+        baseline.metadata.insert(
+            "codex_resume_session".into(),
+            serde_json::Value::String("a".repeat(64)),
+        );
+
+        let progress = fresh_codex_progress(&watcher, &baseline)
+            .expect("App Server pursuing goal must verify post-resume progress");
+        assert_eq!(progress.category, EventCategory::Working);
+        assert_eq!(progress.metadata["goal_state"], "pursuing");
+        assert_eq!(progress.metadata["codex_post_resume_progress"], true);
     }
 
     #[test]
