@@ -109,6 +109,18 @@ pub enum PolicyHint {
     StopWatching,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventReset {
+    pub source_text: String,
+    pub parsed_at: String,
+    #[serde(default)]
+    pub timezone: Option<String>,
+    pub confidence: f64,
+    #[serde(default)]
+    pub margin_seconds: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Event {
     pub schema_version: String,
@@ -132,6 +144,8 @@ pub struct Event {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted_evidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset: Option<EventReset>,
     pub policy_hint: PolicyHint,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes_event_id: Option<String>,
@@ -171,6 +185,7 @@ impl Event {
             evidence_fingerprint: fingerprint.into(),
             summary: summary.into(),
             redacted_evidence: None,
+            reset: None,
             policy_hint,
             supersedes_event_id: None,
             metadata: BTreeMap::new(),
@@ -195,6 +210,57 @@ impl Event {
             || self.source.rule_or_field.is_empty()
         {
             return Err("invalid bounded event text".into());
+        }
+        if chrono::DateTime::parse_from_rfc3339(&self.observed_at).is_err()
+            || self.source.source_id.len() > 256
+            || self.source.rule_or_field.len() > 256
+            || self
+                .source
+                .source_version
+                .as_ref()
+                .is_some_and(|value| value.len() > 128)
+            || self.agent_id.as_ref().is_some_and(|value| value.len() > 64)
+            || self
+                .session_id
+                .as_ref()
+                .is_some_and(|value| value.len() > 256)
+            || self
+                .provider_family
+                .as_ref()
+                .is_some_and(|value| value.len() > 64)
+            || self
+                .redacted_evidence
+                .as_ref()
+                .is_some_and(|value| value.len() > 4000)
+            || self
+                .supersedes_event_id
+                .as_ref()
+                .is_some_and(|value| value.len() > 96)
+            || self.metadata.values().any(|value| {
+                !matches!(
+                    value,
+                    serde_json::Value::Null
+                        | serde_json::Value::Bool(_)
+                        | serde_json::Value::Number(_)
+                        | serde_json::Value::String(_)
+                )
+            })
+        {
+            return Err("event violates schema bounds".into());
+        }
+        if let Some(reset) = &self.reset {
+            if reset.source_text.is_empty()
+                || reset.source_text.len() > 500
+                || chrono::DateTime::parse_from_rfc3339(&reset.parsed_at).is_err()
+                || !(0.0..=1.0).contains(&reset.confidence)
+                || reset.margin_seconds.is_some_and(|margin| margin > 3600)
+                || reset
+                    .timezone
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 128)
+            {
+                return Err("invalid reset".into());
+            }
         }
         if self.metadata.len() > 32 {
             return Err("too many metadata fields".into());
@@ -249,6 +315,8 @@ impl<'de> Deserialize<'de> for Event {
             summary: String,
             #[serde(default)]
             redacted_evidence: Option<String>,
+            #[serde(default)]
+            reset: Option<EventReset>,
             policy_hint: PolicyHint,
             #[serde(default)]
             supersedes_event_id: Option<String>,
@@ -273,6 +341,7 @@ impl<'de> Deserialize<'de> for Event {
             evidence_fingerprint: wire.evidence_fingerprint,
             summary: wire.summary,
             redacted_evidence: wire.redacted_evidence,
+            reset: wire.reset,
             policy_hint: wire.policy_hint,
             supersedes_event_id: wire.supersedes_event_id,
             metadata: wire.metadata,

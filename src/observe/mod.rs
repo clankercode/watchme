@@ -31,14 +31,24 @@ impl EvidenceMerger {
             });
         let candidate = candidate?;
         if events.iter().any(|other| {
-            other.source.kind.rank() > candidate.source.kind.rank()
+            correlated(other, candidate)
                 && contradicts(other.category, candidate.category)
+                && (other.source.kind.rank() > candidate.source.kind.rank()
+                    || (other.source.kind.rank() == candidate.source.kind.rank()
+                        && other.confidence >= candidate.confidence))
         }) {
             None
         } else {
             Some(candidate)
         }
     }
+}
+fn correlated(left: &Event, right: &Event) -> bool {
+    left.watcher_id == right.watcher_id
+        && left.target_identity_hash == right.target_identity_hash
+        && (left.session_id.is_none()
+            || right.session_id.is_none()
+            || left.session_id == right.session_id)
 }
 fn contradicts(a: EventCategory, b: EventCategory) -> bool {
     a != b

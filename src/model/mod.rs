@@ -4,7 +4,7 @@ mod identity;
 mod state;
 
 pub use action::{Action, ActionKind};
-pub use event::{Event, EventCategory, EventSource, PolicyHint, SourceKind};
+pub use event::{Event, EventCategory, EventReset, EventSource, PolicyHint, SourceKind};
 
 pub use identity::{
     PROCESS_IDENTITY_SCHEMA_VERSION, ProcessIdentity, TARGET_IDENTITY_SCHEMA_VERSION,

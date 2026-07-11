@@ -1,6 +1,7 @@
 #[derive(Default)]
 pub struct TerminalSanitizer {
     state: EscapeState,
+    utf8_remaining: u8,
 }
 #[derive(Default)]
 enum EscapeState {
@@ -16,9 +17,18 @@ impl TerminalSanitizer {
         let mut out = Vec::with_capacity(input.len().min(max_bytes));
         let mut lines = 1;
         for &byte in input {
+            if matches!(self.state, EscapeState::Text) && self.utf8_remaining > 0 {
+                if (0x80..=0xbf).contains(&byte) && out.len() < max_bytes {
+                    out.push(byte);
+                }
+                self.utf8_remaining -= 1;
+                continue;
+            }
             match self.state {
                 EscapeState::Text => match byte {
                     0x1b => self.state = EscapeState::Esc,
+                    0x9b => self.state = EscapeState::Csi,
+                    0x90 | 0x9d | 0x98 | 0x9e | 0x9f => self.state = EscapeState::String,
                     b'\n' => {
                         if lines < max_lines && out.len() < max_bytes {
                             out.push(byte);
@@ -31,7 +41,25 @@ impl TerminalSanitizer {
                             out.push(byte)
                         }
                     }
-                    0x80..=0xff => {
+                    0xc2..=0xdf => {
+                        if out.len() < max_bytes {
+                            out.push(byte);
+                            self.utf8_remaining = 1;
+                        }
+                    }
+                    0xe0..=0xef => {
+                        if out.len() < max_bytes {
+                            out.push(byte);
+                            self.utf8_remaining = 2;
+                        }
+                    }
+                    0xf0..=0xf4 => {
+                        if out.len() < max_bytes {
+                            out.push(byte);
+                            self.utf8_remaining = 3;
+                        }
+                    }
+                    0xa0..=0xbf => {
                         if out.len() < max_bytes {
                             out.push(byte)
                         }
@@ -78,6 +106,24 @@ impl TerminalSanitizer {
         }
         sanitized
     }
+}
+
+/// Returns only the bounded live bottom, excluding common quote/history chrome.
+pub fn live_bottom(input: &[u8], max_bytes: usize, max_lines: usize) -> String {
+    let sanitized = sanitize_terminal(input, max_bytes, max_lines.saturating_mul(4));
+    let mut lines: Vec<&str> = sanitized
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('>')
+                && !trimmed.starts_with("│")
+                && !trimmed.starts_with("history:")
+        })
+        .collect();
+    if lines.len() > max_lines {
+        lines.drain(..lines.len() - max_lines);
+    }
+    lines.join("\n")
 }
 pub fn sanitize_terminal(input: &[u8], max_bytes: usize, max_lines: usize) -> String {
     TerminalSanitizer::default().feed(input, max_bytes, max_lines)

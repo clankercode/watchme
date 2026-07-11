@@ -1,16 +1,31 @@
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
-pub const ACTION_SCHEMA_VERSION: &str = "1.0";
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Condition {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusCheck {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ActionKind {
+    WaitUntil { at: String },
     WaitDuration { duration_seconds: u64 },
-    Capture { max_lines: u16 },
-    CheckStatus { check: String },
+    Capture { source: String, max_lines: u16 },
+    CheckStatus { check: StatusCheck },
     SendText { text: String },
     SendKeys { keys: Vec<String> },
-    Notify { message: String },
+    Notify { severity: String, message: String },
     Escalate { level: String },
     StopWatching,
     Noop,
@@ -18,74 +33,184 @@ pub enum ActionKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Action {
-    pub schema_version: String,
-    pub action_id: String,
     #[serde(flatten)]
     pub kind: ActionKind,
+    pub action_id: String,
     pub reason: String,
-    pub evidence_fingerprint: String,
+    pub preconditions: Vec<Condition>,
+    pub expected_outcomes: Vec<Condition>,
     pub timeout_seconds: u64,
 }
+
+impl<'de> Deserialize<'de> for Action {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let mut object = serde_json::Map::deserialize(deserializer)?;
+        let action_id = take(&mut object, "action_id").map_err(D::Error::custom)?;
+        let reason = take(&mut object, "reason").map_err(D::Error::custom)?;
+        let preconditions = take(&mut object, "preconditions").map_err(D::Error::custom)?;
+        let expected_outcomes = take(&mut object, "expected_outcomes").map_err(D::Error::custom)?;
+        let timeout_seconds = take(&mut object, "timeout_seconds").map_err(D::Error::custom)?;
+        let kind =
+            serde_json::from_value(serde_json::Value::Object(object)).map_err(D::Error::custom)?;
+        Ok(Self {
+            kind,
+            action_id,
+            reason,
+            preconditions,
+            expected_outcomes,
+            timeout_seconds,
+        })
+    }
+}
+
+fn take<T: serde::de::DeserializeOwned>(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<T, serde_json::Error> {
+    serde_json::from_value(object.remove(key).unwrap_or(serde_json::Value::Null))
+}
+
 impl Action {
     pub fn new(
         id: impl Into<String>,
         kind: ActionKind,
         reason: impl Into<String>,
-        fingerprint: impl Into<String>,
+        _fingerprint: impl Into<String>,
         timeout_seconds: u64,
     ) -> Self {
         Self {
-            schema_version: ACTION_SCHEMA_VERSION.into(),
             action_id: id.into(),
             kind,
             reason: reason.into(),
-            evidence_fingerprint: fingerprint.into(),
+            preconditions: Vec::new(),
+            expected_outcomes: vec![Condition {
+                kind: "NO_STATE_CHANGE_EXPECTED".into(),
+                value: None,
+            }],
             timeout_seconds,
         }
     }
+
     pub fn send_text(
         id: impl Into<String>,
         text: impl Into<String>,
         reason: impl Into<String>,
         fingerprint: impl Into<String>,
     ) -> Self {
-        Self::new(
+        let mut action = Self::new(
             id,
             ActionKind::SendText { text: text.into() },
             reason,
-            fingerprint,
+            fingerprint.into(),
             30,
-        )
+        );
+        action.preconditions.push(Condition {
+            kind: "TARGET_IDENTITY_MATCHES".into(),
+            value: None,
+        });
+        action
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.action_id.is_empty()
+            || self.action_id.len() > 96
+            || self.reason.is_empty()
+            || self.reason.len() > 500
+            || self.timeout_seconds == 0
+            || self.timeout_seconds > 86_400
+        {
+            return Err("invalid common action fields");
+        }
+        if self.preconditions.len() > 12
+            || self.expected_outcomes.is_empty()
+            || self.expected_outcomes.len() > 6
+        {
+            return Err("invalid action conditions");
+        }
+        match &self.kind {
+            ActionKind::WaitUntil { at } if valid_datetime(at) => Ok(()),
+            ActionKind::WaitDuration { duration_seconds }
+                if (1..=86_400).contains(duration_seconds) =>
+            {
+                Ok(())
+            }
+            ActionKind::Capture { source, max_lines }
+                if matches!(
+                    source.as_str(),
+                    "screen_detection" | "screen_recent" | "structured_state" | "log_tail"
+                ) && (1..=300).contains(max_lines) =>
+            {
+                Ok(())
+            }
+            ActionKind::CheckStatus { check } if valid_check(check) => Ok(()),
+            ActionKind::SendText { text }
+                if !self.preconditions.is_empty() && !text.is_empty() && text.len() <= 512 =>
+            {
+                Ok(())
+            }
+            ActionKind::SendKeys { keys }
+                if !self.preconditions.is_empty()
+                    && !keys.is_empty()
+                    && keys.len() <= 16
+                    && keys.iter().all(|key| valid_key(key)) =>
+            {
+                Ok(())
+            }
+            ActionKind::Notify { severity, message }
+                if matches!(severity.as_str(), "info" | "warning" | "error" | "critical")
+                    && !message.is_empty()
+                    && message.len() <= 500 =>
+            {
+                Ok(())
+            }
+            ActionKind::Escalate { level }
+                if matches!(
+                    level.as_str(),
+                    "alternate_planner" | "independent_second_opinion" | "human_required"
+                ) =>
+            {
+                Ok(())
+            }
+            ActionKind::StopWatching | ActionKind::Noop => Ok(()),
+            _ => Err("invalid action variant fields"),
+        }
     }
 }
-impl<'de> Deserialize<'de> for Action {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            schema_version: String,
-            action_id: String,
-            #[serde(flatten)]
-            kind: ActionKind,
-            reason: String,
-            evidence_fingerprint: String,
-            timeout_seconds: u64,
-        }
-        let w = Wire::deserialize(d)?;
-        if w.schema_version != ACTION_SCHEMA_VERSION
-            || w.action_id.is_empty()
-            || w.timeout_seconds == 0
-            || w.timeout_seconds > 86400
-        {
-            return Err(D::Error::custom("invalid action"));
-        }
-        Ok(Self {
-            schema_version: w.schema_version,
-            action_id: w.action_id,
-            kind: w.kind,
-            reason: w.reason,
-            evidence_fingerprint: w.evidence_fingerprint,
-            timeout_seconds: w.timeout_seconds,
-        })
-    }
+
+fn valid_datetime(value: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(value).is_ok()
+}
+fn valid_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ENTER"
+            | "ESCAPE"
+            | "UP"
+            | "DOWN"
+            | "LEFT"
+            | "RIGHT"
+            | "TAB"
+            | "BACKTAB"
+            | "CTRL_C"
+            | "CTRL_D"
+            | "CTRL_L"
+            | "HOME"
+            | "END"
+            | "PAGE_UP"
+            | "PAGE_DOWN"
+    )
+}
+fn valid_check(check: &StatusCheck) -> bool {
+    matches!(
+        check.kind.as_str(),
+        "PROCESS_ALIVE"
+            | "TARGET_IDENTITY"
+            | "AGENT_STATE"
+            | "GOAL_STATE"
+            | "EVENT_CLEARED"
+            | "COMPOSER_EMPTY"
+            | "SCREEN_CONTAINS_LITERAL"
+            | "SCREEN_NOT_CONTAINS_LITERAL"
+    ) && check.value.as_ref().is_none_or(|value| value.len() <= 256)
 }

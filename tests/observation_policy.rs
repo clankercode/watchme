@@ -134,7 +134,10 @@ fn compiled_policy_is_deny_by_default() {
             .authorize(
                 &Action::new(
                     "a",
-                    ActionKind::Capture { max_lines: 20 },
+                    ActionKind::Capture {
+                        source: "screen_recent".into(),
+                        max_lines: 20
+                    },
                     "reason",
                     "fp",
                     10
@@ -143,6 +146,69 @@ fn compiled_policy_is_deny_by_default() {
             )
             .is_ok()
     );
+}
+
+#[test]
+fn canonical_recovery_plan_actions_match_wire_contract() {
+    let valid: serde_json::Value = serde_json::from_str(include_str!(
+        "/home/xertrov/Downloads/WatchMe-one-shot-bundle/fixtures/recovery-plan.valid.json"
+    ))
+    .unwrap();
+    for value in valid["actions"].as_array().unwrap() {
+        let action: Action = serde_json::from_value(value.clone()).unwrap();
+        action.validate().unwrap();
+    }
+    let invalid: serde_json::Value = serde_json::from_str(include_str!(
+        "/home/xertrov/Downloads/WatchMe-one-shot-bundle/fixtures/recovery-plan.invalid.json"
+    ))
+    .unwrap();
+    assert!(serde_json::from_value::<Action>(invalid["actions"][0].clone()).is_err());
+}
+
+#[test]
+fn recovery_snapshot_round_trip_restarts_fail_closed_with_audit() {
+    let budget = Budget {
+        max_attempts: 2,
+        max_cumulative_wait: Duration::from_secs(30),
+        planner_calls: 1,
+        cooldown: Duration::from_secs(10),
+    };
+    let mut machine = RecoveryMachine::new(budget);
+    machine.revalidated().unwrap();
+    machine.confirm("fp").unwrap();
+    let encoded = serde_json::to_vec(&machine).unwrap();
+    let restored: RecoveryMachine = serde_json::from_slice(&encoded).unwrap();
+    let mut restored = restored.restore_for_restart().unwrap();
+    assert_eq!(restored.state(), RecoveryState::NeedsRevalidation);
+    assert!(
+        restored
+            .begin_action("fp", ClockSnapshot::new(100, 100))
+            .is_err()
+    );
+    assert!(
+        restored
+            .audit()
+            .iter()
+            .any(|entry| entry.reason.contains("restart"))
+    );
+}
+
+#[test]
+fn jsonl_preserves_records_beyond_per_read_limit() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("many.jsonl");
+    fs::write(&path, b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
+    let mut cursor = JsonlCursor::new(
+        path,
+        ReadLimits {
+            max_read_bytes: 1024,
+            max_record_bytes: 128,
+            max_records: 1,
+        },
+    );
+    assert_eq!(cursor.read_new().unwrap().records[0]["n"], 1);
+    assert_eq!(cursor.read_new().unwrap().records[0]["n"], 2);
+    assert_eq!(cursor.read_new().unwrap().records[0]["n"], 3);
 }
 
 #[test]

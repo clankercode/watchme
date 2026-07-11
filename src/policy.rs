@@ -6,6 +6,11 @@ pub struct PolicyContext {
     pub human_intervened: bool,
     pub source_rank: u8,
     pub contradictory_source_rank: Option<u8>,
+    pub process_alive: bool,
+    pub pane_matches: bool,
+    pub composer_empty: bool,
+    pub failed_provider_family: Option<String>,
+    pub planner_provider_family: Option<String>,
 }
 impl PolicyContext {
     pub const fn safe() -> Self {
@@ -15,6 +20,11 @@ impl PolicyContext {
             human_intervened: false,
             source_rank: u8::MAX,
             contradictory_source_rank: None,
+            process_alive: true,
+            pane_matches: true,
+            composer_empty: true,
+            failed_provider_family: None,
+            planner_provider_family: None,
         }
     }
 }
@@ -22,8 +32,19 @@ impl PolicyContext {
 pub struct CompiledPolicy;
 impl CompiledPolicy {
     pub fn authorize(&self, action: &Action, context: &PolicyContext) -> Result<(), &'static str> {
-        if !context.target_revalidated || !context.evidence_current || context.human_intervened {
+        action.validate()?;
+        if !context.target_revalidated
+            || !context.evidence_current
+            || context.human_intervened
+            || !context.process_alive
+            || !context.pane_matches
+        {
             return Err("revalidation required");
+        }
+        if context.failed_provider_family.is_some()
+            && context.failed_provider_family == context.planner_provider_family
+        {
+            return Err("same-provider planner denied");
         }
         if context
             .contradictory_source_rank
@@ -33,7 +54,7 @@ impl CompiledPolicy {
         }
         match &action.kind {
             ActionKind::WaitDuration { duration_seconds } if *duration_seconds <= 86400 => Ok(()),
-            ActionKind::Capture { max_lines } if *max_lines <= 300 => Ok(()),
+            ActionKind::Capture { max_lines, .. } if *max_lines <= 300 => Ok(()),
             ActionKind::CheckStatus { .. }
             | ActionKind::Notify { .. }
             | ActionKind::StopWatching
@@ -60,7 +81,7 @@ impl CompiledPolicy {
             {
                 Ok(())
             }
-            ActionKind::SendText { text } if safe_text(text) => Ok(()),
+            ActionKind::SendText { text } if context.composer_empty && safe_text(text) => Ok(()),
             _ => Err("action denied by compiled policy"),
         }
     }
