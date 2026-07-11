@@ -53,9 +53,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.85 --profile minimal --target ${{ matrix.target }}
+        run: rustup toolchain install 1.88 --profile minimal --target ${{ matrix.target }}
       - name: Select Rust toolchain
-        run: rustup default 1.85
+        run: rustup default 1.88
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Smoke-test release binary

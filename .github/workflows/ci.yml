@@ -22,9 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.85 --profile minimal --component clippy,rustfmt
+        run: rustup toolchain install 1.88 --profile minimal --component clippy,rustfmt
       - name: Select Rust toolchain
-        run: rustup default 1.85
+        run: rustup default 1.88
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
@@ -50,9 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.85 --profile minimal
+        run: rustup toolchain install 1.88 --profile minimal
       - name: Select Rust toolchain
-        run: rustup default 1.85
+        run: rustup default 1.88
       - name: Run tests
         run: cargo test --all-features --locked
       - name: Build release binary

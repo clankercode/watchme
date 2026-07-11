@@ -1,8 +1,14 @@
 # Changelog
 
+## 0.1.1 — 2026-07-12
+
+### Fixed
+
+- Raise MSRV and CI/release toolchains to Rust 1.88 so `let` chains used throughout the daemon compile on GitHub runners (1.85 failed with E0658).
+
 ## 0.1.0 — 2026-07-12
 
-First production-quality local release of WatchMe.
+First production-quality local release of WatchMe. Note: the `v0.1.0` tag targeted Rust 1.85 CI and did not produce a successful multi-platform release; use `v0.1.1`.
 
 ### Added
 
