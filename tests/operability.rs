@@ -10,15 +10,21 @@ use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
 use watchme::audit::{
-    AuditEvent, AuditLog, DecisionChain, RetentionPolicy, append_decision, explain_decision,
+    AuditEvent, AuditLog, DecisionChain, DecisionPhase, RetentionPolicy, append_decision,
+    record_recovery_decision,
 };
-use watchme::config::{Config, NotificationsConfig};
+use watchme::config::{Config, NotificationsConfig, PlanningConfig};
 use watchme::doctor::{CheckStatus, DoctorOptions, run_doctor};
+use watchme::model::{
+    Event, EventCategory, EventSource, PolicyHint, ProcessIdentity, SourceKind, TargetIdentity,
+    WatcherLifecycle, WatcherState,
+};
 use watchme::notify::{
     DesktopBackend, HerdrBackend, NotificationOutcome, NotifyRequest, NotifyTarget, notify,
     notify_during_cleanup,
 };
 use watchme::paths::WatchmePaths;
+use watchme::planner::router::{PlannerCapability, resolve_eligible_planners};
 use watchme::planner::{SnapshotBuildInput, SnapshotObservation, build_redacted_snapshot};
 use watchme::redact::redact_text;
 
@@ -127,6 +133,109 @@ fn doctor_strict_fails_when_warnings_present() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("configuration").or(predicate::str::contains("doctor")));
+}
+
+#[test]
+fn recovery_decision_persists_for_explain_logs_and_snapshot() {
+    // Simulate the daemon write path (not hand-seeding audit/snapshot files).
+    let temp = tempdir().unwrap();
+    let (config, state, runtime) = isolated_env(&temp);
+    let paths =
+        WatchmePaths::resolve(temp.path(), Some(&config), Some(&state), Some(&runtime)).unwrap();
+    paths.create_owner_only().unwrap();
+
+    let mut watcher = WatcherState::new(
+        "recovery-watcher".into(),
+        TargetIdentity::process(ProcessIdentity::new(42, 100)),
+        WatcherLifecycle::Recovering {
+            evidence_fingerprint: "fp-recovery-1".into(),
+        },
+        1,
+        1,
+    );
+    let secret = "Authorization: Bearer sk-ant-recoverysecret999999";
+    watcher.last_observation = Some(
+        Event::new(
+            "evt-recovery",
+            "2026-07-12T01:00:00Z",
+            "recovery-watcher",
+            "a".repeat(64),
+            EventSource::new(SourceKind::ScreenDetection, "screen", "usage_limit"),
+            EventCategory::UsageLimit,
+            0.95,
+            true,
+            "b".repeat(64),
+            secret,
+            PolicyHint::WaitAllowed,
+        )
+        .unwrap(),
+    );
+
+    record_recovery_decision(
+        &paths,
+        &watcher,
+        DecisionPhase::ActionBegin,
+        "ALLOW labelled wait",
+        "WAIT_DURATION",
+        "begun",
+    )
+    .expect("daemon write path must persist decision + snapshot");
+
+    // Audit must exist from the recovery recorder, not from this test seeding it.
+    assert!(
+        paths.state_dir().join("audit.jsonl").is_file(),
+        "recovery decision must create audit.jsonl"
+    );
+    assert!(
+        paths
+            .state_dir()
+            .join("snapshots/recovery-watcher.json")
+            .is_file(),
+        "recovery decision must create snapshot file"
+    );
+
+    let explain = watchme_cmd(&temp, &config, &state, &runtime)
+        .args(["explain", "recovery-watcher"])
+        .output()
+        .unwrap();
+    assert!(
+        explain.status.success(),
+        "explain stderr={}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    let explain_text = String::from_utf8_lossy(&explain.stdout);
+    assert!(explain_text.contains("policy_decision: ALLOW labelled wait"));
+    assert!(explain_text.contains("attempted_action: WAIT_DURATION"));
+    assert!(explain_text.contains("verification: begun"));
+
+    let logs = watchme_cmd(&temp, &config, &state, &runtime)
+        .args(["logs", "recovery-watcher"])
+        .output()
+        .unwrap();
+    assert!(
+        logs.status.success(),
+        "logs stderr={}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+    let logs_text = String::from_utf8_lossy(&logs.stdout);
+    assert!(logs_text.contains("recovery-watcher"));
+    assert!(logs_text.contains("decision"));
+    assert!(!logs_text.contains("sk-ant-recoverysecret"));
+
+    let snapshot = watchme_cmd(&temp, &config, &state, &runtime)
+        .args(["snapshot", "recovery-watcher", "--redacted"])
+        .output()
+        .unwrap();
+    assert!(
+        snapshot.status.success(),
+        "snapshot stderr={}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
+    let snap_text = String::from_utf8_lossy(&snapshot.stdout);
+    assert!(!snap_text.contains("sk-ant-recoverysecret"));
+    let parsed: Value = serde_json::from_str(&snap_text).unwrap();
+    assert_eq!(parsed["schema_version"], "1.0");
+    assert_eq!(parsed["watcher"]["watcher_id"], "recovery-watcher");
 }
 
 #[test]
@@ -422,11 +531,41 @@ fn providers_lists_support_tiers_and_first_class_claude_codex() {
 
 #[test]
 fn providers_independence_check_excludes_same_family() {
-    let explained = explain_decision(&[sample_decision("w")], Some("w"));
-    assert!(explained.is_ok());
-    // Library-level provider independence is covered by planner tests; here the
-    // CLI providers listing must still expose readiness without requiring the
-    // failed family executable.
+    let planning = PlanningConfig {
+        enabled: true,
+        planner_priority: vec!["claude".into(), "codex".into()],
+        ..PlanningConfig::default()
+    };
+    let candidates = vec![
+        PlannerCapability {
+            id: "claude".into(),
+            executable: "/bin/false".into(),
+            configured_family: "anthropic".into(),
+            resolved_family: "anthropic".into(),
+            available: true,
+            unsafe_mode: false,
+        },
+        PlannerCapability {
+            id: "codex".into(),
+            executable: "/bin/false".into(),
+            configured_family: "openai".into(),
+            resolved_family: "openai".into(),
+            available: true,
+            unsafe_mode: false,
+        },
+    ];
+    let eligible = resolve_eligible_planners(&planning, "anthropic", &candidates);
+    assert!(
+        eligible
+            .iter()
+            .all(|planner| planner.provider_family != "anthropic"),
+        "same-family planner must be excluded: {eligible:?}"
+    );
+    assert!(
+        eligible.iter().any(|planner| planner.id == "codex"),
+        "independent family must remain eligible: {eligible:?}"
+    );
+
     let temp = tempdir().unwrap();
     let (config, state, runtime) = isolated_env(&temp);
     watchme_cmd(&temp, &config, &state, &runtime)

@@ -7,6 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::{SourceKind, TargetIdentity, WatcherLifecycle, WatcherState};
+use crate::paths::WatchmePaths;
+use crate::planner::{SnapshotBuildInput, SnapshotObservation, build_redacted_snapshot};
 use crate::redact::redact_text;
 
 pub const AUDIT_SCHEMA_VERSION: &str = "1.0";
@@ -42,6 +45,28 @@ pub struct DecisionChain {
     pub policy_decision: String,
     pub attempted_action: String,
     pub verification: String,
+}
+
+/// Recovery decision phases persisted for `explain` / `logs`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecisionPhase {
+    PolicyAllow,
+    PolicyDeny,
+    ActionBegin,
+    ActionVerify,
+    ActionCancel,
+}
+
+impl DecisionPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyAllow => "policy_allow",
+            Self::PolicyDeny => "policy_deny",
+            Self::ActionBegin => "action_begin",
+            Self::ActionVerify => "action_verify",
+            Self::ActionCancel => "action_cancel",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +271,176 @@ pub fn append_decision(log: &mut AuditLog, chain: &DecisionChain) -> io::Result<
         verification: Some(chain.verification.clone()),
         message: "decision chain".into(),
     })
+}
+
+/// Persist a recovery decision into audit.jsonl and a redacted snapshot file
+/// where CLI `explain` / `logs` / `snapshot` already look.
+pub fn record_recovery_decision(
+    paths: &WatchmePaths,
+    watcher: &WatcherState,
+    phase: DecisionPhase,
+    policy_decision: &str,
+    attempted_action: &str,
+    verification: &str,
+) -> io::Result<()> {
+    let _ = paths.create_owner_only();
+    let chain = decision_chain_from_watcher(
+        watcher,
+        phase,
+        policy_decision,
+        attempted_action,
+        verification,
+    );
+    let audit_path = paths.state_file("audit.jsonl")?;
+    let mut log = AuditLog::open(audit_path)?;
+    append_decision(&mut log, &chain)?;
+    persist_watcher_snapshot(paths, watcher)?;
+    Ok(())
+}
+
+/// Build the decision-chain record daemon recovery emits for operability CLI.
+pub fn decision_chain_from_watcher(
+    watcher: &WatcherState,
+    phase: DecisionPhase,
+    policy_decision: &str,
+    attempted_action: &str,
+    verification: &str,
+) -> DecisionChain {
+    let event = watcher.last_observation.as_ref();
+    let detector = event
+        .map(|event| format!("{:?}", event.source.kind))
+        .unwrap_or_else(|| "none".into());
+    let evidence = event
+        .map(|event| {
+            format!(
+                "{}:{}",
+                format!("{:?}", event.category).to_ascii_lowercase(),
+                event.evidence_fingerprint
+            )
+        })
+        .unwrap_or_else(|| "none".into());
+    DecisionChain {
+        watcher_id: watcher.watcher_id.clone(),
+        detector: detector.to_ascii_lowercase(),
+        evidence,
+        state: format!("{phase:?}:{}", lifecycle_label(&watcher.lifecycle)),
+        policy_decision: policy_decision.into(),
+        attempted_action: attempted_action.into(),
+        verification: verification.into(),
+    }
+}
+
+/// Write a redacted planner-shaped snapshot to `state/snapshots/{watcher_id}.json`.
+pub fn persist_watcher_snapshot(paths: &WatchmePaths, watcher: &WatcherState) -> io::Result<()> {
+    let snap_dir = paths.state_dir().join("snapshots");
+    fs::create_dir_all(&snap_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&snap_dir, fs::Permissions::from_mode(0o700));
+    }
+    let snapshot = build_watcher_snapshot(watcher).map_err(io::Error::other)?;
+    let encoded = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let path = snap_dir.join(format!("{}.json", watcher.watcher_id));
+    let tmp = snap_dir.join(format!("{}.json.tmp", watcher.watcher_id));
+    fs::write(&tmp, &encoded)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn build_watcher_snapshot(watcher: &WatcherState) -> Result<serde_json::Value, String> {
+    let event = watcher.last_observation.as_ref();
+    let (mux_kind, pane_id, process) = match &watcher.target {
+        TargetIdentity::Process { process } => ("process".into(), "none".into(), process),
+        TargetIdentity::Multiplexer {
+            provider,
+            pane,
+            process,
+            ..
+        } => (provider.clone(), pane.clone(), process),
+    };
+    let identity_hash = {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(&watcher.target).unwrap_or_default();
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    let observations = event
+        .map(|event| {
+            vec![SnapshotObservation {
+                event_id: event.event_id.clone(),
+                category: format!("{:?}", event.category).to_ascii_lowercase(),
+                source_kind: source_kind_label(event.source.kind),
+                confidence: event.confidence,
+                summary: event.summary.clone(),
+                observed_at: event.observed_at.clone(),
+            }]
+        })
+        .unwrap_or_default();
+    let input = SnapshotBuildInput {
+        snapshot_id: format!("snap-{}", watcher.watcher_id),
+        created_at: now_rfc3339(),
+        watcher_id: watcher.watcher_id.clone(),
+        watcher_state: lifecycle_label(&watcher.lifecycle),
+        evidence_fingerprint: event
+            .map(|event| event.evidence_fingerprint.clone())
+            .unwrap_or_else(|| "0".repeat(64)),
+        mux_kind,
+        pane_id,
+        process_pid: process.pid,
+        process_start_time: process.start_time.to_string(),
+        identity_hash,
+        agent_id: event.and_then(|event| event.agent_id.clone()),
+        provider_family: event.and_then(|event| event.provider_family.clone()),
+        failed_provider_family: event
+            .and_then(|event| event.provider_family.clone())
+            .unwrap_or_else(|| "unknown".into()),
+        terminal_text: event.map(|event| event.summary.clone()),
+        observations,
+        allowed_actions: vec![
+            "WAIT_DURATION".into(),
+            "CAPTURE".into(),
+            "CHECK_STATUS".into(),
+            "NOTIFY".into(),
+            "NOOP".into(),
+        ],
+        max_snapshot_bytes: 50_000,
+        extra_secret_names: vec![],
+    };
+    let snapshot = build_redacted_snapshot(input).map_err(|error| error.to_string())?;
+    serde_json::to_value(snapshot).map_err(|error| error.to_string())
+}
+
+fn lifecycle_label(lifecycle: &WatcherLifecycle) -> String {
+    match lifecycle {
+        WatcherLifecycle::Registered => "REGISTERED".into(),
+        WatcherLifecycle::Observing => "OBSERVING".into(),
+        WatcherLifecycle::Paused => "PAUSED".into(),
+        WatcherLifecycle::Recovering { .. } => "RECOVERING".into(),
+        WatcherLifecycle::Waiting { .. } => "WAITING".into(),
+        WatcherLifecycle::HumanRequired { .. } => "HUMAN_REQUIRED".into(),
+        WatcherLifecycle::TargetTerminated => "TARGET_TERMINATED".into(),
+        WatcherLifecycle::Stopped { .. } => "STOPPED".into(),
+    }
+}
+
+fn source_kind_label(kind: SourceKind) -> String {
+    match kind {
+        SourceKind::ScreenDetection => "screen_detection",
+        SourceKind::StructuredLog => "structured_log",
+        SourceKind::Hook => "hook",
+        SourceKind::TypedApi => "typed_api",
+        SourceKind::HerdrAgentState => "herdr_agent_state",
+        SourceKind::ProcessMetadata => "process_metadata",
+        SourceKind::Planner => "planner",
+        SourceKind::Internal => "internal",
+    }
+    .into()
 }
 
 pub fn explain_decision(

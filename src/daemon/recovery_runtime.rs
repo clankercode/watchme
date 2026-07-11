@@ -5,8 +5,11 @@ use super::{
     Registry, WatcherLifecycle, capture_mux_target, execute_mux_action, mux_identity_key, now_ms,
     process_identity_key, target_identity_hash, validate_mux_target, watcher_mux_identity,
 };
+use crate::audit::{DecisionPhase, record_recovery_decision};
 use crate::daemon::registry::DispatchSnapshot;
+use crate::model::ActionKind;
 use crate::mux::ComposerSafety;
+use crate::paths::WatchmePaths;
 use crate::recovery::actuator::{ActionExecutor, ExecutionError, ExecutionOutput, RuntimeActuator};
 use crate::recovery::transaction::{EvidenceReader, LiveEvidence, OwnerIdentity};
 
@@ -233,11 +236,13 @@ impl DaemonActionExecutor {
     fn new(
         registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
         snapshot: DispatchSnapshot,
+        paths: WatchmePaths,
     ) -> Self {
         Self {
             services: DaemonRuntimeServices::new(
                 registry.clone(),
                 snapshot.watcher().watcher_id.clone(),
+                paths,
             ),
             evidence: FreshTargetEvidence::new(registry.clone(), snapshot.clone()),
             registry,
@@ -251,9 +256,10 @@ impl DaemonActionExecutor {
     fn with_cancellation(
         registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
         snapshot: DispatchSnapshot,
+        paths: WatchmePaths,
         cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        let mut executor = Self::new(registry, snapshot);
+        let mut executor = Self::new(registry, snapshot, paths);
         executor.cancellation = cancellation;
         executor
     }
@@ -262,9 +268,10 @@ impl DaemonActionExecutor {
     fn with_before_mux_dispatch(
         registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
         snapshot: DispatchSnapshot,
+        paths: WatchmePaths,
         hook: std::sync::Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
-        let mut executor = Self::new(registry, snapshot);
+        let mut executor = Self::new(registry, snapshot, paths);
         executor.before_mux_dispatch = Some(hook);
         executor
     }
@@ -451,12 +458,14 @@ pub(super) fn execute_recovery_action(
     engine: std::sync::Arc<super::DaemonRecoveryEngine>,
     watcher: crate::model::WatcherState,
     owner: OwnerIdentity,
+    paths: WatchmePaths,
 ) {
     execute_recovery_action_with_cancellation(
         registry,
         engine,
         watcher,
         owner,
+        paths,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 }
@@ -466,14 +475,24 @@ pub(super) fn execute_recovery_action_with_cancellation(
     engine: std::sync::Arc<super::DaemonRecoveryEngine>,
     watcher: crate::model::WatcherState,
     owner: OwnerIdentity,
+    paths: WatchmePaths,
     cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     if cancellation.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
     let Some(action) = engine.proposed_action(&watcher) else {
+        let _ = record_recovery_decision(
+            &paths,
+            &watcher,
+            DecisionPhase::PolicyDeny,
+            "DENY no recovery recipe",
+            "NONE",
+            "no_action",
+        );
         return;
     };
+    let action_label = action_type_label(&action.kind);
     let fingerprint = action
         .preconditions
         .iter()
@@ -483,6 +502,14 @@ pub(super) fn execute_recovery_action_with_cancellation(
         .unwrap_or_default()
         .to_owned();
     if fingerprint.is_empty() {
+        let _ = record_recovery_decision(
+            &paths,
+            &watcher,
+            DecisionPhase::PolicyDeny,
+            "DENY missing evidence fingerprint",
+            action_label,
+            "cancelled",
+        );
         return;
     }
     let clock = SystemRecoveryClock::new();
@@ -499,8 +526,32 @@ pub(super) fn execute_recovery_action_with_cancellation(
             .begin_action(&watcher.watcher_id, &fingerprint, snapshot, now_ms())
             .is_err()
         {
+            let _ = record_recovery_decision(
+                &paths,
+                &watcher,
+                DecisionPhase::PolicyDeny,
+                "DENY recovery begin refused",
+                action_label,
+                "cancelled",
+            );
             return;
         }
+        let _ = record_recovery_decision(
+            &paths,
+            &watcher,
+            DecisionPhase::PolicyAllow,
+            &format!("ALLOW {action_label}"),
+            action_label,
+            "authorized",
+        );
+        let _ = record_recovery_decision(
+            &paths,
+            &watcher,
+            DecisionPhase::ActionBegin,
+            &format!("ALLOW {action_label}"),
+            action_label,
+            "begun",
+        );
         if let Some(mut event) = guard
             .get(&watcher.watcher_id)
             .and_then(|current| current.last_observation.clone())
@@ -516,13 +567,25 @@ pub(super) fn execute_recovery_action_with_cancellation(
     let Some(dispatch) = dispatch else { return };
     let current = dispatch.watcher().clone();
     let evidence = FreshTargetEvidence::new(registry.clone(), dispatch.clone());
-    let executor =
-        DaemonActionExecutor::with_cancellation(registry.clone(), dispatch, cancellation);
+    let executor = DaemonActionExecutor::with_cancellation(
+        registry.clone(),
+        dispatch,
+        paths.clone(),
+        cancellation,
+    );
     match engine.execute(&current, owner, &evidence, &executor, &clock) {
         Ok(Some(record))
             if record.phase == crate::recovery::transaction::ActionPhase::Succeeded =>
         {
             if executor.cancellation_requested() {
+                let _ = record_recovery_decision(
+                    &paths,
+                    &current,
+                    DecisionPhase::ActionCancel,
+                    &format!("ALLOW {action_label}"),
+                    action_label,
+                    "cancelled_after_side_effect",
+                );
                 let _ = registry.blocking_lock().transition(
                     &current.watcher_id,
                     WatcherLifecycle::HumanRequired {
@@ -536,9 +599,57 @@ pub(super) fn execute_recovery_action_with_cancellation(
                 &mut registry.blocking_lock(),
             )
             .action_succeeded(&current.watcher_id, &fingerprint, now_ms());
+            let _ = record_recovery_decision(
+                &paths,
+                &current,
+                DecisionPhase::ActionVerify,
+                &format!("ALLOW {action_label}"),
+                action_label,
+                "verified",
+            );
         }
-        Ok(_) => {}
+        Ok(Some(record)) => {
+            let _ = record_recovery_decision(
+                &paths,
+                &current,
+                DecisionPhase::ActionCancel,
+                &format!("ALLOW {action_label}"),
+                action_label,
+                &format!("{:?}", record.phase).to_ascii_lowercase(),
+            );
+        }
+        Ok(None) => {
+            let _ = record_recovery_decision(
+                &paths,
+                &current,
+                DecisionPhase::PolicyDeny,
+                "DENY no executable action",
+                action_label,
+                "no_action",
+            );
+        }
         Err(error) => {
+            let phase = if matches!(
+                error,
+                crate::recovery::transaction::TransactionError::Policy(_)
+            ) {
+                DecisionPhase::PolicyDeny
+            } else {
+                DecisionPhase::ActionCancel
+            };
+            let policy = if matches!(phase, DecisionPhase::PolicyDeny) {
+                format!("DENY {error}")
+            } else {
+                format!("ALLOW {action_label}")
+            };
+            let _ = record_recovery_decision(
+                &paths,
+                &current,
+                phase,
+                &policy,
+                action_label,
+                "cancelled",
+            );
             let _ = registry.blocking_lock().transition(
                 &current.watcher_id,
                 WatcherLifecycle::HumanRequired {
@@ -547,6 +658,21 @@ pub(super) fn execute_recovery_action_with_cancellation(
                 now_ms(),
             );
         }
+    }
+}
+
+fn action_type_label(kind: &ActionKind) -> &'static str {
+    match kind {
+        ActionKind::WaitUntil { .. } => "WAIT_UNTIL",
+        ActionKind::WaitDuration { .. } => "WAIT_DURATION",
+        ActionKind::Capture { .. } => "CAPTURE",
+        ActionKind::CheckStatus { .. } => "CHECK_STATUS",
+        ActionKind::SendText { .. } => "SEND_TEXT",
+        ActionKind::SendKeys { .. } => "SEND_KEYS",
+        ActionKind::Notify { .. } => "NOTIFY",
+        ActionKind::Escalate { .. } => "ESCALATE",
+        ActionKind::StopWatching => "STOP_WATCHING",
+        ActionKind::Noop => "NOOP",
     }
 }
 
@@ -725,6 +851,13 @@ mod tests {
                 process_start_time: 0,
                 nonce: "test".into(),
             },
+            WatchmePaths::resolve(
+                temporary.path(),
+                Some(&temporary.path().join("config")),
+                Some(&temporary.path().join("state")),
+                Some(&temporary.path().join("run")),
+            )
+            .unwrap(),
         );
 
         let audit = engine.store().audit("real-tmux-recovery").unwrap();
@@ -890,8 +1023,18 @@ mod tests {
             }
         });
         let evidence = FreshTargetEvidence::new(registry.clone(), dispatch.clone());
-        let executor =
-            DaemonActionExecutor::with_before_mux_dispatch(registry.clone(), dispatch, hook);
+        let executor = DaemonActionExecutor::with_before_mux_dispatch(
+            registry.clone(),
+            dispatch,
+            WatchmePaths::resolve(
+                temporary.path(),
+                Some(&temporary.path().join("config")),
+                Some(&temporary.path().join("state")),
+                Some(&temporary.path().join("run")),
+            )
+            .unwrap(),
+            hook,
+        );
         let store = JsonActionStore::load(temporary.path().join("actions.json")).unwrap();
         let engine = RecoveryEngine::new(store, InputRecipe);
         let clock = SystemRecoveryClock::new();

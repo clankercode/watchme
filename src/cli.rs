@@ -6,8 +6,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use watchme::audit::{
-    AuditLog, DecisionChain, RetentionPolicy, append_decision, explain_decision,
-    load_decision_chains,
+    AuditLog, DecisionChain, RetentionPolicy, explain_decision, load_decision_chains,
 };
 use watchme::client::ResolvedRegistration;
 use watchme::config::Config;
@@ -498,16 +497,6 @@ fn providers_command(options: JsonOutput) -> Result<(), WatchmeError> {
 fn chrono_now() -> String {
     let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
     now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-/// Persist a decision chain for later `explain` (daemon/recovery callers).
-#[allow(dead_code)]
-pub fn record_decision_chain(
-    paths: &WatchmePaths,
-    chain: &DecisionChain,
-) -> Result<(), WatchmeError> {
-    let mut log = audit_log(paths)?;
-    append_decision(&mut log, chain).map_err(|error| WatchmeError::Configuration(error.to_string()))
 }
 
 fn hook_lifecycle(command: crate::hook_cli::HooksCommand) -> Result<(), WatchmeError> {

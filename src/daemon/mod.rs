@@ -173,6 +173,7 @@ pub async fn run_with_components_and_clock(
         recovery_engine,
         recovery_owner,
         recovery_supervisor.clone(),
+        paths.clone(),
     )));
     let timeout = Duration::from_secs(2);
     let result = loop {
@@ -275,7 +276,7 @@ pub async fn run_observation_monitor_with_clock(
     clock: std::sync::Arc<dyn ObservationClock>,
     max_iterations: usize,
 ) {
-    run_observation_loop(registry, observer, clock, max_iterations, None, None, None).await
+    run_observation_loop(registry, observer, clock, max_iterations, None).await
 }
 
 /// A fresh, target-bound read used at every transaction revalidation point.
@@ -506,6 +507,7 @@ mod recovery_runtime_tests {
 
     use super::runtime_services::DaemonRuntimeServices;
     use super::*;
+    use crate::daemon::recovery_jobs::RecoveryLoopContext;
     use crate::model::{
         Event, EventCategory, EventSource, PolicyHint, ProcessIdentity, SourceKind, TargetIdentity,
         WatcherState,
@@ -530,7 +532,17 @@ mod recovery_runtime_tests {
             ))
             .unwrap();
         let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
-        let services = DaemonRuntimeServices::new(registry.clone(), "watcher".into());
+        let services = DaemonRuntimeServices::new(
+            registry.clone(),
+            "watcher".into(),
+            crate::paths::WatchmePaths::resolve(
+                temp.path(),
+                Some(&temp.path().join("config")),
+                Some(&temp.path().join("state")),
+                Some(&temp.path().join("run")),
+            )
+            .unwrap(),
+        );
 
         services.schedule("monotonic+60s").unwrap();
 
@@ -616,9 +628,18 @@ mod recovery_runtime_tests {
             std::sync::Arc::new(WaitObserver),
             std::sync::Arc::new(SystemObservationClock::new()),
             1,
-            Some(engine.clone()),
-            Some(owner),
-            Some(std::sync::Arc::new(RecoverySupervisor::new())),
+            Some(RecoveryLoopContext {
+                recovery: engine.clone(),
+                owner,
+                supervisor: std::sync::Arc::new(RecoverySupervisor::new()),
+                paths: crate::paths::WatchmePaths::resolve(
+                    temp.path(),
+                    Some(&temp.path().join("config")),
+                    Some(&temp.path().join("state")),
+                    Some(&temp.path().join("run")),
+                )
+                .unwrap(),
+            }),
         )
         .await;
 
@@ -712,9 +733,18 @@ mod recovery_runtime_tests {
             std::sync::Arc::new(WaitObserver),
             std::sync::Arc::new(SystemObservationClock::new()),
             1,
-            Some(engine.clone()),
-            Some(owner),
-            Some(std::sync::Arc::new(RecoverySupervisor::new())),
+            Some(RecoveryLoopContext {
+                recovery: engine.clone(),
+                owner,
+                supervisor: std::sync::Arc::new(RecoverySupervisor::new()),
+                paths: crate::paths::WatchmePaths::resolve(
+                    temp.path(),
+                    Some(&temp.path().join("config")),
+                    Some(&temp.path().join("state")),
+                    Some(&temp.path().join("run")),
+                )
+                .unwrap(),
+            }),
         )
         .await;
 

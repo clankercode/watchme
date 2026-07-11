@@ -92,17 +92,28 @@ pub(super) async fn run_observation_monitor_with_recovery(
     recovery: Arc<DaemonRecoveryEngine>,
     owner: crate::recovery::transaction::OwnerIdentity,
     recovery_supervisor: Arc<RecoverySupervisor>,
+    paths: crate::paths::WatchmePaths,
 ) {
     run_observation_loop(
         registry,
         observer,
         clock,
         0,
-        Some(recovery),
-        Some(owner),
-        Some(recovery_supervisor),
+        Some(RecoveryLoopContext {
+            recovery,
+            owner,
+            supervisor: recovery_supervisor,
+            paths,
+        }),
     )
     .await
+}
+
+pub(super) struct RecoveryLoopContext {
+    pub(super) recovery: Arc<DaemonRecoveryEngine>,
+    pub(super) owner: crate::recovery::transaction::OwnerIdentity,
+    pub(super) supervisor: Arc<RecoverySupervisor>,
+    pub(super) paths: crate::paths::WatchmePaths,
 }
 
 pub(super) async fn run_observation_loop(
@@ -110,9 +121,7 @@ pub(super) async fn run_observation_loop(
     observer: Arc<dyn Observer>,
     clock: Arc<dyn ObservationClock>,
     max_iterations: usize,
-    recovery: Option<Arc<DaemonRecoveryEngine>>,
-    owner: Option<crate::recovery::transaction::OwnerIdentity>,
-    recovery_supervisor: Option<Arc<RecoverySupervisor>>,
+    recovery: Option<RecoveryLoopContext>,
 ) {
     let mut iterations = 0;
     let mut runtime_due = std::collections::BTreeMap::<String, u64>::new();
@@ -177,8 +186,6 @@ pub(super) async fn run_observation_loop(
                     registry: registry.clone(),
                     clock: clock.as_ref(),
                     recovery: recovery.as_ref(),
-                    owner: owner.as_ref(),
-                    supervisor: recovery_supervisor.as_ref(),
                 };
                 coordinator
                     .commit_and_schedule(watcher, &mut next_schedule, result)
@@ -196,9 +203,7 @@ pub(super) async fn run_observation_loop(
 struct RecoveryDispatch<'a> {
     registry: Arc<tokio::sync::Mutex<Registry>>,
     clock: &'a dyn ObservationClock,
-    recovery: Option<&'a Arc<DaemonRecoveryEngine>>,
-    owner: Option<&'a crate::recovery::transaction::OwnerIdentity>,
-    supervisor: Option<&'a Arc<RecoverySupervisor>>,
+    recovery: Option<&'a RecoveryLoopContext>,
 }
 
 impl RecoveryDispatch<'_> {
@@ -246,12 +251,12 @@ impl RecoveryDispatch<'_> {
             .recovery
             .and_then(|_| guard.get(&watcher.watcher_id).cloned());
         drop(guard);
-        if let (Some(engine), Some(owner), Some(current), Some(supervisor)) =
-            (self.recovery, self.owner, current, self.supervisor)
-        {
-            let engine = engine.clone();
+        if let (Some(ctx), Some(current)) = (self.recovery, current) {
+            let engine = ctx.recovery.clone();
             let registry = self.registry.clone();
-            let owner = owner.clone();
+            let owner = ctx.owner.clone();
+            let paths = ctx.paths.clone();
+            let supervisor = ctx.supervisor.clone();
             let watcher_id = current.watcher_id.clone();
             supervisor.schedule(watcher_id, move |cancellation| {
                 // Herdr rejects synchronous protocol calls while Tokio is entered.
@@ -266,6 +271,7 @@ impl RecoveryDispatch<'_> {
                                 engine,
                                 current,
                                 owner,
+                                paths,
                                 cancellation,
                             )
                         })
