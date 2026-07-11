@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{ProcessIdentity, TargetIdentity, WatcherLifecycle, WatcherState};
+use crate::recovery::state_machine::RecoveryMachine;
 use crate::store::{JsonStore, LoadOutcome, StoreError};
 
 #[derive(Debug, Error)]
@@ -58,6 +59,14 @@ impl Registry {
         };
         let mut replay_transitioned = false;
         for watcher in watchers.values_mut() {
+            if let Some(recovery) = watcher.recovery.take() {
+                watcher.recovery = Some(
+                    recovery
+                        .restore_for_restart()
+                        .map_err(|_| RegistryError::Corrupt("invalid recovery state".into()))?,
+                );
+                replay_transitioned = true;
+            }
             if !matches!(
                 watcher.lifecycle,
                 WatcherLifecycle::Stopped { .. }
@@ -151,6 +160,40 @@ impl Registry {
     }
     pub fn list(&self) -> Vec<WatcherState> {
         self.watchers.values().cloned().collect()
+    }
+    pub fn persist_recovery(
+        &mut self,
+        id: &str,
+        recovery: RecoveryMachine,
+        now: u64,
+    ) -> Result<(), RegistryError> {
+        let mut updated = self.watchers.clone();
+        let watcher = updated
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::Unknown(id.into()))?;
+        watcher.recovery = Some(recovery);
+        watcher.revision = next_revision(watcher)?;
+        watcher.updated_at_unix_ms = now;
+        self.persist_watchers(&updated)?;
+        self.watchers = updated;
+        Ok(())
+    }
+    pub fn persist_observation_schedule(
+        &mut self,
+        id: &str,
+        schedule: crate::model::ObservationSchedule,
+        now: u64,
+    ) -> Result<(), RegistryError> {
+        let mut updated = self.watchers.clone();
+        let watcher = updated
+            .get_mut(id)
+            .ok_or_else(|| RegistryError::Unknown(id.into()))?;
+        watcher.observation_schedule = schedule;
+        watcher.revision = next_revision(watcher)?;
+        watcher.updated_at_unix_ms = now;
+        self.persist_watchers(&updated)?;
+        self.watchers = updated;
+        Ok(())
     }
 
     fn persist_watchers(

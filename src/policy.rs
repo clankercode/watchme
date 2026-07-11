@@ -11,6 +11,17 @@ pub struct PolicyContext {
     pub composer_empty: bool,
     pub failed_provider_family: Option<String>,
     pub planner_provider_family: Option<String>,
+    pub attempts_remaining: u32,
+    pub cumulative_wait_remaining_seconds: u64,
+    pub planner_calls_remaining: u32,
+    pub cooldown_ready: bool,
+    pub session_id: Option<String>,
+    pub evidence_fingerprint: Option<String>,
+    pub menu_stable: bool,
+    pub agent_state: Option<String>,
+    pub goal_state: Option<String>,
+    pub event_category: Option<String>,
+    pub wall_time_rfc3339: Option<String>,
 }
 impl PolicyContext {
     pub const fn safe() -> Self {
@@ -25,6 +36,17 @@ impl PolicyContext {
             composer_empty: true,
             failed_provider_family: None,
             planner_provider_family: None,
+            attempts_remaining: 1,
+            cumulative_wait_remaining_seconds: 86_400,
+            planner_calls_remaining: 1,
+            cooldown_ready: true,
+            session_id: None,
+            evidence_fingerprint: None,
+            menu_stable: true,
+            agent_state: None,
+            goal_state: None,
+            event_category: None,
+            wall_time_rfc3339: None,
         }
     }
 }
@@ -46,6 +68,25 @@ impl CompiledPolicy {
         {
             return Err("same-provider planner denied");
         }
+        if context.attempts_remaining == 0 || !context.cooldown_ready {
+            return Err("attempt or cooldown budget denied");
+        }
+        if matches!(action.kind, ActionKind::WaitDuration { duration_seconds } if duration_seconds > context.cumulative_wait_remaining_seconds)
+        {
+            return Err("cumulative wait budget denied");
+        }
+        if matches!(action.kind, ActionKind::Escalate { ref level } if level != "human_required")
+            && context.planner_calls_remaining == 0
+        {
+            return Err("planner budget denied");
+        }
+        if !action
+            .preconditions
+            .iter()
+            .all(|condition| precondition_holds(condition, context))
+        {
+            return Err("declared precondition failed");
+        }
         if context
             .contradictory_source_rank
             .is_some_and(|r| r > context.source_rank)
@@ -61,29 +102,49 @@ impl CompiledPolicy {
             | ActionKind::Noop => Ok(()),
             ActionKind::Escalate { level } if level == "human_required" => Ok(()),
             ActionKind::SendKeys { keys }
-                if keys.iter().all(|k| {
-                    matches!(
-                        k.as_str(),
-                        "ENTER"
-                            | "ESCAPE"
-                            | "UP"
-                            | "DOWN"
-                            | "LEFT"
-                            | "RIGHT"
-                            | "TAB"
-                            | "BACKTAB"
-                            | "HOME"
-                            | "END"
-                            | "PAGE_UP"
-                            | "PAGE_DOWN"
-                    )
-                }) =>
+                if context.composer_empty
+                    && keys.iter().all(|k| {
+                        matches!(
+                            k.as_str(),
+                            "ENTER"
+                                | "ESCAPE"
+                                | "UP"
+                                | "DOWN"
+                                | "LEFT"
+                                | "RIGHT"
+                                | "TAB"
+                                | "BACKTAB"
+                                | "HOME"
+                                | "END"
+                                | "PAGE_UP"
+                                | "PAGE_DOWN"
+                        )
+                    }) =>
             {
                 Ok(())
             }
             ActionKind::SendText { text } if context.composer_empty && safe_text(text) => Ok(()),
             _ => Err("action denied by compiled policy"),
         }
+    }
+}
+fn precondition_holds(condition: &crate::model::Condition, context: &PolicyContext) -> bool {
+    let text = || condition.value.as_ref().and_then(serde_json::Value::as_str);
+    match condition.kind.as_str() {
+        "TARGET_IDENTITY_MATCHES" => context.target_revalidated && context.pane_matches,
+        "PROCESS_ALIVE" => context.process_alive,
+        "SESSION_ID_MATCHES" => text() == context.session_id.as_deref(),
+        "EVIDENCE_FINGERPRINT_MATCHES" => text() == context.evidence_fingerprint.as_deref(),
+        "COMPOSER_EMPTY" => context.composer_empty,
+        "MENU_STABLE" => context.menu_stable,
+        "AGENT_STATE_IS" => text() == context.agent_state.as_deref(),
+        "GOAL_STATE_IS" => text() == context.goal_state.as_deref(),
+        "EVENT_CATEGORY_IS" => text() == context.event_category.as_deref(),
+        "NO_HUMAN_INTERVENTION" => !context.human_intervened,
+        "CURRENT_TIME_AT_OR_AFTER" => text()
+            .zip(context.wall_time_rfc3339.as_deref())
+            .is_some_and(|(required, current)| current >= required),
+        _ => false,
     }
 }
 fn safe_text(text: &str) -> bool {

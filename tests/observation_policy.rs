@@ -84,6 +84,26 @@ fn sanitizer_strips_terminal_protocol_and_bounds_output() {
 }
 
 #[test]
+fn split_sequences_and_malformed_utf8_cannot_reveal_terminal_payloads() {
+    let samples: &[&[u8]] = &[b"\x1b]52;c;SECRET\x07", b"\x1bPSECRET\x1b\\"];
+    for sample in samples {
+        for split in 0..=sample.len() {
+            let mut sanitizer = watchme::observe::screen::TerminalSanitizer::default();
+            let mut clean = sanitizer.feed(&sample[..split], 128, 4);
+            clean.push_str(&sanitizer.feed(&sample[split..], 128 - clean.len(), 4));
+            assert!(!clean.contains("SECRET"));
+        }
+    }
+    let mut sanitizer = watchme::observe::screen::TerminalSanitizer::default();
+    let _ = sanitizer.feed(&[0xe2], 128, 4);
+    assert!(
+        !sanitizer
+            .feed(b"\x1b]52;c;SECRET\x07", 128, 4)
+            .contains("SECRET")
+    );
+}
+
+#[test]
 fn screen_requires_two_stable_observations_but_terminal_failure_is_immediate() {
     let mut debounce = ScreenDebouncer::new(2);
     assert!(!debounce.observe("fp", false));

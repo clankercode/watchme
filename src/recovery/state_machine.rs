@@ -15,7 +15,7 @@ pub enum RecoveryState {
     HumanRequired,
     Stopped,
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Budget {
     pub max_attempts: u32,
     pub max_cumulative_wait: Duration,
@@ -35,7 +35,7 @@ impl ClockSnapshot {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditTransition {
     pub from: RecoveryState,
@@ -43,7 +43,7 @@ pub struct AuditTransition {
     pub reason: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryMachine {
     schema_version: u16,

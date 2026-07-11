@@ -48,14 +48,6 @@ impl JsonlCursor {
         }
     }
     pub fn read_new(&mut self) -> io::Result<JsonlBatch> {
-        if !self.pending.is_empty() {
-            return Ok(JsonlBatch {
-                records: (0..self.limits.max_records)
-                    .filter_map(|_| self.pending.pop_front())
-                    .collect(),
-                ..Default::default()
-            });
-        }
         let mut file = File::open(&self.path)?;
         let metadata = file.metadata()?;
         let identity = (metadata.dev(), metadata.ino());
@@ -65,6 +57,14 @@ impl JsonlCursor {
             self.pending.clear();
             self.discarding = false;
             self.identity = Some(identity);
+        }
+        if !self.pending.is_empty() {
+            return Ok(JsonlBatch {
+                records: (0..self.limits.max_records)
+                    .filter_map(|_| self.pending.pop_front())
+                    .collect(),
+                ..Default::default()
+            });
         }
         file.seek(SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();

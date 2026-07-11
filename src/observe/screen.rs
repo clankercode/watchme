@@ -18,11 +18,15 @@ impl TerminalSanitizer {
         let mut lines = 1;
         for &byte in input {
             if matches!(self.state, EscapeState::Text) && self.utf8_remaining > 0 {
-                if (0x80..=0xbf).contains(&byte) && out.len() < max_bytes {
-                    out.push(byte);
+                if (0x80..=0xbf).contains(&byte) {
+                    if out.len() < max_bytes {
+                        out.push(byte);
+                    }
+                    self.utf8_remaining -= 1;
+                    continue;
                 }
-                self.utf8_remaining -= 1;
-                continue;
+                // A malformed sequence cannot consume a following control byte.
+                self.utf8_remaining = 0;
             }
             match self.state {
                 EscapeState::Text => match byte {

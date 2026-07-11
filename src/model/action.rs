@@ -53,14 +53,16 @@ impl<'de> Deserialize<'de> for Action {
         let timeout_seconds = take(&mut object, "timeout_seconds").map_err(D::Error::custom)?;
         let kind =
             serde_json::from_value(serde_json::Value::Object(object)).map_err(D::Error::custom)?;
-        Ok(Self {
+        let action = Self {
             kind,
             action_id,
             reason,
             preconditions,
             expected_outcomes,
             timeout_seconds,
-        })
+        };
+        action.validate().map_err(D::Error::custom)?;
+        Ok(action)
     }
 }
 
@@ -113,7 +115,7 @@ impl Action {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.action_id.is_empty()
+        if !valid_id(&self.action_id)
             || self.action_id.len() > 96
             || self.reason.is_empty()
             || self.reason.len() > 500
@@ -127,6 +129,11 @@ impl Action {
             || self.expected_outcomes.len() > 6
         {
             return Err("invalid action conditions");
+        }
+        if !self.preconditions.iter().all(valid_precondition)
+            || !self.expected_outcomes.iter().all(valid_outcome)
+        {
+            return Err("invalid condition kind or value");
         }
         match &self.kind {
             ActionKind::WaitUntil { at } if valid_datetime(at) => Ok(()),
@@ -176,6 +183,53 @@ impl Action {
             _ => Err("invalid action variant fields"),
         }
     }
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && b"._:-".contains(&byte))
+        })
+}
+fn scalar_value(condition: &Condition) -> bool {
+    condition.value.as_ref().is_none_or(|value| match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+        serde_json::Value::String(text) => text.len() <= 256,
+        _ => false,
+    })
+}
+fn valid_precondition(condition: &Condition) -> bool {
+    scalar_value(condition)
+        && matches!(
+            condition.kind.as_str(),
+            "TARGET_IDENTITY_MATCHES"
+                | "PROCESS_ALIVE"
+                | "SESSION_ID_MATCHES"
+                | "EVIDENCE_FINGERPRINT_MATCHES"
+                | "COMPOSER_EMPTY"
+                | "MENU_STABLE"
+                | "AGENT_STATE_IS"
+                | "GOAL_STATE_IS"
+                | "EVENT_CATEGORY_IS"
+                | "NO_HUMAN_INTERVENTION"
+                | "CURRENT_TIME_AT_OR_AFTER"
+        )
+}
+fn valid_outcome(condition: &Condition) -> bool {
+    scalar_value(condition)
+        && matches!(
+            condition.kind.as_str(),
+            "AGENT_WORKING"
+                | "AGENT_IDLE"
+                | "BLOCK_CLEARED"
+                | "GOAL_ACTIVE_OR_PURSUING"
+                | "MENU_DISMISSED"
+                | "WAIT_STATE_RECORDED"
+                | "PROCESS_TERMINATED"
+                | "HUMAN_NOTIFIED"
+                | "NO_STATE_CHANGE_EXPECTED"
+        )
 }
 
 fn valid_datetime(value: &str) -> bool {
