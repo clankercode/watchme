@@ -1,16 +1,21 @@
+mod ipc_service;
 mod observation;
+mod recovery_jobs;
 mod recovery_runtime;
 pub mod registry;
 mod runtime_services;
 pub mod scheduler;
 
+use ipc_service::{acknowledge_shutdown_requests, service_connection};
 pub use observation::classify_herdr_state;
 use observation::observation_event;
-use recovery_runtime::{RuntimeComposerSafety, execute_recovery_action_with_cancellation};
-use runtime_services::{
-    DaemonRuntimeServices, SystemRecoveryClock, recover_durable_actions_after_restart,
-    recover_stale_durable_actions, target_process_is_alive,
+pub use recovery_jobs::observation_jitter_seconds;
+use recovery_jobs::{
+    DaemonRecoveryEngine, RecoverySupervisor, run_observation_loop,
+    run_observation_monitor_with_recovery,
 };
+use recovery_runtime::RuntimeComposerSafety;
+use runtime_services::recover_durable_actions_after_restart;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
@@ -18,10 +23,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::daemon::registry::{RegistrationOutcome, Registry};
+use crate::daemon::registry::Registry;
 use crate::daemon::scheduler::{Scheduler, SchedulerEvent, SchedulerHandle};
-use crate::ipc::protocol::{Request, Response};
-use crate::ipc::{bind_owner_only, read_request, write_response};
+use crate::ipc::bind_owner_only;
 use crate::model::WatcherLifecycle;
 use crate::paths::WatchmePaths;
 use crate::process::{LifecycleDecision, LifecycleMonitor, ProcessInspector};
@@ -29,103 +33,6 @@ use crate::store::JsonStore;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-
-const RECOVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
-
-/// Owns every blocking recovery transaction until it reaches a terminal
-/// ledger state. Cancellation is cooperative because a mux request can be
-/// in a kernel read when shutdown begins; in that case the daemon stays alive
-/// until the worker has observed cancellation and finished fail-closed.
-struct RecoverySupervisor {
-    accepting: std::sync::atomic::AtomicBool,
-    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    jobs: std::sync::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>>,
-}
-
-impl RecoverySupervisor {
-    fn new() -> Self {
-        Self {
-            accepting: std::sync::atomic::AtomicBool::new(true),
-            cancellation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            jobs: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    fn schedule(&self, watcher_id: String, job: impl FnOnce() + Send + 'static) {
-        let mut jobs = self.jobs.lock().expect("recovery job registry poisoned");
-        if !self.accepting.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        jobs.retain(|(_, handle)| !handle.is_finished());
-        jobs.push((watcher_id, tokio::task::spawn_blocking(job)));
-    }
-
-    fn begin_shutdown(&self) {
-        self.accepting
-            .store(false, std::sync::atomic::Ordering::Release);
-        self.cancellation
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    async fn wait_for_terminal_jobs(&self, registry: std::sync::Arc<tokio::sync::Mutex<Registry>>) {
-        self.begin_shutdown();
-        let jobs = std::mem::take(&mut *self.jobs.lock().expect("recovery job registry poisoned"));
-        for (watcher_id, mut job) in jobs {
-            if tokio::time::timeout(RECOVERY_SHUTDOWN_GRACE, &mut job)
-                .await
-                .is_err()
-            {
-                // The worker cannot be safely killed after a possible mux
-                // side effect. Persist the human hand-off, then retain this
-                // daemon until the cooperative worker reaches its terminal
-                // transaction state.
-                let _ = registry.lock().await.transition(
-                    &watcher_id,
-                    WatcherLifecycle::HumanRequired {
-                        reason: "recovery cancellation exceeded shutdown grace".into(),
-                    },
-                    now_ms(),
-                );
-                let _ = job.await;
-            }
-        }
-    }
-}
-
-struct ShutdownSignal {
-    acknowledged: tokio::sync::oneshot::Sender<()>,
-    response_written: tokio::sync::oneshot::Receiver<()>,
-}
-
-async fn acknowledge_shutdown_requests(
-    first: ShutdownSignal,
-    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ShutdownSignal>,
-    timeout: Duration,
-) {
-    // Let concurrently accepted IPC tasks enqueue their already-requested
-    // shutdown before we acknowledge any of them. This keeps repeated
-    // shutdown requests idempotent without leaving a second client blocked.
-    tokio::task::yield_now().await;
-    let mut signals = vec![first];
-    while let Ok(signal) = receiver.try_recv() {
-        signals.push(signal);
-    }
-    let responses = signals
-        .into_iter()
-        .map(|signal| {
-            let _ = signal.acknowledged.send(());
-            signal.response_written
-        })
-        .collect::<Vec<_>>();
-    for response_written in responses {
-        let _ = tokio::time::timeout(timeout, response_written).await;
-    }
-}
-
-type DaemonRecoveryEngine = crate::recovery::engine::RecoveryEngine<
-    crate::recovery::action_store::JsonActionStore,
-    std::sync::Arc<dyn crate::recovery::engine::RecipeProvider>,
->;
 
 pub const MAX_CONNECTIONS: usize = 32;
 const PROCESS_REEXEC_GRACE_MS: u64 = 2_000;
@@ -732,24 +639,6 @@ pub async fn run_observation_monitor(
     .await
 }
 
-async fn run_observation_monitor_with_recovery(
-    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-    observer: std::sync::Arc<dyn Observer>,
-    recovery: std::sync::Arc<DaemonRecoveryEngine>,
-    owner: crate::recovery::transaction::OwnerIdentity,
-    recovery_supervisor: std::sync::Arc<RecoverySupervisor>,
-) {
-    run_observation_loop(
-        registry,
-        observer,
-        std::sync::Arc::new(SystemObservationClock::new()),
-        0,
-        Some(recovery),
-        Some(owner),
-        Some(recovery_supervisor),
-    )
-    .await
-}
 pub async fn run_observation_monitor_with_clock(
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
     observer: std::sync::Arc<dyn Observer>,
@@ -757,180 +646,6 @@ pub async fn run_observation_monitor_with_clock(
     max_iterations: usize,
 ) {
     run_observation_loop(registry, observer, clock, max_iterations, None, None, None).await
-}
-
-async fn run_observation_loop(
-    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-    observer: std::sync::Arc<dyn Observer>,
-    clock: std::sync::Arc<dyn ObservationClock>,
-    max_iterations: usize,
-    recovery: Option<std::sync::Arc<DaemonRecoveryEngine>>,
-    owner: Option<crate::recovery::transaction::OwnerIdentity>,
-    recovery_supervisor: Option<std::sync::Arc<RecoverySupervisor>>,
-) {
-    let mut iterations = 0;
-    let mut runtime_due = std::collections::BTreeMap::<String, u64>::new();
-    loop {
-        let now = clock.wall_now_ms();
-        let mono = clock.mono_now_ms();
-        let due = {
-            let guard = registry.lock().await;
-            let mut due = Vec::new();
-            for watcher in guard.list() {
-                if matches!(
-                    watcher.lifecycle,
-                    WatcherLifecycle::Paused
-                        | WatcherLifecycle::Stopped { .. }
-                        | WatcherLifecycle::TargetTerminated
-                ) {
-                    continue;
-                }
-                let schedule = &watcher.observation_schedule;
-                let interval_ms = recovery_observation_interval_ms(&watcher);
-                let due_mono = runtime_due
-                    .entry(watcher.watcher_id.clone())
-                    .or_insert_with(|| {
-                        mono.saturating_add(
-                            schedule.next_due_wall_ms.saturating_sub(now).min(65_000),
-                        )
-                    });
-                *due_mono = (*due_mono).min(mono.saturating_add(interval_ms));
-                if schedule.event_wake_pending || mono >= *due_mono {
-                    let mut next = schedule.clone();
-                    next.last_check_wall_ms = Some(now);
-                    next.interval_sequence = next.interval_sequence.saturating_add(1);
-                    let jitter =
-                        observation_jitter_seconds(&watcher.watcher_id, next.interval_sequence);
-                    let next_interval = if interval_ms < 60_000 {
-                        interval_ms
-                    } else {
-                        (60_000i64 + jitter * 1_000).max(1) as u64
-                    };
-                    next.next_due_wall_ms = now.saturating_add(next_interval);
-                    runtime_due.insert(
-                        watcher.watcher_id.clone(),
-                        mono.saturating_add(next_interval),
-                    );
-                    due.push((watcher, next))
-                }
-            }
-            due
-        };
-        for (watcher, mut next_schedule) in due {
-            let event = match tokio::time::timeout(
-                Duration::from_secs(5),
-                observer.observe(watcher.clone()),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err("observation timed out".into()),
-            };
-            if let Ok(result) = event {
-                if let Some(sequence) = result.herdr_after_sequence {
-                    next_schedule.herdr_after_sequence = sequence;
-                }
-                let event = result.event;
-                if let Some(event) = event.as_ref()
-                    && event.source.kind == crate::model::SourceKind::ScreenDetection
-                {
-                    if event.category.is_actionable() {
-                        if next_schedule.screen_fingerprint.as_deref()
-                            == Some(&event.evidence_fingerprint)
-                        {
-                            next_schedule.screen_stable_count =
-                                next_schedule.screen_stable_count.saturating_add(1);
-                        } else {
-                            next_schedule.screen_fingerprint =
-                                Some(event.evidence_fingerprint.clone());
-                            next_schedule.screen_stable_count = 1;
-                        }
-                    } else {
-                        next_schedule.screen_fingerprint = None;
-                        next_schedule.screen_stable_count = 0;
-                    }
-                }
-                let mut guard = registry.lock().await;
-                if guard
-                    .commit_observation(
-                        &watcher.watcher_id,
-                        next_schedule,
-                        event,
-                        clock.wall_now_ms(),
-                    )
-                    .is_err()
-                {
-                    // A recovery decision may only consume an observation that is
-                    // durably committed. Retrying the next poll is safe; running
-                    // against the old snapshot is not.
-                    continue;
-                }
-                let current = recovery
-                    .as_ref()
-                    .and_then(|_| guard.get(&watcher.watcher_id).cloned());
-                drop(guard);
-                if let (Some(engine), Some(owner), Some(current), Some(supervisor)) = (
-                    recovery.as_ref(),
-                    owner.as_ref(),
-                    current,
-                    recovery_supervisor.as_ref(),
-                ) {
-                    let engine = engine.clone();
-                    let registry = registry.clone();
-                    let owner = owner.clone();
-                    let cancellation = supervisor.cancellation.clone();
-                    let watcher_id = current.watcher_id.clone();
-                    supervisor.schedule(watcher_id, move || {
-                        // `Herdr` deliberately rejects synchronous protocol calls
-                        // while a Tokio runtime is entered.  Keep the complete
-                        // recovery transaction on a native worker, rather than
-                        // relaxing that adapter guard or risking nested runtimes.
-                        let _ = std::thread::scope(|scope| {
-                            scope
-                                .spawn(|| {
-                                    recover_stale_durable_actions(&engine);
-                                    execute_recovery_action_with_cancellation(
-                                        registry,
-                                        engine,
-                                        current,
-                                        owner,
-                                        cancellation,
-                                    )
-                                })
-                                .join()
-                        });
-                    });
-                    // Verification intentionally runs alongside later
-                    // observation ticks: input progress is only trusted once
-                    // a fresh, durably committed observation confirms it.
-                }
-            }
-        }
-        iterations += 1;
-        if max_iterations > 0 && iterations >= max_iterations {
-            return;
-        }
-        clock.sleep_until_mono(mono.saturating_add(1_000)).await;
-    }
-}
-
-fn recovery_observation_interval_ms(watcher: &crate::model::WatcherState) -> u64 {
-    const NORMAL_INTERVAL_MS: u64 = 60_000;
-    const VERIFY_INTERVAL_MS: u64 = 1_000;
-    if watcher.recovery.as_ref().is_some_and(|machine| {
-        machine.state() == crate::recovery::state_machine::RecoveryState::Acting
-    }) {
-        VERIFY_INTERVAL_MS
-    } else {
-        NORMAL_INTERVAL_MS
-    }
-}
-
-pub fn observation_jitter_seconds(watcher_id: &str, interval_sequence: u64) -> i64 {
-    let hash = watcher_id.bytes().fold(interval_sequence, |acc, byte| {
-        acc.wrapping_mul(109).wrapping_add(u64::from(byte))
-    });
-    (hash % 11) as i64 - 5
 }
 
 async fn run_lifecycle_monitor(
@@ -1037,239 +752,6 @@ fn has_active_watchers(registry: &Registry) -> bool {
             WatcherLifecycle::Stopped { .. } | WatcherLifecycle::TargetTerminated
         )
     })
-}
-
-async fn service_connection<P: PeerCredentialProvider>(
-    mut stream: tokio::net::UnixStream,
-    registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
-    scheduler: SchedulerHandle,
-    peer_credentials: std::sync::Arc<P>,
-    shutdown_sender: tokio::sync::mpsc::UnboundedSender<ShutdownSignal>,
-    timeout: Duration,
-) {
-    match peer_credentials.effective_uid(&stream) {
-        Ok(uid) if uid == rustix::process::geteuid().as_raw() => {}
-        Ok(_) => {
-            eprintln!("watchme daemon: denied IPC peer with mismatched effective UID");
-            return;
-        }
-        Err(error) => {
-            eprintln!("watchme daemon: could not validate IPC peer: {error}");
-            return;
-        }
-    }
-    let request = match read_request(&mut stream, timeout).await {
-        Ok(request) => request,
-        Err(error) => {
-            eprintln!("watchme daemon: rejected IPC request: {error}");
-            let _ = write_response(
-                &mut stream,
-                &Response::Error {
-                    code: "invalid_request".into(),
-                    message: error.to_string(),
-                },
-                timeout,
-            )
-            .await;
-            return;
-        }
-    };
-    if request_has_empty_target(&request) {
-        let _ = write_response(
-            &mut stream,
-            &Response::Error {
-                code: "invalid_target".into(),
-                message: "target ID must not be empty".into(),
-            },
-            timeout,
-        )
-        .await;
-        return;
-    }
-    if matches!(
-        request,
-        Request::Stop {
-            id: None,
-            all: false
-        }
-    ) {
-        let _ = write_response(
-            &mut stream,
-            &Response::Error {
-                code: "invalid_request".into(),
-                message: "stop requires a watcher ID or --all".into(),
-            },
-            timeout,
-        )
-        .await;
-        return;
-    }
-    if matches!(request, Request::Shutdown) {
-        let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
-        let (written, response_written) = tokio::sync::oneshot::channel();
-        if shutdown_sender
-            .send(ShutdownSignal {
-                acknowledged,
-                response_written,
-            })
-            .is_err()
-        {
-            let _ = write_response(
-                &mut stream,
-                &Response::Error {
-                    code: "daemon_stopping".into(),
-                    message: "daemon shutdown coordinator is unavailable".into(),
-                },
-                timeout,
-            )
-            .await;
-            return;
-        }
-        if acknowledgement.await.is_err() {
-            return;
-        }
-        let _ = write_response(&mut stream, &Response::Stopped, timeout).await;
-        let _ = written.send(());
-        return;
-    }
-    let (response, _) = {
-        let mut registry = registry.lock().await;
-        handle_request(&mut registry, &scheduler, request)
-    };
-    let response = response.unwrap_or_else(|error| Response::Error {
-        code: "daemon_error".into(),
-        message: error.to_string(),
-    });
-    if let Err(error) = write_response(&mut stream, &response, timeout).await {
-        eprintln!("watchme daemon: IPC response failed: {error}");
-    }
-}
-
-fn request_has_empty_target(request: &Request) -> bool {
-    match request {
-        Request::Status { id } | Request::Stop { id, .. } => {
-            id.as_ref().is_some_and(String::is_empty)
-        }
-        Request::Pause { id } | Request::Resume { id } | Request::WakeObservation { id, .. } => {
-            id.is_empty()
-        }
-        Request::List | Request::Register { .. } | Request::Shutdown => false,
-    }
-}
-
-fn handle_request(
-    registry: &mut Registry,
-    scheduler: &SchedulerHandle,
-    request: Request,
-) -> (Result<Response, registry::RegistryError>, bool) {
-    match request {
-        Request::Status { id } => (
-            Ok(Response::Status {
-                running: true,
-                watchers: id.map_or_else(
-                    || registry.list(),
-                    |id| registry.get(&id).cloned().into_iter().collect(),
-                ),
-            }),
-            false,
-        ),
-        Request::List => (
-            Ok(Response::Watchers {
-                watchers: registry.list(),
-            }),
-            false,
-        ),
-        Request::WakeObservation {
-            id,
-            event_fingerprint,
-        } => (
-            registry
-                .wake_observation(&id, &event_fingerprint, now_ms())
-                .map(|()| Response::Acknowledged),
-            false,
-        ),
-        Request::Register { watcher } => (
-            registry.register(*watcher).map(|outcome| match outcome {
-                RegistrationOutcome::Added(watcher_id) => {
-                    let _ = scheduler.send(SchedulerEvent::Register(watcher_id.clone()));
-                    Response::Registered {
-                        watcher_id,
-                        existing: false,
-                    }
-                }
-                RegistrationOutcome::Existing(watcher_id) => Response::Registered {
-                    watcher_id,
-                    existing: true,
-                },
-            }),
-            false,
-        ),
-        Request::Stop { id, all } => {
-            let ids: Vec<String> = if all {
-                registry
-                    .list()
-                    .into_iter()
-                    .map(|watcher| watcher.watcher_id)
-                    .collect()
-            } else {
-                id.into_iter().collect()
-            };
-            let result = ids
-                .into_iter()
-                .try_for_each(|id| {
-                    registry.transition(
-                        &id,
-                        WatcherLifecycle::Stopped {
-                            reason: "requested".into(),
-                        },
-                        now_ms(),
-                    )
-                })
-                .map(|()| Response::Stopped);
-            for id in registry
-                .list()
-                .into_iter()
-                .filter(|watcher| matches!(watcher.lifecycle, WatcherLifecycle::Stopped { .. }))
-                .map(|watcher| watcher.watcher_id)
-            {
-                let _ = scheduler.send(SchedulerEvent::Stop(id));
-            }
-            (result, false)
-        }
-        Request::Pause { id } => (
-            registry
-                .transition(&id, WatcherLifecycle::Paused, now_ms())
-                .map(|()| {
-                    let _ = scheduler.send(SchedulerEvent::Pause(id.clone()));
-                    Response::Updated {
-                        watcher: Box::new(
-                            registry
-                                .get(&id)
-                                .expect("transitioned watcher exists")
-                                .clone(),
-                        ),
-                    }
-                }),
-            false,
-        ),
-        Request::Resume { id } => (
-            registry
-                .transition(&id, WatcherLifecycle::Observing, now_ms())
-                .map(|()| {
-                    let _ = scheduler.send(SchedulerEvent::Resume(id.clone()));
-                    Response::Updated {
-                        watcher: Box::new(
-                            registry
-                                .get(&id)
-                                .expect("transitioned watcher exists")
-                                .clone(),
-                        ),
-                    }
-                }),
-            false,
-        ),
-        Request::Shutdown => (Ok(Response::Stopped), true),
-    }
 }
 
 fn now_ms() -> u64 {
@@ -1719,6 +1201,7 @@ mod process_lifecycle_tests {
 
 #[cfg(test)]
 mod recovery_runtime_tests {
+    use super::runtime_services::DaemonRuntimeServices;
     use super::*;
     use crate::model::{
         Event, EventCategory, EventSource, PolicyHint, ProcessIdentity, SourceKind, TargetIdentity,

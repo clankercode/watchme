@@ -1,7 +1,9 @@
+use super::runtime_services::{
+    DaemonRuntimeServices, SystemRecoveryClock, target_process_is_alive,
+};
 use super::{
-    DaemonRuntimeServices, Registry, SystemRecoveryClock, WatcherLifecycle, capture_mux_target,
-    execute_mux_action, mux_identity_key, now_ms, process_identity_key, target_identity_hash,
-    target_process_is_alive, validate_mux_target, watcher_mux_identity,
+    Registry, WatcherLifecycle, capture_mux_target, execute_mux_action, mux_identity_key, now_ms,
+    process_identity_key, target_identity_hash, validate_mux_target, watcher_mux_identity,
 };
 use crate::daemon::registry::DispatchSnapshot;
 use crate::mux::ComposerSafety;
