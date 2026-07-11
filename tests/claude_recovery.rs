@@ -423,10 +423,14 @@ fn transcript_binding_rejects_replacement_without_treating_mutable_contents_as_i
         &transcript,
         &binding
     ));
+    // Hold the old inode open so delete+recreate cannot reuse it (seen on
+    // Linux aarch64 CI when the negative assertion otherwise flakes).
+    let held = fs::File::open(&transcript).unwrap();
     fs::remove_file(&transcript).unwrap();
     fs::write(&transcript, "same-length-evidence\n").unwrap();
     #[cfg(unix)]
     fs::set_permissions(&transcript, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(held);
     assert!(!watchme::hooks::claude::transcript_matches_binding(
         &transcript,
         &transcript,

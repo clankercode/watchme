@@ -1,3 +1,10 @@
+## 0.1.11 — 2026-07-12
+
+### Fixed
+
+- Expect physicalized XDG config paths in CLI tests (macOS `/var` → `/private/var`).
+- Hold replaced transcript inodes open so Claude binding negative checks cannot flake on inode reuse.
+
 ## 0.1.10 — 2026-07-12
 
 ### Fixed

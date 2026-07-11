@@ -86,7 +86,13 @@ fn administrative_commands_parse() {
 fn config_path_prints_xdg_resolved_config_file() {
     let temp = tempdir().unwrap();
     let config_home = temp.path().join("config");
-    let expected = config_home.join("watchme").join("config.toml");
+    std::fs::create_dir_all(&config_home).unwrap();
+    // macOS tempdirs sit under /var -> /private/var; WatchMe physicalizes the
+    // existing prefix before joining watchme/config.toml.
+    let expected = std::fs::canonicalize(&config_home)
+        .unwrap()
+        .join("watchme")
+        .join("config.toml");
     Command::cargo_bin("watchme")
         .unwrap()
         .env("HOME", temp.path())
