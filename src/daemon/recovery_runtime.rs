@@ -8,8 +8,10 @@ use crate::mux::ComposerSafety;
 use crate::recovery::actuator::{ActionExecutor, ExecutionError, ExecutionOutput, RuntimeActuator};
 use crate::recovery::transaction::{EvidenceReader, LiveEvidence, OwnerIdentity};
 
-/// Reads the durable watcher at every transaction boundary. A revision or
-/// lifecycle change is evidence of concurrent ownership and fails closed.
+/// Reads the durable watcher at every transaction boundary. Target and
+/// lifecycle changes are evidence of concurrent ownership and fail closed;
+/// a new observation of the same live target is instead the evidence needed
+/// to verify a dispatched input action.
 pub(super) struct FreshTargetEvidence {
     registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
     snapshot: DispatchSnapshot,
@@ -31,8 +33,9 @@ impl FreshTargetEvidence {
             .ok_or_else(|| "recovery watcher disappeared".to_owned())
     }
 
-    fn unchanged(&self, watcher: &crate::model::WatcherState) -> bool {
-        watcher == self.snapshot.watcher()
+    fn target_and_lifecycle_are_stable(&self, watcher: &crate::model::WatcherState) -> bool {
+        watcher.target == self.snapshot.watcher().target
+            && watcher.lifecycle == self.snapshot.watcher().lifecycle
     }
 }
 
@@ -43,7 +46,7 @@ impl EvidenceReader for FreshTargetEvidence {
             .last_observation
             .clone()
             .ok_or_else(|| "missing current observation".to_owned())?;
-        let unchanged = self.unchanged(&watcher);
+        let target_and_lifecycle_are_stable = self.target_and_lifecycle_are_stable(&watcher);
         let process_alive = target_process_is_alive(&watcher.target);
         let (target_revalidated, pane_matches, identity, composer_safe) =
             match watcher_mux_identity(&watcher) {
@@ -70,7 +73,7 @@ impl EvidenceReader for FreshTargetEvidence {
             };
         let event_matches = event.watcher_id == watcher.watcher_id
             && event.target_identity_hash == target_identity_hash(&watcher.target);
-        let human_intervened = !unchanged
+        let human_intervened = !target_and_lifecycle_are_stable
             || matches!(
                 watcher.lifecycle,
                 WatcherLifecycle::Paused
@@ -84,7 +87,7 @@ impl EvidenceReader for FreshTargetEvidence {
             target_revalidated,
             process_alive,
             pane_matches,
-            evidence_current: unchanged && event_matches,
+            evidence_current: event_matches,
             composer_safe,
             human_intervened,
             event,
@@ -128,6 +131,8 @@ struct DaemonActionExecutor {
     services: DaemonRuntimeServices,
     evidence: FreshTargetEvidence,
     snapshot: DispatchSnapshot,
+    #[cfg(test)]
+    before_mux_dispatch: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DaemonActionExecutor {
@@ -143,6 +148,26 @@ impl DaemonActionExecutor {
             evidence: FreshTargetEvidence::new(registry.clone(), snapshot.clone()),
             registry,
             snapshot,
+            #[cfg(test)]
+            before_mux_dispatch: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_before_mux_dispatch(
+        registry: std::sync::Arc<tokio::sync::Mutex<Registry>>,
+        snapshot: DispatchSnapshot,
+        hook: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let mut executor = Self::new(registry, snapshot);
+        executor.before_mux_dispatch = Some(hook);
+        executor
+    }
+
+    fn before_mux_dispatch(&self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_mux_dispatch {
+            hook();
         }
     }
 
@@ -175,6 +200,7 @@ impl ActionExecutor for DaemonActionExecutor {
         match &action.kind {
             ActionKind::SendText { .. } | ActionKind::SendKeys { .. } => {
                 self.confirm_live_evidence()?;
+                self.before_mux_dispatch();
                 // Keep the registry lock through the mux command.  Retarget,
                 // pause, and stop all require this same lock, making the
                 // revision check and external side effect one critical region.
@@ -373,9 +399,10 @@ mod tests {
         tmux::{Tmux, TmuxSelector},
     };
     use crate::recovery::action_store::JsonActionStore;
+    use crate::recovery::coordinator::RecoveryCoordinator;
     use crate::recovery::engine::{RecipeProvider, RecoveryEngine};
     use crate::recovery::state_machine::{Budget, RecoveryCommand, RecoveryMachine};
-    use crate::recovery::transaction::{ActionPhase, ActionStore, OwnerIdentity};
+    use crate::recovery::transaction::{ActionPhase, ActionStore, OwnerIdentity, TransactionError};
     use crate::store::JsonStore;
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -395,6 +422,25 @@ mod tests {
                 5,
             ))
         }
+    }
+
+    struct InputRecipe;
+    impl RecipeProvider for InputRecipe {
+        fn action_for(&self, watcher: &WatcherState) -> Option<Action> {
+            let event = watcher.last_observation.as_ref()?;
+            Some(Action::send_text(
+                "test.input",
+                "continue",
+                "test dispatch-boundary interleaving",
+                event.evidence_fingerprint.clone(),
+            ))
+        }
+    }
+
+    enum DispatchMutation {
+        Pause,
+        HumanRevision,
+        RetargetPaneReuse,
     }
 
     struct TmuxServerGuard(String);
@@ -430,7 +476,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let tmux = Tmux::for_socket_name(socket, Duration::from_secs(2));
+        let tmux = Tmux::for_socket_name(socket.clone(), Duration::from_secs(2));
         let deadline = Instant::now() + Duration::from_secs(2);
         let identity = loop {
             let candidate = tmux
@@ -534,6 +580,205 @@ mod tests {
     }
 
     #[test]
+    fn final_mux_dispatch_interleavings_cancel_before_input_and_never_retry() {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            return;
+        }
+        for mutation in [
+            DispatchMutation::Pause,
+            DispatchMutation::HumanRevision,
+            DispatchMutation::RetargetPaneReuse,
+        ] {
+            assert_final_mux_interleaving_cancels(mutation);
+        }
+    }
+
+    fn assert_final_mux_interleaving_cancels(mutation: DispatchMutation) {
+        let socket = format!(
+            "watchme-interleave-{}-{}",
+            std::process::id(),
+            match mutation {
+                DispatchMutation::Pause => "pause",
+                DispatchMutation::HumanRevision => "human",
+                DispatchMutation::RetargetPaneReuse => "reuse",
+            }
+        );
+        let _server = TmuxServerGuard(socket.clone());
+        assert!(
+            Command::new("tmux")
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "-L",
+                    &socket,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "recovery",
+                    "sh",
+                    "-c",
+                    "printf 'recovery-ready\\n'; while IFS= read -r line; do printf 'INPUT:%s\\n' \"$line\"; done",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let tmux = Tmux::for_socket_name(socket.clone(), Duration::from_secs(2));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let identity = loop {
+            let candidate = tmux
+                .resolve_selector(&TmuxSelector::parse("recovery").unwrap())
+                .unwrap();
+            if tmux
+                .capture_tail(&candidate, 8, 1_024)
+                .is_ok_and(|capture| capture.text.contains("recovery-ready"))
+            {
+                break candidate;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test tmux pane did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let target = TargetIdentity::tmux(
+            identity.server,
+            identity.server_instance,
+            identity.session_id,
+            identity.window_id,
+            identity.pane_id,
+            identity.tty,
+            identity.process,
+            None,
+        );
+        let fingerprint = "d".repeat(64);
+        let mut machine = RecoveryMachine::new(Budget {
+            max_attempts: 2,
+            max_cumulative_wait: Duration::from_secs(60),
+            planner_calls: 0,
+            cooldown: Duration::ZERO,
+        });
+        machine.apply(RecoveryCommand::Revalidated).unwrap();
+        machine
+            .apply(RecoveryCommand::Confirm {
+                fingerprint: fingerprint.clone(),
+            })
+            .unwrap();
+        let mut watcher = WatcherState::new(
+            format!("interleave-{socket}"),
+            target.clone(),
+            WatcherLifecycle::Observing,
+            0,
+            1,
+        );
+        watcher.recovery = Some(machine);
+        watcher.last_observation = Some(
+            Event::new(
+                "event",
+                "2026-07-11T00:00:00Z",
+                watcher.watcher_id.clone(),
+                target_identity_hash(&target),
+                EventSource::new(SourceKind::ScreenDetection, "tmux", "generic_tail"),
+                EventCategory::BlockedGoal,
+                0.9,
+                false,
+                fingerprint.clone(),
+                "blocked",
+                PolicyHint::DeterministicActionAllowed,
+            )
+            .unwrap(),
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let mut initial =
+            Registry::load(JsonStore::new(temporary.path().join("watchers.json"))).unwrap();
+        initial.register(watcher.clone()).unwrap();
+        RecoveryCoordinator::new(&mut initial)
+            .begin_action(
+                &watcher.watcher_id,
+                &fingerprint,
+                crate::recovery::state_machine::ClockSnapshot::new(0, 0),
+                1,
+            )
+            .unwrap();
+        let dispatch = initial.dispatch_snapshot(&watcher.watcher_id).unwrap();
+        let current = dispatch.watcher().clone();
+        let registry = std::sync::Arc::new(tokio::sync::Mutex::new(initial));
+        let target_id = current.watcher_id.clone();
+        let registry_for_hook = registry.clone();
+        let hook = std::sync::Arc::new(move || {
+            let mut guard = registry_for_hook.blocking_lock();
+            match mutation {
+                DispatchMutation::Pause => guard
+                    .transition(&target_id, WatcherLifecycle::Paused, 2)
+                    .unwrap(),
+                DispatchMutation::HumanRevision => guard
+                    .transition(
+                        &target_id,
+                        WatcherLifecycle::HumanRequired {
+                            reason: "human changed pane after baseline".into(),
+                        },
+                        2,
+                    )
+                    .unwrap(),
+                DispatchMutation::RetargetPaneReuse => guard
+                    .retarget_process(&target_id, ProcessIdentity::new(u32::MAX, u64::MAX), 2)
+                    .unwrap(),
+            }
+        });
+        let evidence = FreshTargetEvidence::new(registry.clone(), dispatch.clone());
+        let executor =
+            DaemonActionExecutor::with_before_mux_dispatch(registry.clone(), dispatch, hook);
+        let store = JsonActionStore::load(temporary.path().join("actions.json")).unwrap();
+        let engine = RecoveryEngine::new(store, InputRecipe);
+        let clock = SystemRecoveryClock::new();
+        let result = engine.execute(
+            &current,
+            OwnerIdentity {
+                pid: std::process::id(),
+                process_start_time: 0,
+                nonce: "interleaving".into(),
+            },
+            &evidence,
+            &executor,
+            &clock,
+        );
+        assert!(matches!(result, Err(TransactionError::Execution(_))));
+        let audit = engine.store().audit(&current.watcher_id).unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|record| record.phase == ActionPhase::Prepared)
+        );
+        assert_eq!(audit.last().unwrap().phase, ActionPhase::Failed);
+        assert!(
+            !tmux
+                .capture_tail(&watcher_mux_identity(&current).unwrap().unwrap(), 16, 2_048,)
+                .unwrap()
+                .text
+                .contains("INPUT:")
+        );
+        let retries = engine.execute(
+            &current,
+            OwnerIdentity {
+                pid: std::process::id(),
+                process_start_time: 0,
+                nonce: "interleaving-retry".into(),
+            },
+            &evidence,
+            &executor,
+            &clock,
+        );
+        assert!(retries.is_err(), "stale dispatch must not execute on retry");
+        assert!(
+            !tmux
+                .capture_tail(&watcher_mux_identity(&current).unwrap().unwrap(), 16, 2_048,)
+                .unwrap()
+                .text
+                .contains("INPUT:")
+        );
+    }
+
+    #[test]
     fn capture_source_must_be_bound_to_the_current_adapter_observation() {
         let target = TargetIdentity::herdr(
             "/tmp/herdr.sock".into(),
@@ -613,6 +858,6 @@ mod tests {
 
         let current = reader.read().unwrap();
         assert!(current.human_intervened);
-        assert!(!current.evidence_current);
+        assert!(current.evidence_current);
     }
 }

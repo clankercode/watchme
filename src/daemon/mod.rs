@@ -671,24 +671,30 @@ async fn run_observation_loop(
                     continue;
                 }
                 let schedule = &watcher.observation_schedule;
-                let due_mono = *runtime_due
+                let interval_ms = recovery_observation_interval_ms(&watcher);
+                let due_mono = runtime_due
                     .entry(watcher.watcher_id.clone())
                     .or_insert_with(|| {
                         mono.saturating_add(
                             schedule.next_due_wall_ms.saturating_sub(now).min(65_000),
                         )
                     });
-                if schedule.event_wake_pending || mono >= due_mono {
+                *due_mono = (*due_mono).min(mono.saturating_add(interval_ms));
+                if schedule.event_wake_pending || mono >= *due_mono {
                     let mut next = schedule.clone();
                     next.last_check_wall_ms = Some(now);
                     next.interval_sequence = next.interval_sequence.saturating_add(1);
                     let jitter =
                         observation_jitter_seconds(&watcher.watcher_id, next.interval_sequence);
-                    next.next_due_wall_ms =
-                        now.saturating_add_signed((60_000i64 + jitter * 1_000).max(1));
+                    let next_interval = if interval_ms < 60_000 {
+                        interval_ms
+                    } else {
+                        (60_000i64 + jitter * 1_000).max(1) as u64
+                    };
+                    next.next_due_wall_ms = now.saturating_add(next_interval);
                     runtime_due.insert(
                         watcher.watcher_id.clone(),
-                        mono.saturating_add_signed((60_000i64 + jitter * 1_000).max(1)),
+                        mono.saturating_add(next_interval),
                     );
                     due.push((watcher, next))
                 }
@@ -754,11 +760,24 @@ async fn run_observation_loop(
                     let engine = engine.clone();
                     let registry = registry.clone();
                     let owner = owner.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        recover_stale_durable_actions(&engine);
-                        execute_recovery_action(registry, engine, current, owner)
-                    })
-                    .await;
+                    let recovery_task = tokio::task::spawn_blocking(move || {
+                        // `Herdr` deliberately rejects synchronous protocol calls
+                        // while a Tokio runtime is entered.  Keep the complete
+                        // recovery transaction on a native worker, rather than
+                        // relaxing that adapter guard or risking nested runtimes.
+                        let _ = std::thread::scope(|scope| {
+                            scope
+                                .spawn(|| {
+                                    recover_stale_durable_actions(&engine);
+                                    execute_recovery_action(registry, engine, current, owner)
+                                })
+                                .join()
+                        });
+                    });
+                    // Verification intentionally runs alongside later
+                    // observation ticks: input progress is only trusted once
+                    // a fresh, durably committed observation confirms it.
+                    drop(recovery_task);
                 }
             }
         }
@@ -767,6 +786,18 @@ async fn run_observation_loop(
             return;
         }
         clock.sleep_until_mono(mono.saturating_add(1_000)).await;
+    }
+}
+
+fn recovery_observation_interval_ms(watcher: &crate::model::WatcherState) -> u64 {
+    const NORMAL_INTERVAL_MS: u64 = 60_000;
+    const VERIFY_INTERVAL_MS: u64 = 1_000;
+    if watcher.recovery.as_ref().is_some_and(|machine| {
+        machine.state() == crate::recovery::state_machine::RecoveryState::Acting
+    }) {
+        VERIFY_INTERVAL_MS
+    } else {
+        NORMAL_INTERVAL_MS
     }
 }
 
@@ -1657,7 +1688,16 @@ mod recovery_runtime_tests {
         )
         .await;
 
-        let audit = engine.store().audit("waiter").unwrap();
+        let mut audit = engine.store().audit("waiter").unwrap();
+        for _ in 0..100 {
+            if audit.last().is_some_and(|record| {
+                record.phase == crate::recovery::transaction::ActionPhase::Succeeded
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            audit = engine.store().audit("waiter").unwrap();
+        }
         assert_eq!(
             audit.last().unwrap().phase,
             crate::recovery::transaction::ActionPhase::Succeeded

@@ -470,13 +470,20 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
         baseline: Option<&LiveEvidence>,
     ) -> Result<LiveEvidence, TransactionError> {
         let live = self.evidence.read().map_err(TransactionError::Store)?;
-        if !live.target_revalidated
-            || !live.process_alive
-            || !live.pane_matches
-            || !live.evidence_current
-        {
+        if !live.target_revalidated {
+            return Err(TransactionError::Revalidation("target was not revalidated"));
+        }
+        if !live.process_alive {
             return Err(TransactionError::Revalidation(
-                "live target evidence incomplete",
+                "target process is not alive",
+            ));
+        }
+        if !live.pane_matches {
+            return Err(TransactionError::Revalidation("target pane does not match"));
+        }
+        if !live.evidence_current {
+            return Err(TransactionError::Revalidation(
+                "live evidence is not current",
             ));
         }
         if live.human_intervened {
