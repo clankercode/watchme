@@ -29,6 +29,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked
+      - name: Test release reconciliation
+        run: scripts/test-reconcile-release.sh
 
   test:
     name: Test (${{ matrix.name }})

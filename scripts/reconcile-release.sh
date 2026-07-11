@@ -13,10 +13,12 @@ version="${tag#v}"
 version="${version%%+*}"
 if [[ "$version" == *-* ]]; then
   expected_prerelease=true
+  expected_latest=false
   prerelease_flag=(--prerelease)
   latest_flag=(--latest=false)
 else
   expected_prerelease=false
+  expected_latest=true
   prerelease_flag=(--prerelease=false)
   latest_flag=(--latest)
 fi
@@ -33,17 +35,24 @@ for asset in "${expected_assets[@]}"; do
 done
 
 release_json() {
-  gh release view "$tag" \
-    --json isDraft,isImmutable,name,body,assets,isPrerelease
+  local metadata latest releases
+  metadata="$(gh release view "$tag" \
+    --json isDraft,isImmutable,name,body,assets,isPrerelease)" || return 1
+  # `gh release view` does not expose isLatest. `gh release list` does, so
+  # merge it into the same metadata object using the official CLI schema.
+  releases="$(gh release list --limit 1000 --json tagName,isLatest)" || return 1
+  latest="$(jq --arg tag "$tag" '[.[] | select(.tagName == $tag)][0].isLatest // false' <<<"$releases")"
+  jq --argjson latest "$latest" '. + {isLatest: $latest}' <<<"$metadata"
 }
 
 verify_release() {
-  local json="$1" expected_draft="$2" verify_dir
+  local json="$1" expected_draft="$2" expected_release_latest="$3" verify_dir
   verify_dir="$(mktemp -d)"
   cleanup_dirs+=("$verify_dir")
 
   test "$(jq -r .isDraft <<<"$json")" = "$expected_draft" || return 1
   test "$(jq -r .isPrerelease <<<"$json")" = "$expected_prerelease" || return 1
+  test "$(jq -r .isLatest <<<"$json")" = "$expected_release_latest" || return 1
   test "$(jq -r .name <<<"$json")" = "$title" || return 1
   jq -j .body <<<"$json" >"${verify_dir}/REMOTE_NOTES.md" || return 1
   cmp "$notes_file" "${verify_dir}/REMOTE_NOTES.md" || return 1
@@ -66,7 +75,7 @@ trap cleanup EXIT
 
 if json="$(release_json 2>/dev/null)"; then
   if [[ "$(jq -r .isDraft <<<"$json")" == false ]]; then
-    if verify_release "$json" false; then
+    if verify_release "$json" false "$expected_latest"; then
       printf 'Published release %s already matches; no changes required.\n' "$tag"
       exit 0
     fi
@@ -87,9 +96,9 @@ fi
 gh release upload "$tag" \
   "${dist}"/*.tar.gz "${dist}/SHA256SUMS" --clobber
 json="$(release_json)"
-verify_release "$json" true
+verify_release "$json" true false
 
 gh release edit "$tag" --draft=false --title "$title" \
   --notes-file "$notes_file" "${prerelease_flag[@]}" "${latest_flag[@]}"
 json="$(release_json)"
-verify_release "$json" false
+verify_release "$json" false "$expected_latest"

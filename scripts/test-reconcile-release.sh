@@ -19,6 +19,10 @@ if [[ "${0##*/}" == gh ]]; then
         --argjson assets "$assets" \
         '{isDraft:$draft,isImmutable:$immutable,isPrerelease:$prerelease,name:$name,body:$body,assets:$assets}'
       ;;
+    list)
+      jq -n --arg tag "$(<"$state/tag")" --argjson latest "$(<"$state/latest")" \
+        '[{tagName:$tag,isLatest:$latest}]'
+      ;;
     create|edit)
       touch "$state/exists"
       [[ "$command" == create ]] && printf true >"$state/draft"
@@ -28,6 +32,8 @@ if [[ "${0##*/}" == gh ]]; then
           --draft=false) printf false >"$state/draft" ;;
           --prerelease) printf true >"$state/prerelease" ;;
           --prerelease=false) printf false >"$state/prerelease" ;;
+          --latest) printf true >"$state/latest" ;;
+          --latest=false) printf false >"$state/latest" ;;
           --title) shift; printf '%s' "$1" >"$state/name" ;;
           --notes-file) shift; cp "$1" "$state/body" ;;
         esac
@@ -81,11 +87,14 @@ reset_state() {
   printf false >"$MOCK_GH_STATE/immutable"
   printf false >"$MOCK_GH_STATE/prerelease"
   printf false >"$MOCK_GH_STATE/draft"
+  printf false >"$MOCK_GH_STATE/latest"
+  : >"$MOCK_GH_STATE/tag"
   : >"$MOCK_GH_STATE/name"
   : >"$MOCK_GH_STATE/body"
 }
 
 run_reconcile() {
+  printf '%s' "$1" >"$MOCK_GH_STATE/tag"
   (cd "$repo" && scripts/reconcile-release.sh "$1" "$work/dist" "$work/notes.md")
 }
 
@@ -95,6 +104,7 @@ make_dist v1.2.3
 run_reconcile v1.2.3
 test "$(<"$MOCK_GH_STATE/draft")" = false
 test "$(<"$MOCK_GH_STATE/prerelease")" = false
+test "$(<"$MOCK_GH_STATE/latest")" = true
 grep -q 'create.*--draft' "$MOCK_GH_STATE/log"
 grep -q -- '--latest ' "$MOCK_GH_STATE/log"
 
@@ -113,6 +123,14 @@ printf true >"$MOCK_GH_STATE/immutable"
 run_reconcile v1.2.3
 ! grep -Eq ' (create|edit|upload) ' "$MOCK_GH_STATE/log"
 
+# Latest mismatch on an immutable stable release fails without mutation.
+printf false >"$MOCK_GH_STATE/latest"
+: >"$MOCK_GH_STATE/log"
+if run_reconcile v1.2.3 2>"$work/latest-error"; then exit 1; fi
+grep -q 'new corrected version tag' "$work/latest-error"
+! grep -Eq ' (create|edit|upload) ' "$MOCK_GH_STATE/log"
+printf true >"$MOCK_GH_STATE/latest"
+
 # Mismatched immutable release: fail explicitly without mutation.
 printf 'wrong notes\n' >"$MOCK_GH_STATE/body"
 : >"$MOCK_GH_STATE/log"
@@ -125,7 +143,14 @@ reset_state
 make_dist v1.2.3-rc.1
 run_reconcile v1.2.3-rc.1
 test "$(<"$MOCK_GH_STATE/prerelease")" = true
+test "$(<"$MOCK_GH_STATE/latest")" = false
 grep -q -- '--prerelease ' "$MOCK_GH_STATE/log"
 grep -q -- '--latest=false' "$MOCK_GH_STATE/log"
+
+# Correct published prerelease is also a verified no-op.
+printf true >"$MOCK_GH_STATE/immutable"
+: >"$MOCK_GH_STATE/log"
+run_reconcile v1.2.3-rc.1
+! grep -Eq ' (create|edit|upload) ' "$MOCK_GH_STATE/log"
 
 printf 'release reconciliation fixtures passed\n'
