@@ -366,13 +366,21 @@ fn read_settings(settings: &Path) -> Result<serde_json::Value, String> {
     if !settings.exists() {
         return Ok(serde_json::json!({}));
     }
-    checked_file(settings, "Claude settings", true)?;
+    // Claude settings are configuration, not secrets, and Claude Code creates the
+    // file 0644 by default. Require only that it is not group/world *writable*
+    // (matching the parent-directory rule) rather than fully owner-only.
+    checked_file(settings, "Claude settings", false)?;
     serde_json::from_slice(&fs::read(settings).map_err(|e| e.to_string())?)
         .map_err(|e| format!("invalid Claude settings JSON: {e}"))
 }
 fn check_parent(settings: &Path) -> Result<(), String> {
     let parent = settings.parent().ok_or("settings lacks parent")?;
-    let meta = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+    // Resolve a symlinked configuration directory (e.g. ~/.claude -> ~/.claude-p)
+    // to its physical location before validating. A symlinked *leaf* settings file
+    // is still refused by checked_file / the open-time recheck; only the directory
+    // prefix is permitted to be a symlink, matching the state-store security model.
+    let parent = crate::paths::physicalize_existing_prefix(parent).map_err(|e| e.to_string())?;
+    let meta = fs::symlink_metadata(&parent).map_err(|e| e.to_string())?;
     if !meta.file_type().is_dir() {
         return Err("configuration parent is not a directory".into());
     }
@@ -401,7 +409,12 @@ fn checked_file(path: &Path, label: &str, private: bool) -> Result<fs::Metadata,
             meta.mode() & 0o022 != 0
         };
         if bad_mode || meta.uid() != rustix::process::getuid().as_raw() {
-            return Err(format!("{label} must be owner-only"));
+            let rule = if private {
+                "owner-only"
+            } else {
+                "owned and not group/world writable"
+            };
+            return Err(format!("{label} must be {rule}"));
         }
     }
     Ok(meta)
