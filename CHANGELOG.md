@@ -7,6 +7,7 @@
 ### Fixed
 
 - Detect supported Codex ancestors when shell-escaped commands have no controlling TTY, while retaining strict tmux and Herdr identity checks.
+- Recognize native Herdr API responses and fall back to verified process supervision instead of rejecting bare registration as a malformed provisional bridge response.
 
 ## 0.1.17 — 2026-07-12
 

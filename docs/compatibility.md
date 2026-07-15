@@ -61,11 +61,32 @@ proof remains a human hand-off.
 
 ## Herdr
 
-Probe date: 2026-07-11 (Australia/Sydney).
+Probe date: 2026-07-16 (Australia/Sydney).
 
-The read-only probe `command -v herdr` produced no output and exited non-zero on the development host. Consequently, no installed Herdr version, `--help` output, schema command, socket documentation, or upstream plugin API could be verified. No live Herdr state was opened or modified, and the live smoke test was skipped honestly because Herdr was absent.
+The development host and `x-left` report Herdr 0.7.4. Its bundled
+`herdr api schema --json` describes native protocol 16: requests use `id`,
+`method`, and `params`; responses use the same `id` with exactly one of
+`result` or `error`. A read-only `herdr api snapshot` on `x-left` confirmed a
+live protocol-16 server and the inherited workspace, tab, and pane context.
+Herdr's [socket API documentation](https://herdr.dev/docs/socket-api/) is the
+upstream reference for that native surface.
 
-WatchMe therefore implements and tests a fixed, local bridge contract rather than claiming compatibility with an unverified upstream API. The contract is newline-delimited JSON over the owner-owned Unix socket in `HERDR_SOCKET_PATH`, with `protocol = "watchme.herdr"`, `schema_version = 1`, unique request IDs, one request/response per connection, a 256 KiB response ceiling, and bounded timeouts. Context also requires `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID`.
+WatchMe's existing Herdr adapter implements a separate, fixed local bridge
+contract. It does not claim native protocol-16 pane control. The bridge is
+newline-delimited JSON over the owner-owned Unix socket in
+`HERDR_SOCKET_PATH`, with `protocol = "watchme.herdr"`, `schema_version = 1`,
+unique request IDs, one request/response per connection, a 256 KiB response
+ceiling, and bounded timeouts. Context also requires `HERDR_WORKSPACE_ID`,
+`HERDR_TAB_ID`, and `HERDR_PANE_ID`.
+
+When those inherited variables point at a native Herdr server, WatchMe first
+performs its normal socket ownership, mode, peer-credential, size, newline,
+and deadline checks. A syntactically valid native `id` plus `result`/`error`
+envelope is then treated as an explicit protocol incompatibility. Bare
+registration falls back to the independently verified coding-agent process;
+it does not persist Herdr multiplexer capabilities or send pane input. Partial
+environment, unsafe sockets, timeouts, arbitrary malformed responses, and
+process/pane contradictions still fail closed.
 
 The schema-faithful fake covers `pane_info`, `process_info`, bounded recent unwrapped `pane_read`, separate control-safe `send_text` and allowlisted symbolic `send_keys`, `agent_session`, `agent_state_events`, and `notification`. The client rejects partial, malformed, oversized, wrong-version, wrong-protocol, wrong-method, and mismatched-request responses. Success and failure are an exact union: success requires a non-null result and no error, while failure requires a non-null error and no result. One monotonic deadline covers connection, peer verification, write, response read, and parse; held or byte-dripping peers cannot renew it. It requires an absolute, canonical Unix socket owned by the current UID and not writable by group or others, rechecks the pathname device/inode after connecting, and uses Tokio's portable Unix peer-credential API on both Linux and macOS; unavailable or mismatched credentials fail closed. Target process, pane, and composer safety are revalidated at action boundaries, and terminal reads receive a post-read identity check. Persisted Herdr server identity combines the canonical socket path and provider-returned server ID, so either replacement changes target identity.
 
@@ -82,7 +103,8 @@ Probe date: 2026-07-12. Host reports `tmux 3.6b`. Real integration tests use iso
 | Claude Code 2.1.207 structured StopFailure hook | structured recovery (when correlated) | hook installer + fixture/e2e tests; live menu not established |
 | Claude Code terminal rate-limit menu | deterministic terminal recovery (fixture-only on this host) | fixtures; live probe blocked by first-run UI |
 | Codex blocked durable goal | structured / deterministic resume | fixture + recovery tests for `/goal resume` |
-| Herdr | contract-tested adapter | schema-faithful fake; live skipped (binary absent) |
+| Herdr 0.7.4 native API | process-supervision fallback | installed schema + read-only live `x-left` protocol-16 probe |
+| `watchme.herdr` bridge | contract-tested adapter | schema-faithful fake; no upstream bridge claim |
 | tmux 3.6b | first-class multiplexer | real integration tests |
 | Bundled generic manifests (opencode, pi, hermes, …) | observation-only to planner-assisted per manifest | bundled manifests + loader tests |
 | Untested / unknown agents | untested → safe degradation | `unknown.toml` + doctor/providers |

@@ -22,12 +22,13 @@ watchme daemon status
 | Permission errors on state/runtime | Directory not owner-only | Fix modes to `0700`; remove group/other write |
 | Claude hook not recovering | Missing correlation / macOS proof / first-run UI | See [compatibility.md](compatibility.md); install hook explicitly |
 | Herdr checks warn | Herdr not installed or env unset | Optional; tmux path remains available |
+| Herdr protocol error mentions unknown field `id` | Older WatchMe tried its provisional bridge contract against the native Herdr API | Upgrade WatchMe; current builds fall back to verified process supervision |
 | Planner refused | Same provider family / disabled / budget | Expected; escalate or configure independent planner |
 
 ## Multiplexer notes
 
 - **tmux**: real integration tests use isolated `-L` sockets. Pane rename/index changes must not break immutable identity.
-- **Herdr**: live probe skipped when binary absent; contract fake covers the socket protocol.
+- **Herdr**: Herdr 0.7.4's native socket API is detected but does not grant pane-control capabilities. WatchMe uses verified process supervision unless the socket implements the explicit `watchme.herdr` bridge contract.
 
 ## Logs
 
