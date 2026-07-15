@@ -248,8 +248,8 @@ impl Event {
         {
             return Err("event violates schema bounds".into());
         }
-        if let Some(reset) = &self.reset {
-            if reset.source_text.is_empty()
+        if let Some(reset) = &self.reset
+            && (reset.source_text.is_empty()
                 || reset.source_text.len() > 500
                 || chrono::DateTime::parse_from_rfc3339(&reset.parsed_at).is_err()
                 || !(0.0..=1.0).contains(&reset.confidence)
@@ -257,10 +257,9 @@ impl Event {
                 || reset
                     .timezone
                     .as_ref()
-                    .is_some_and(|value| value.len() > 128)
-            {
-                return Err("invalid reset".into());
-            }
+                    .is_some_and(|value| value.len() > 128))
+        {
+            return Err("invalid reset".into());
         }
         if self.metadata.len() > 32 {
             return Err("too many metadata fields".into());

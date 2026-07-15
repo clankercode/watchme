@@ -284,10 +284,10 @@ fn check_providers(paths: &WatchmePaths, config: &Config) -> DoctorCheck {
 }
 
 fn expand_home(value: &str) -> std::path::PathBuf {
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home).join(rest);
     }
     std::path::PathBuf::from(value)
 }

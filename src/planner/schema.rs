@@ -370,10 +370,10 @@ pub fn validate_recovery_plan(
                 "action type not allowlisted: {type_name}"
             )));
         }
-        if let ActionKind::SendText { text } = &action.kind {
-            if prohibited_text(text) {
-                return Err(SchemaError::new("prohibited send text"));
-            }
+        if let ActionKind::SendText { text } = &action.kind
+            && prohibited_text(text)
+        {
+            return Err(SchemaError::new("prohibited send text"));
         }
         policy
             .authorize(action, &policy_context)

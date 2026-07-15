@@ -321,19 +321,18 @@ pub fn correlated_rollout_event(
         return None;
     }
     let binding = bind_rollout(path)?;
-    if let Some(previous) = watcher.last_observation.as_ref() {
-        if previous
+    if let Some(previous) = watcher.last_observation.as_ref()
+        && previous
             .metadata
             .get("codex_rollout_path")
             .and_then(serde_json::Value::as_str)
             == Some(path.to_string_lossy().as_ref())
-        {
-            let previous_binding = previous.metadata.get("codex_rollout_binding")?;
-            let previous_binding: CodexRolloutBinding =
-                serde_json::from_value(previous_binding.clone()).ok()?;
-            if previous_binding != binding {
-                return None;
-            }
+    {
+        let previous_binding = previous.metadata.get("codex_rollout_binding")?;
+        let previous_binding: CodexRolloutBinding =
+            serde_json::from_value(previous_binding.clone()).ok()?;
+        if previous_binding != binding {
+            return None;
         }
     }
     let bytes = std::fs::read(path).ok()?;

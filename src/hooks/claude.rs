@@ -122,13 +122,13 @@ pub fn read_markers(path: &Path) -> Result<Vec<HookMarker>, String> {
         if line.len() > 8192 {
             continue;
         }
-        if let Ok(marker) = serde_json::from_str::<HookMarker>(&line) {
-            if valid_marker(&marker) {
-                if lines.len() == 256 {
-                    lines.pop_front();
-                }
-                lines.push_back(marker);
+        if let Ok(marker) = serde_json::from_str::<HookMarker>(&line)
+            && valid_marker(&marker)
+        {
+            if lines.len() == 256 {
+                lines.pop_front();
             }
+            lines.push_back(marker);
         }
     }
     Ok(lines.into_iter().collect())
@@ -206,10 +206,10 @@ pub fn parse_stop_failure_payload(payload: &[u8]) -> Result<HookMarker, String> 
     {
         return Err("Claude hook payload is not StopFailure".into());
     }
-    if let Some(cwd) = optional_string(object, "cwd", 4096)? {
-        if !Path::new(cwd).is_absolute() {
-            return Err("Claude hook cwd must be absolute".into());
-        }
+    if let Some(cwd) = optional_string(object, "cwd", 4096)?
+        && !Path::new(cwd).is_absolute()
+    {
+        return Err("Claude hook cwd must be absolute".into());
     }
     let _ = optional_string(object, "permission_mode", 128)?;
     if !Path::new(transcript_path).is_absolute()

@@ -69,7 +69,7 @@ impl ObservationClock for JumpingClock {
             *self.mono.lock().unwrap() = deadline;
             let mut sleeps = self.sleeps.lock().unwrap();
             *sleeps += 1;
-            let delta = if *sleeps % 2 == 0 {
+            let delta = if (*sleeps).is_multiple_of(2) {
                 3_601_000
             } else {
                 -3_599_000

@@ -817,13 +817,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let identity = loop {
             if let Ok(candidate) = tmux.resolve_selector(&TmuxSelector::parse("recovery").unwrap())
-            {
-                if tmux
+                && tmux
                     .capture_tail(&candidate, 8, 1_024)
                     .is_ok_and(|capture| capture.text.contains("recovery-ready"))
-                {
-                    break candidate;
-                }
+            {
+                break candidate;
             }
             assert!(
                 Instant::now() < deadline,
@@ -975,13 +973,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let identity = loop {
             if let Ok(candidate) = tmux.resolve_selector(&TmuxSelector::parse("recovery").unwrap())
-            {
-                if tmux
+                && tmux
                     .capture_tail(&candidate, 8, 1_024)
                     .is_ok_and(|capture| capture.text.contains("recovery-ready"))
-                {
-                    break candidate;
-                }
+            {
+                break candidate;
             }
             assert!(
                 Instant::now() < deadline,

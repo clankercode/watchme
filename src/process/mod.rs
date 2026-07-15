@@ -179,20 +179,20 @@ impl ProcessResolver {
         let ancestry = self.ancestry(inspector, child_pid);
         let mut candidates = Vec::new();
         for (distance, process) in ancestry.iter().enumerate().skip(1) {
-            if let Some(agent) = self.agent_for(process) {
-                if let Some(candidate) = self.candidate(process, agent, hints, Some(distance)) {
-                    candidates.push(candidate);
-                }
+            if let Some(agent) = self.agent_for(process)
+                && let Some(candidate) = self.candidate(process, agent, hints, Some(distance))
+            {
+                candidates.push(candidate);
             }
         }
         if candidates.is_empty()
             && let Some(tty) = &hints.tty
         {
             for process in inspector.processes_on_tty(tty)? {
-                if let Some(agent) = self.agent_for(&process) {
-                    if let Some(candidate) = self.candidate(&process, agent, hints, None) {
-                        candidates.push(candidate);
-                    }
+                if let Some(agent) = self.agent_for(&process)
+                    && let Some(candidate) = self.candidate(&process, agent, hints, None)
+                {
+                    candidates.push(candidate);
                 }
             }
         }

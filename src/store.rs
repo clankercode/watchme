@@ -155,10 +155,10 @@ impl JsonStore {
         let file = File::from(fd);
         let mut bytes = Vec::with_capacity(size.min(self.max_bytes) as usize);
         file.take(self.max_bytes + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 <= self.max_bytes {
-            if let Ok(value) = serde_json::from_slice(&bytes) {
-                return Ok(LoadOutcome::Present(value));
-            }
+        if bytes.len() as u64 <= self.max_bytes
+            && let Ok(value) = serde_json::from_slice(&bytes)
+        {
+            return Ok(LoadOutcome::Present(value));
         }
         before_quarantine();
         self.quarantine(&parent, &bytes, fixed_quarantine_name)
