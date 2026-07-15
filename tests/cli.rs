@@ -102,6 +102,17 @@ fn start_is_not_a_command() {
 
 #[test]
 fn administrative_commands_parse() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let configure = |command: &mut Command| {
+        command
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("XDG_STATE_HOME", temp.path().join("state"))
+            .env("XDG_RUNTIME_DIR", &runtime);
+    };
     // Operability commands must not fall through to the generic unimplemented
     // stub: they succeed, or return a specific actionable error.
     for arguments in [
@@ -111,11 +122,9 @@ fn administrative_commands_parse() {
         &["doctor", "--strict"],
         &["providers"],
     ] {
-        let output = Command::cargo_bin("watchme")
-            .expect("binary exists")
-            .args(arguments)
-            .output()
-            .expect("command runs");
+        let mut command = Command::cargo_bin("watchme").expect("binary exists");
+        configure(&mut command);
+        let output = command.args(arguments).output().expect("command runs");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !stderr.contains("not implemented yet"),
@@ -133,8 +142,9 @@ fn administrative_commands_parse() {
         &["daemon", "status"],
         &["daemon", "stop"],
     ] {
-        Command::cargo_bin("watchme")
-            .expect("binary exists")
+        let mut command = Command::cargo_bin("watchme").expect("binary exists");
+        configure(&mut command);
+        command
             .args(arguments)
             .assert()
             .failure()

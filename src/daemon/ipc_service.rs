@@ -197,6 +197,13 @@ fn handle_request(
                 watcher_id,
                 existing: true,
             },
+            RegistrationOutcome::Revalidated(watcher_id) => {
+                let _ = scheduler.send(SchedulerEvent::Resume(watcher_id.clone()));
+                Response::Registered {
+                    watcher_id,
+                    existing: true,
+                }
+            }
         }),
         Request::Stop { id, all } => {
             let ids: Vec<String> = if all {
@@ -257,5 +264,70 @@ fn handle_request(
                 }
             }),
         Request::Shutdown => Ok(Response::Stopped),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::daemon::scheduler::Scheduler;
+    use crate::model::{ProcessIdentity, TargetIdentity, WatcherState};
+    use crate::store::JsonStore;
+
+    #[tokio::test]
+    async fn fresh_registration_resumes_a_replayed_watcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("watchers.json");
+        let watcher = || {
+            WatcherState::new(
+                "replayed".into(),
+                TargetIdentity::process(ProcessIdentity::new(42, 900)),
+                WatcherLifecycle::Observing,
+                0,
+                1,
+            )
+        };
+        let mut initial = Registry::load(JsonStore::new(state_path.clone())).unwrap();
+        initial.register(watcher()).unwrap();
+        drop(initial);
+        let mut replayed = Registry::load(JsonStore::new(state_path)).unwrap();
+        assert!(matches!(
+            replayed.get("replayed").unwrap().lifecycle,
+            WatcherLifecycle::HumanRequired { .. }
+        ));
+
+        let (scheduler, runner) = Scheduler::new(Duration::from_secs(60), true);
+        scheduler
+            .send(SchedulerEvent::Register("replayed".into()))
+            .unwrap();
+        scheduler
+            .send(SchedulerEvent::Pause("replayed".into()))
+            .unwrap();
+        let task = tokio::spawn(runner.run());
+
+        assert_eq!(
+            handle_request(
+                &mut replayed,
+                &scheduler,
+                Request::Register {
+                    watcher: Box::new(watcher()),
+                },
+            )
+            .unwrap(),
+            Response::Registered {
+                watcher_id: "replayed".into(),
+                existing: true,
+            }
+        );
+        assert_eq!(
+            replayed.get("replayed").unwrap().lifecycle,
+            WatcherLifecycle::Registered
+        );
+        assert!(!scheduler.snapshot().await.unwrap()[0].paused);
+
+        scheduler.send(SchedulerEvent::Shutdown).unwrap();
+        task.await.unwrap();
     }
 }

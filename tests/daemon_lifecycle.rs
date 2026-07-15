@@ -104,12 +104,20 @@ fn registry_deduplicates_persists_transitions_and_replays_as_revalidation_requir
         .transition("first", WatcherLifecycle::Observing, 2)
         .unwrap();
 
-    let replayed = Registry::load(JsonStore::new(temp.path().join("watchers.json"))).unwrap();
+    let mut replayed = Registry::load(JsonStore::new(temp.path().join("watchers.json"))).unwrap();
     let watcher = replayed.get("first").unwrap();
     assert!(
         matches!(watcher.lifecycle, WatcherLifecycle::HumanRequired { ref reason } if reason.contains("revalidation"))
     );
     assert_eq!(watcher.revision, 2);
+
+    assert_eq!(
+        replayed.register(state("first", 42, 900)).unwrap(),
+        RegistrationOutcome::Revalidated("first".into())
+    );
+    let watcher = replayed.get("first").unwrap();
+    assert_eq!(watcher.lifecycle, WatcherLifecycle::Registered);
+    assert_eq!(watcher.revision, 3);
 }
 
 #[test]
@@ -129,6 +137,31 @@ fn registry_rejects_id_collision_without_overwriting_persisted_target() {
         persisted.get("same-id").unwrap().target,
         state("ignored", 42, 900).target
     );
+}
+
+#[test]
+fn fresh_registration_preserves_non_replay_human_required_state() {
+    let temp = TempDir::new().unwrap();
+    let mut registry = Registry::load(JsonStore::new(temp.path().join("watchers.json"))).unwrap();
+    registry.register(state("human", 42, 900)).unwrap();
+    registry
+        .transition(
+            "human",
+            WatcherLifecycle::HumanRequired {
+                reason: "authentication requires user action".into(),
+            },
+            2,
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.register(state("human", 42, 900)).unwrap(),
+        RegistrationOutcome::Existing("human".into())
+    );
+    assert!(matches!(
+        registry.get("human").unwrap().lifecycle,
+        WatcherLifecycle::HumanRequired { ref reason } if reason.contains("authentication")
+    ));
 }
 
 #[test]

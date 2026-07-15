@@ -26,7 +26,10 @@ pub enum RegistryError {
 pub enum RegistrationOutcome {
     Added(String),
     Existing(String),
+    Revalidated(String),
 }
+
+const RESTART_REVALIDATION_REASON: &str = "target revalidation required after daemon restart";
 
 /// Immutable authorization token for one daemon action.  Policy, evidence,
 /// and dispatch all bind to this same watcher image; any durable mutation
@@ -100,7 +103,7 @@ impl Registry {
                     | WatcherLifecycle::HumanRequired { .. }
             ) {
                 watcher.lifecycle = WatcherLifecycle::HumanRequired {
-                    reason: "target revalidation required after daemon restart".into(),
+                    reason: RESTART_REVALIDATION_REASON.into(),
                 };
                 watcher.revision = next_revision(watcher)?;
                 replay_transitioned = true;
@@ -126,27 +129,17 @@ impl Registry {
     ) -> Result<RegistrationOutcome, RegistryError> {
         if let Some(existing) = self.watchers.get(&watcher.watcher_id).cloned() {
             if stable_target_eq(&existing.target, &watcher.target) {
-                if existing.target.needs_revalidation() && !watcher.target.needs_revalidation() {
-                    let mut updated = self.watchers.clone();
-                    let upgraded = updated
-                        .get_mut(&watcher.watcher_id)
-                        .ok_or_else(|| RegistryError::Unknown(watcher.watcher_id.clone()))?;
-                    upgraded.target = watcher.target;
-                    upgraded.revision = next_revision(upgraded)?;
-                    upgraded.updated_at_unix_ms = watcher.updated_at_unix_ms;
-                    self.persist_watchers(&updated)?;
-                    self.watchers = updated;
-                }
-                return Ok(RegistrationOutcome::Existing(existing.watcher_id.clone()));
+                return self.refresh_existing(&existing.watcher_id, watcher);
             }
             return Err(RegistryError::IdCollision(watcher.watcher_id));
         }
-        if let Some(existing) = self
+        if let Some(existing_id) = self
             .watchers
             .values()
             .find(|existing| stable_target_eq(&existing.target, &watcher.target))
+            .map(|existing| existing.watcher_id.clone())
         {
-            return Ok(RegistrationOutcome::Existing(existing.watcher_id.clone()));
+            return self.refresh_existing(&existing_id, watcher);
         }
         let id = watcher.watcher_id.clone();
         let mut updated = self.watchers.clone();
@@ -154,6 +147,46 @@ impl Registry {
         self.persist_watchers(&updated)?;
         self.watchers = updated;
         Ok(RegistrationOutcome::Added(id))
+    }
+
+    fn refresh_existing(
+        &mut self,
+        existing_id: &str,
+        fresh: WatcherState,
+    ) -> Result<RegistrationOutcome, RegistryError> {
+        let existing = self
+            .watchers
+            .get(existing_id)
+            .ok_or_else(|| RegistryError::Unknown(existing_id.into()))?;
+        let target_upgraded =
+            existing.target.needs_revalidation() && !fresh.target.needs_revalidation();
+        let replay_revalidated = matches!(
+            &existing.lifecycle,
+            WatcherLifecycle::HumanRequired { reason } if reason == RESTART_REVALIDATION_REASON
+        );
+        if !target_upgraded && !replay_revalidated {
+            return Ok(RegistrationOutcome::Existing(existing_id.into()));
+        }
+
+        let mut updated = self.watchers.clone();
+        let refreshed = updated
+            .get_mut(existing_id)
+            .ok_or_else(|| RegistryError::Unknown(existing_id.into()))?;
+        refreshed.target = fresh.target;
+        if replay_revalidated {
+            refreshed.lifecycle = WatcherLifecycle::Registered;
+            refreshed.recovery = fresh.recovery;
+        }
+        refreshed.revision = next_revision(refreshed)?;
+        refreshed.updated_at_unix_ms = fresh.updated_at_unix_ms;
+        self.persist_watchers(&updated)?;
+        self.watchers = updated;
+
+        if replay_revalidated {
+            Ok(RegistrationOutcome::Revalidated(existing_id.into()))
+        } else {
+            Ok(RegistrationOutcome::Existing(existing_id.into()))
+        }
     }
 
     pub fn transition(
