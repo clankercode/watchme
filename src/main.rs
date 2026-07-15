@@ -1,6 +1,7 @@
 mod cli;
 mod error;
 mod hook_cli;
+mod registration_context;
 
 use std::process::ExitCode;
 

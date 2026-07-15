@@ -31,6 +31,88 @@ fn test_context_environment_variable_cannot_bypass_detection() {
 }
 
 #[test]
+fn bare_watchme_registers_from_ttyless_codex_ancestor() {
+    use std::process::{Command as StdCommand, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let temp = tempdir().unwrap();
+    let codex = temp.path().join("codex");
+    assert!(
+        StdCommand::new("rustc")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .args(["--edition=2024", "tests/fixtures/fake_codex.rs", "-o"])
+            .arg(&codex)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let runtime = temp.path().join("runtime");
+    let state = temp.path().join("state");
+    let home = temp.path().join("home");
+    for directory in [&runtime, &state, &home] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let child = StdCommand::new(&codex)
+        .env("WATCHME_BIN", env!("CARGO_BIN_EXE_watchme"))
+        .env("HOME", &home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut child = ChildGuard(child);
+    let state_file = state.join("watchme/watchers.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let persisted = loop {
+        if let Ok(bytes) = fs::read(&state_file)
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+            && value["watchers"]
+                .as_array()
+                .is_some_and(|watchers| !watchers.is_empty())
+        {
+            break value;
+        }
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!("fake Codex exited before registration: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bare registration did not persist"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let watcher = &persisted["watchers"][0];
+    assert_eq!(watcher["target"]["kind"], "process");
+    assert_eq!(
+        watcher["target"]["process"]["executable"],
+        codex.to_str().unwrap()
+    );
+
+    let _ = StdCommand::new(env!("CARGO_BIN_EXE_watchme"))
+        .env("HOME", &home)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .args(["daemon", "stop"])
+        .status();
+}
+
+#[test]
 fn start_is_not_a_command() {
     Command::cargo_bin("watchme")
         .expect("binary exists")

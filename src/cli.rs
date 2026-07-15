@@ -14,11 +14,7 @@ use watchme::daemon;
 use watchme::doctor::{list_providers, run_doctor};
 use watchme::ipc::protocol::{Request, Response};
 use watchme::ipc::{read_response, write_request};
-use watchme::mux::Multiplexer;
-use watchme::mux::herdr::{Herdr, HerdrContext};
-use watchme::mux::tmux::Tmux;
 use watchme::paths::WatchmePaths;
-use watchme::process::{CandidateHints, ProcessInspector, ProcessResolver};
 
 use crate::error::WatchmeError;
 
@@ -728,13 +724,6 @@ fn register_with_detector(
     }
 }
 
-fn unsupported_registration_context() -> WatchmeError {
-    WatchmeError::UnsupportedContext(
-            "invoke WatchMe normally as !watchme from a supported coding-agent session; run `watchme doctor` for diagnostics"
-                .to_owned(),
-        )
-}
-
 trait RegistrationContextDetector {
     fn detect(&self) -> Result<ResolvedRegistration, WatchmeError>;
 }
@@ -747,143 +736,8 @@ struct ProductionContextDetector;
 
 impl RegistrationContextDetector for ProductionContextDetector {
     fn detect(&self) -> Result<ResolvedRegistration, WatchmeError> {
-        #[cfg(target_os = "linux")]
-        let inspector = watchme::process::linux::LinuxProcessInspector::default();
-        #[cfg(target_os = "macos")]
-        let inspector = watchme::process::macos::MacOsProcessInspector::default();
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        return Err(unsupported_registration_context());
-
-        let current_pid = std::process::id();
-        let current = inspector
-            .inspect(current_pid)
-            .map_err(|_| unsupported_registration_context())?;
-        let tty = current.tty.ok_or_else(unsupported_registration_context)?;
-        let hints = CandidateHints {
-            tty: Some(tty),
-            process_group_id: current.process_group_id,
-            session_leader_id: current.session_leader_id,
-            uid: current.uid,
-            executable_hint: None,
-        };
-        let resolved = {
-            let names = watchme::agents::manifest::ManifestRegistry::bundled()
-                .map(|registry| registry.process_match_basenames())
-                .unwrap_or_default();
-            ProcessResolver::with_manifest_names(names)
-                .resolve(&inspector, current_pid, &hints)
-                .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?
-        };
-
-        if std::env::var_os("HERDR_SOCKET_PATH").is_some()
-            || std::env::var_os("HERDR_WORKSPACE_ID").is_some()
-            || std::env::var_os("HERDR_TAB_ID").is_some()
-            || std::env::var_os("HERDR_PANE_ID").is_some()
-        {
-            let herdr = Herdr::new(
-                HerdrContext::from_environment()
-                    .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?,
-                Duration::from_secs(2),
-            )
-            .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
-            let pane = herdr
-                .current_target()
-                .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
-            if pane.process != resolved.identity
-                || normalize_tty(pane.tty.as_str())
-                    != normalize_tty(resolved.identity.tty.as_deref().unwrap_or_default())
-            {
-                return Err(WatchmeError::UnsupportedContext(
-                    "agent ancestor and Herdr pane process/TTY identities do not match".into(),
-                ));
-            }
-            let watcher_id = format!(
-                "herdr-{}-{}-{}",
-                pane.pane_id, resolved.identity.pid, resolved.identity.start_time
-            );
-            let mut watcher = watchme::model::WatcherState::new(
-                watcher_id,
-                watchme::model::TargetIdentity::herdr(
-                    pane.server,
-                    pane.server_instance,
-                    pane.session_id,
-                    pane.window_id,
-                    pane.pane_id,
-                    pane.tty,
-                    resolved.identity,
-                ),
-                watchme::model::WatcherLifecycle::Registered,
-                0,
-                unix_time_ms(),
-            );
-            watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
-            return Ok(ResolvedRegistration { watcher });
-        }
-
-        if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some() {
-            let tmux = Tmux::from_environment(Duration::from_secs(2))
-                .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
-            let pane = tmux
-                .current_target()
-                .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
-            let resolved_tty = resolved.identity.tty.as_deref().unwrap_or_default();
-            if normalize_tty(resolved_tty)
-                != normalize_tty(pane.process.tty.as_deref().unwrap_or_default())
-            {
-                return Err(WatchmeError::UnsupportedContext(
-                    "agent process and tmux pane TTY identities do not match".into(),
-                ));
-            }
-            let watcher_id = format!(
-                "tmux-{}-{}-{}",
-                pane.pane_id.trim_start_matches('%'),
-                resolved.identity.pid,
-                resolved.identity.start_time
-            );
-            let mut watcher = watchme::model::WatcherState::new(
-                watcher_id,
-                watchme::model::TargetIdentity::tmux(
-                    pane.server,
-                    pane.server_instance,
-                    pane.session_id,
-                    pane.window_id,
-                    pane.pane_id,
-                    pane.tty,
-                    resolved.identity,
-                    None,
-                ),
-                watchme::model::WatcherLifecycle::Registered,
-                0,
-                unix_time_ms(),
-            );
-            watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
-            return Ok(ResolvedRegistration { watcher });
-        }
-        let watcher_id = format!(
-            "process-{}-{}",
-            resolved.identity.pid, resolved.identity.start_time
-        );
-        let mut watcher = watchme::model::WatcherState::new(
-            watcher_id,
-            watchme::model::TargetIdentity::process(resolved.identity),
-            watchme::model::WatcherLifecycle::Registered,
-            0,
-            unix_time_ms(),
-        );
-        watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
-        Ok(ResolvedRegistration { watcher })
+        crate::registration_context::detect_current()
     }
-}
-
-fn normalize_tty(tty: &str) -> &str {
-    tty.strip_prefix("/dev/").unwrap_or(tty)
-}
-
-fn unix_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 struct IpcRegistrationClient;
