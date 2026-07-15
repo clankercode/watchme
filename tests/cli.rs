@@ -7,19 +7,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
-#[test]
-fn bare_watchme_registers_from_ttyless_codex_ancestor() {
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn bare_codex_registration(herdr_socket: Option<&Path>) -> Value {
     use std::process::{Command as StdCommand, Stdio};
     use std::time::{Duration, Instant};
-
-    struct ChildGuard(std::process::Child);
-
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
 
     let temp = tempdir().unwrap();
     let codex = temp.path().join("codex");
@@ -40,7 +39,8 @@ fn bare_watchme_registers_from_ttyless_codex_ancestor() {
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    let child = StdCommand::new(&codex)
+    let mut command = StdCommand::new(&codex);
+    command
         .env("WATCHME_BIN", env!("CARGO_BIN_EXE_watchme"))
         .env("HOME", &home)
         .env("XDG_RUNTIME_DIR", &runtime)
@@ -50,9 +50,23 @@ fn bare_watchme_registers_from_ttyless_codex_ancestor() {
         .env_remove("TMUX_PANE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    for name in [
+        "HERDR_SOCKET_PATH",
+        "HERDR_WORKSPACE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_PANE_ID",
+    ] {
+        command.env_remove(name);
+    }
+    if let Some(socket) = herdr_socket {
+        command
+            .env("HERDR_SOCKET_PATH", socket)
+            .env("HERDR_WORKSPACE_ID", "w6")
+            .env("HERDR_TAB_ID", "w6:t1")
+            .env("HERDR_PANE_ID", "w6:pD");
+    }
+    let child = command.spawn().unwrap();
     let mut child = ChildGuard(child);
     let state_file = state.join("watchme/watchers.json");
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -88,6 +102,54 @@ fn bare_watchme_registers_from_ttyless_codex_ancestor() {
         .env("XDG_STATE_HOME", &state)
         .args(["daemon", "stop"])
         .status();
+
+    persisted
+}
+
+#[test]
+fn bare_watchme_registers_from_ttyless_codex_ancestor() {
+    let persisted = bare_codex_registration(None);
+    let watcher = &persisted["watchers"][0];
+    assert_eq!(watcher["target"]["kind"], "process");
+}
+
+#[test]
+fn bare_watchme_ignores_native_herdr_api_and_registers_codex_process() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+
+    let herdr = tempdir().unwrap();
+    let socket = herdr.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    let server = std::thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(connection.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        recorded
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str::<Value>(&line).unwrap());
+        connection
+            .write_all(
+                br#"{"id":"","error":{"code":"invalid_request","message":"invalid request: missing field `id`"}}
+"#,
+            )
+            .unwrap();
+    });
+
+    let persisted = bare_codex_registration(Some(&socket));
+    server.join().unwrap();
+
+    assert_eq!(persisted["watchers"][0]["target"]["kind"], "process");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["protocol"], "watchme.herdr");
 }
 
 #[test]

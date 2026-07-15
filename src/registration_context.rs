@@ -1,10 +1,10 @@
 use std::time::Duration;
 
 use watchme::client::ResolvedRegistration;
-use watchme::mux::Multiplexer;
 use watchme::mux::herdr::{Herdr, HerdrContext};
 use watchme::mux::tmux::Tmux;
-use watchme::process::{CandidateHints, ProcessInspector, ProcessResolver};
+use watchme::mux::{Multiplexer, MuxError};
+use watchme::process::{CandidateHints, ProcessInspector, ProcessResolver, ResolvedProcess};
 
 use crate::error::WatchmeError;
 
@@ -43,11 +43,19 @@ pub fn detect_current() -> Result<ResolvedRegistration, WatchmeError> {
         .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
 
     if has_herdr_environment() {
-        return herdr_registration(resolved);
+        return match herdr_registration(resolved.clone()) {
+            Ok(registration) => Ok(registration),
+            Err(MuxError::IncompatibleProtocol(_)) => Ok(process_registration(resolved)),
+            Err(error) => Err(WatchmeError::UnsupportedContext(error.to_string())),
+        };
     }
     if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_PANE").is_some() {
         return tmux_registration(resolved);
     }
+    Ok(process_registration(resolved))
+}
+
+fn process_registration(resolved: ResolvedProcess) -> ResolvedRegistration {
     let watcher_id = format!(
         "process-{}-{}",
         resolved.identity.pid, resolved.identity.start_time
@@ -60,7 +68,7 @@ pub fn detect_current() -> Result<ResolvedRegistration, WatchmeError> {
         unix_time_ms(),
     );
     watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
-    Ok(ResolvedRegistration { watcher })
+    ResolvedRegistration { watcher }
 }
 
 fn has_herdr_environment() -> bool {
@@ -74,23 +82,14 @@ fn has_herdr_environment() -> bool {
     .any(|name| std::env::var_os(name).is_some())
 }
 
-fn herdr_registration(
-    resolved: watchme::process::ResolvedProcess,
-) -> Result<ResolvedRegistration, WatchmeError> {
-    let herdr = Herdr::new(
-        HerdrContext::from_environment()
-            .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?,
-        Duration::from_secs(2),
-    )
-    .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
-    let pane = herdr
-        .current_target()
-        .map_err(|error| WatchmeError::UnsupportedContext(error.to_string()))?;
+fn herdr_registration(resolved: ResolvedProcess) -> Result<ResolvedRegistration, MuxError> {
+    let herdr = Herdr::new(HerdrContext::from_environment()?, Duration::from_secs(2))?;
+    let pane = herdr.current_target()?;
     if pane.process != resolved.identity
         || normalize_tty(pane.tty.as_str())
             != normalize_tty(resolved.identity.tty.as_deref().unwrap_or_default())
     {
-        return Err(WatchmeError::UnsupportedContext(
+        return Err(MuxError::IdentityChanged(
             "agent ancestor and Herdr pane process/TTY identities do not match".into(),
         ));
     }
