@@ -390,6 +390,86 @@ fn public_claude_hook_lifecycle_is_dry_run_safe_and_has_no_registration_alias() 
 }
 
 #[test]
+fn daemon_start_detaches_waits_and_is_idempotent() {
+    use std::process::Command as StdCommand;
+
+    struct DaemonGuard {
+        home: PathBuf,
+        config: PathBuf,
+        state: PathBuf,
+        runtime: PathBuf,
+    }
+
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            let _ = StdCommand::new(env!("CARGO_BIN_EXE_watchme"))
+                .env("HOME", &self.home)
+                .env("XDG_CONFIG_HOME", &self.config)
+                .env("XDG_STATE_HOME", &self.state)
+                .env("XDG_RUNTIME_DIR", &self.runtime)
+                .args(["daemon", "stop"])
+                .status();
+        }
+    }
+
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    let config = temp.path().join("config");
+    let state = temp.path().join("state");
+    let runtime = temp.path().join("runtime");
+    for directory in [&home, &config, &state, &runtime] {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::create_dir(config.join("watchme")).unwrap();
+    fs::write(
+        config.join("watchme/config.toml"),
+        "config_version = 1\n\n[daemon]\nidle_grace_seconds = 1\nstay_resident = true\n",
+    )
+    .unwrap();
+    let _guard = DaemonGuard {
+        home: home.clone(),
+        config: config.clone(),
+        state: state.clone(),
+        runtime: runtime.clone(),
+    };
+    let configure = |command: &mut Command| {
+        command
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", &runtime);
+    };
+
+    let mut first = Command::cargo_bin("watchme").unwrap();
+    configure(&mut first);
+    first
+        .args(["daemon", "start"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("daemon started\n"))
+        .stderr(predicate::str::is_empty());
+
+    let mut second = Command::cargo_bin("watchme").unwrap();
+    configure(&mut second);
+    second
+        .args(["daemon", "start"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("daemon already running\n"))
+        .stderr(predicate::str::is_empty());
+
+    let mut status = Command::cargo_bin("watchme").unwrap();
+    configure(&mut status);
+    status
+        .args(["daemon", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("daemon: running"))
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
 fn daemon_run_honors_config_stay_resident_and_idle_grace() {
     use std::process::{Command as StdCommand, Stdio};
     use std::thread;

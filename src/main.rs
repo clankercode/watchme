@@ -1,4 +1,5 @@
 mod cli;
+mod daemon_client;
 mod error;
 mod hook_cli;
 mod registration_context;
