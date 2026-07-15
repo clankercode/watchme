@@ -489,6 +489,41 @@ fn response_envelope_rejects_wrong_schema_protocol_and_method() {
 }
 
 #[test]
+fn native_herdr_response_is_a_typed_protocol_incompatibility() {
+    let (_server, socket, _) = spawn_fake(|_, _| {
+        Some(json!({
+            "id": "",
+            "error": {
+                "code": "invalid_request",
+                "message": "invalid request: missing field `id`"
+            }
+        }))
+    });
+    let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+    assert!(matches!(
+        herdr.current_target(),
+        Err(MuxError::IncompatibleProtocol(_))
+    ));
+}
+
+#[test]
+fn native_herdr_classifier_rejects_ambiguous_envelopes() {
+    for reply in [
+        json!({"id": "only-id"}),
+        json!({"id": "bad-error", "error": {"code": "invalid_request"}}),
+        json!({
+            "id": "ambiguous",
+            "result": {"type": "pong"},
+            "error": {"code": "invalid_request", "message": "bad"}
+        }),
+    ] {
+        let (_server, socket, _) = spawn_fake(move |_, _| Some(reply.clone()));
+        let herdr = Herdr::new(context(socket), Duration::from_millis(200)).unwrap();
+        assert!(matches!(herdr.current_target(), Err(MuxError::Protocol(_))));
+    }
+}
+
+#[test]
 fn drip_feed_cannot_extend_the_end_to_end_deadline() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("drip.sock");

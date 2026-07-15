@@ -101,6 +101,8 @@ pub enum MuxError {
     InvalidUtf8,
     #[error("Herdr protocol error: {0}")]
     Protocol(String),
+    #[error("incompatible Herdr protocol: {0}")]
+    IncompatibleProtocol(String),
     #[error("unsafe Herdr socket: {0}")]
     UnsafeSocket(String),
 }

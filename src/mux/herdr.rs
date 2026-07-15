@@ -131,6 +131,19 @@ struct Response<T> {
     error: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct NativeResponse {
+    id: String,
+    result: Option<serde_json::Value>,
+    error: Option<NativeError>,
+}
+
+#[derive(Deserialize)]
+struct NativeError {
+    code: String,
+    message: String,
+}
+
 #[derive(Serialize)]
 struct TargetParams<'a> {
     workspace_id: &'a str,
@@ -506,8 +519,17 @@ impl Herdr {
                 "response is not newline terminated".into(),
             ));
         }
-        let response: Response<T> = serde_json::from_slice(&bytes)
-            .map_err(|error| MuxError::Protocol(format!("malformed response: {error}")))?;
+        let response: Response<T> = match serde_json::from_slice(&bytes) {
+            Ok(response) => response,
+            Err(_) if is_native_response(&bytes) => {
+                return Err(MuxError::IncompatibleProtocol(
+                    "native Herdr socket API does not implement the watchme.herdr bridge".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(MuxError::Protocol(format!("malformed response: {error}")));
+            }
+        };
         if started.elapsed() >= self.timeout {
             return Err(MuxError::Timeout);
         }
@@ -540,6 +562,22 @@ impl Herdr {
         })?;
         Err(MuxError::Protocol(error))
     }
+}
+
+fn is_native_response(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<NativeResponse>(bytes).is_ok_and(|response| {
+        let _ = (
+            &response.id,
+            response
+                .error
+                .as_ref()
+                .map(|error| (&error.code, &error.message)),
+        );
+        matches!(
+            (response.result, response.error),
+            (Some(_), None) | (None, Some(_))
+        )
+    })
 }
 
 impl Multiplexer for Herdr {
