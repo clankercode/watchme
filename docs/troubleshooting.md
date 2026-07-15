@@ -17,8 +17,8 @@ watchme daemon status
 
 | Symptom | Likely cause | Action |
 |---|---|---|
-| Bare `watchme` fails with unsupported context | Not inside a supported agent pane | Use shell escape `!WatchMe` from the agent, or run `doctor` |
-| `daemon unavailable` | Supervisor not running and lazy start failed | `watchme daemon run` / check `XDG_RUNTIME_DIR` permissions |
+| Bare `watchme` fails with unsupported context | No supported coding-agent ancestor, or multiplexer identity mismatch | Use shell escape `!WatchMe` from the agent, then run `watchme doctor` |
+| `daemon unavailable` | Supervisor not running and lazy start failed | Run `watchme daemon start`; use `watchme daemon run` for foreground diagnostics; check `XDG_RUNTIME_DIR` permissions |
 | Permission errors on state/runtime | Directory not owner-only | Fix modes to `0700`; remove group/other write |
 | Claude hook not recovering | Missing correlation / macOS proof / first-run UI | See [compatibility.md](compatibility.md); install hook explicitly |
 | Herdr checks warn | Herdr not installed or env unset | Optional; tmux path remains available |

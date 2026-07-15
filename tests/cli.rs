@@ -165,6 +165,15 @@ fn administrative_commands_parse() {
 }
 
 #[test]
+fn daemon_completion_includes_detached_start() {
+    let completion = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/completions/watchme.bash"),
+    )
+    .unwrap();
+    assert!(completion.contains("daemon) COMPREPLY=( $(compgen -W \"start run status stop\""));
+}
+
+#[test]
 fn config_path_prints_xdg_resolved_config_file() {
     let temp = tempdir().unwrap();
     let config_home = temp.path().join("config");

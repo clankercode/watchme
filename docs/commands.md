@@ -9,7 +9,7 @@ watchme
 WatchMe
 ```
 
-Registers the current coding-agent context when detection succeeds (tmux/Herdr + process correlation). Outside a supported context, exits non-zero and prints guidance to invoke via `!watchme` and run `watchme doctor`.
+Registers the current coding-agent context when process-ancestry detection succeeds, including tty-less commands launched by Codex. When tmux or Herdr metadata is present, WatchMe also requires strict pane and process correlation. Outside a supported context, it exits non-zero and prints guidance to invoke via `!watchme` and run `watchme doctor`.
 
 There is **no** `watchme start` command.
 
@@ -28,7 +28,7 @@ There is **no** `watchme start` command.
 | `doctor [--strict] [--json]` | Local diagnostics |
 | `providers [--json]` | Built-in + manifest providers |
 | `config path\|check\|show` | Config path, validate, redacted show |
-| `daemon run\|status\|stop` | Per-user supervisor lifecycle |
+| `daemon start\|run\|status\|stop` | Per-user supervisor lifecycle |
 | `hooks install-claude\|remove-claude [--dry-run] [--settings PATH] [--marker PATH]` | Claude StopFailure hook |
 
 JSON envelopes use `schema_version = "1.0"` and `ok` boolean.
@@ -36,7 +36,9 @@ JSON envelopes use `schema_version = "1.0"` and `ok` boolean.
 ## Daemon behavior
 
 - Lazy start: registration may spawn `daemon run` when the socket is absent.
+- `daemon start` starts the daemon in the background, waits for it to answer, and is idempotent when it is already running.
 - `daemon run` loads `$XDG_CONFIG_HOME/watchme/config.toml` for `idle_grace_seconds` and `stay_resident`.
+- Both startup paths honor `idle_grace_seconds` and `stay_resident`; use `daemon run` for foreground diagnostics and service managers.
 - Default is non-resident: empty daemon exits after idle grace.
 - Opt-in systemd/launchd helpers expect `stay_resident = true` in config.
 

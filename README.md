@@ -22,6 +22,8 @@ cargo build --release -j1 --locked
 #   --with-systemd --with-completions --with-man --with-herdr-action
 
 watchme doctor
+# Optional explicit background start; bare registration also starts lazily:
+watchme daemon start
 # From a supported coding-agent session / shell escape:
 WatchMe
 watchme status

@@ -1,4 +1,4 @@
-.TH WATCHME 1 "2026-07-12" "watchme 0.1.0" "User Commands"
+.TH WATCHME 1 "2026-07-16" "watchme 0.1.0" "User Commands"
 .SH NAME
 watchme \- local supervisor for long-running coding-agent sessions
 .SH SYNOPSIS
@@ -27,8 +27,12 @@ List watchers.
 .B doctor [--strict] [--json]
 Run local diagnostics.
 .TP
-.B daemon run|status|stop
+.B daemon start|run|status|stop
 Manage the per-user supervisor.
+.B daemon start
+runs the supervisor in the background and waits for readiness;
+.B daemon run
+keeps it in the foreground for diagnostics and service managers.
 .TP
 .B hooks install-claude|remove-claude
 Install or remove the owner-only Claude StopFailure hook.

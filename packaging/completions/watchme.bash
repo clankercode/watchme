@@ -13,7 +13,7 @@ _watchme() {
       case "${prev}" in
         hooks) COMPREPLY=( $(compgen -W "install-claude remove-claude" -- "${cur}") ) ;;
         config) COMPREPLY=( $(compgen -W "path check show" -- "${cur}") ) ;;
-        daemon) COMPREPLY=( $(compgen -W "run status stop" -- "${cur}") ) ;;
+        daemon) COMPREPLY=( $(compgen -W "start run status stop" -- "${cur}") ) ;;
         stop) COMPREPLY=( $(compgen -W "--all --json" -- "${cur}") ) ;;
         doctor) COMPREPLY=( $(compgen -W "--strict --json" -- "${cur}") ) ;;
       esac

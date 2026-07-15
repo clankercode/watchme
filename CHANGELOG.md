@@ -1,3 +1,13 @@
+## Unreleased
+
+### Added
+
+- Add readiness-checked, idempotent `watchme daemon start` for detached interactive startup while preserving foreground `daemon run` for service managers.
+
+### Fixed
+
+- Detect supported Codex ancestors when shell-escaped commands have no controlling TTY, while retaining strict tmux and Herdr identity checks.
+
 ## 0.1.17 — 2026-07-12
 
 ### Fixed
