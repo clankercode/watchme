@@ -20,10 +20,18 @@ pub fn detect_current() -> Result<ResolvedRegistration, WatchmeError> {
     let current = inspector
         .inspect(current_pid)
         .map_err(|_| unsupported_context())?;
+    let has_controlling_tty = current.tty.is_some();
     let hints = CandidateHints {
         tty: current.tty,
-        process_group_id: current.process_group_id,
-        session_leader_id: current.session_leader_id,
+        // TTY-less agent tool calls commonly run in an isolated process group
+        // and session. Those child-local IDs cannot contradict the ancestor;
+        // ancestry plus the same UID remain required correlated evidence.
+        process_group_id: has_controlling_tty
+            .then_some(current.process_group_id)
+            .flatten(),
+        session_leader_id: has_controlling_tty
+            .then_some(current.session_leader_id)
+            .flatten(),
         uid: current.uid,
         executable_hint: None,
     };
@@ -166,4 +174,16 @@ fn unix_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_context_message_explains_shell_escape_and_doctor() {
+        let message = unsupported_context().to_string();
+        assert!(message.contains("!watchme"));
+        assert!(message.contains("watchme doctor"));
+    }
 }

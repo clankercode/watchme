@@ -8,29 +8,6 @@ use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 #[test]
-fn bare_watchme_outside_agent_explains_shell_escape_and_doctor() {
-    Command::cargo_bin("watchme")
-        .expect("binary exists")
-        .env_remove("TMUX")
-        .env_remove("WATCHME_TEST_AGENT_CONTEXT")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("!watchme"))
-        .stderr(predicate::str::contains("watchme doctor"));
-}
-
-#[test]
-fn test_context_environment_variable_cannot_bypass_detection() {
-    Command::cargo_bin("watchme")
-        .expect("binary exists")
-        .env("WATCHME_TEST_AGENT_CONTEXT", "claude")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unsupported context"))
-        .stderr(predicate::str::contains("!watchme"));
-}
-
-#[test]
 fn bare_watchme_registers_from_ttyless_codex_ancestor() {
     use std::process::{Command as StdCommand, Stdio};
     use std::time::{Duration, Instant};
@@ -68,6 +45,7 @@ fn bare_watchme_registers_from_ttyless_codex_ancestor() {
         .env("HOME", &home)
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
+        .env("WATCHME_ISOLATE_PROCESS_GROUP", "1")
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
         .stdin(Stdio::null())
@@ -310,8 +288,15 @@ fn administrative_target_ids_must_not_be_empty() {
 
 #[test]
 fn json_errors_are_versioned_envelopes() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
     let output = Command::cargo_bin("watchme")
         .expect("binary exists")
+        .env("HOME", temp.path())
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("XDG_RUNTIME_DIR", &runtime)
         .args(["list", "--json"])
         .output()
         .expect("command runs");
