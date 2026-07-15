@@ -131,19 +131,6 @@ struct Response<T> {
     error: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct NativeResponse {
-    id: String,
-    result: Option<serde_json::Value>,
-    error: Option<NativeError>,
-}
-
-#[derive(Deserialize)]
-struct NativeError {
-    code: String,
-    message: String,
-}
-
 #[derive(Serialize)]
 struct TargetParams<'a> {
     workspace_id: &'a str,
@@ -565,19 +552,20 @@ impl Herdr {
 }
 
 fn is_native_response(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<NativeResponse>(bytes).is_ok_and(|response| {
-        let _ = (
-            &response.id,
-            response
-                .error
-                .as_ref()
-                .map(|error| (&error.code, &error.message)),
-        );
-        matches!(
-            (response.result, response.error),
-            (Some(_), None) | (None, Some(_))
-        )
-    })
+    let Ok(serde_json::Value::Object(response)) = serde_json::from_slice(bytes) else {
+        return false;
+    };
+    if !matches!(response.get("id"), Some(serde_json::Value::String(_))) {
+        return false;
+    }
+    match (response.get("result"), response.get("error")) {
+        (Some(result), None) => !result.is_null(),
+        (None, Some(serde_json::Value::Object(error))) => {
+            matches!(error.get("code"), Some(serde_json::Value::String(_)))
+                && matches!(error.get("message"), Some(serde_json::Value::String(_)))
+        }
+        _ => false,
+    }
 }
 
 impl Multiplexer for Herdr {
