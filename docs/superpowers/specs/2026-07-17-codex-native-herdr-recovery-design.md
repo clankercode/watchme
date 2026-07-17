@@ -50,6 +50,13 @@ databases, and a `thread_goals` row keyed by the same thread ID. Native Herdr's
 schema supplies pane identity, process metadata, bounded pane reads, and an
 atomic `pane.send_input` request accepting literal text plus symbolic keys.
 
+The goal had already been manually resumed before the later Herdr snapshot was
+taken. Its then-current `working` value therefore says nothing about the status
+Herdr exposed during the capacity incident. Native Herdr can also report that
+screen detection was skipped. A focused pane, `screen_detection_skipped`, a
+missing status, or a stale status must all be treated as absent corroboration;
+none may override current structured Codex goal and turn evidence.
+
 ## Considered Approaches
 
 ### 1. Native Herdr plus exact Codex state correlation (selected)
@@ -165,8 +172,9 @@ Autonomous capacity recovery requires all of the following:
 The exact observed wording, `Selected model is at capacity. Please try a
 different model.`, is one supported capacity result. Matching is performed on
 the structured assistant result payload, not arbitrary screen history. Screen
-capture and Herdr agent status may corroborate the event but cannot authorize
-it alone.
+capture and a fresh, non-skipped Herdr agent status may corroborate the event
+but cannot authorize it alone. Focused or skipped Herdr detection is not
+negative evidence and cannot suppress a structured Codex capacity event.
 
 Other resolvable conditions can gain recipes later only through the same
 evidence/action contract: typed classification, exact target binding,
@@ -263,10 +271,13 @@ Implementation proceeds in red-green-refactor slices. Required tests include:
    `pane.send_input` containing `/goal resume` plus `Enter`, no duplicate send,
    post-resume active verification, and human hand-off after ambiguous send.
 8. Audit tests prove lifecycle records appear without private payloads.
-9. CLI end-to-end coverage starts a fake Codex process, native Herdr socket,
+9. Focused-pane tests prove `screen_detection_skipped`, missing status, and
+   stale status neither authorize recovery nor mask valid structured Codex
+   evidence.
+10. CLI end-to-end coverage starts a fake Codex process, native Herdr socket,
    SQLite state, and rollout; bare `watchme` registers/promotes, observes a
    capacity block, submits once, and reports verified recovery.
-10. Existing bridge, tmux, Claude, process-only fallback, daemon lifecycle,
+11. Existing bridge, tmux, Claude, process-only fallback, daemon lifecycle,
     release build, schema, and install smoke gates remain green.
 
 ## Live Verification
