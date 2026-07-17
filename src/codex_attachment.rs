@@ -165,11 +165,14 @@ pub fn attach_process_correlated_codex_session_at(
 #[cfg(target_os = "linux")]
 fn resume_thread_id(proc_root: &Path, pid: u32) -> Option<String> {
     let path = proc_root.join(pid.to_string()).join("cmdline");
-    let metadata = std::fs::metadata(&path).ok()?;
-    if metadata.len() == 0 || metadata.len() > MAX_CMDLINE_BYTES {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_CMDLINE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_CMDLINE_BYTES {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
     if !bytes.ends_with(&[0]) {
         return None;
     }
@@ -340,5 +343,41 @@ fn target_session(target: &TargetIdentity) -> Option<String> {
         Some(MultiplexerContext::Tmux { session_id, .. }) => Some(session_id.clone()),
         Some(MultiplexerContext::Herdr { workspace_id, .. }) => Some(workspace_id.clone()),
         None => None,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn live_proc_cmdline_is_bounded_even_though_pseudo_file_reports_zero_length() {
+        let mut child = Command::new("bash")
+            .args([
+                "-c",
+                "exec -a codex /usr/bin/python3 -c 'import time; time.sleep(10)' resume thr_live_proc",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let path = Path::new("/proc")
+            .join(child.id().to_string())
+            .join("cmdline");
+        let result = (0..100).find_map(|_| {
+            let thread = resume_thread_id(Path::new("/proc"), child.id());
+            if thread.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            thread
+        });
+        let metadata = std::fs::metadata(path).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(result.as_deref(), Some("thr_live_proc"));
     }
 }
