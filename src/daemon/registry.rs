@@ -198,14 +198,16 @@ impl Registry {
             &existing.lifecycle,
             WatcherLifecycle::HumanRequired { reason } if reason == RESTART_REVALIDATION_REASON
         );
-        if !process_promotion && !target_upgraded && !replay_revalidated {
-            return Ok(RegistrationOutcome::Existing(existing_id.into()));
-        }
-        if process_promotion
-            && (!compatible_attachment(&existing.codex_session, &fresh.codex_session)
-                || !compatible_attachment(&existing.claude_session, &fresh.claude_session))
+        let attachment_upgrade = (existing.codex_session.is_none()
+            && fresh.codex_session.is_some())
+            || (existing.claude_session.is_none() && fresh.claude_session.is_some());
+        if !compatible_attachment(&existing.codex_session, &fresh.codex_session)
+            || !compatible_attachment(&existing.claude_session, &fresh.claude_session)
         {
             return Err(RegistryError::IdCollision(fresh.watcher_id));
+        }
+        if !process_promotion && !target_upgraded && !replay_revalidated && !attachment_upgrade {
+            return Ok(RegistrationOutcome::Existing(existing_id.into()));
         }
 
         let mut updated = self.watchers.clone();
@@ -213,7 +215,7 @@ impl Registry {
             .get_mut(existing_id)
             .ok_or_else(|| RegistryError::Unknown(existing_id.into()))?;
         refreshed.target = fresh.target;
-        if process_promotion {
+        if process_promotion || attachment_upgrade {
             refreshed.lifecycle = WatcherLifecycle::Registered;
             refreshed.recovery = None;
             refreshed.last_observation = None;
@@ -236,7 +238,7 @@ impl Registry {
         if let Some(watcher) = self.watchers.get(existing_id) {
             self.audit_lifecycle(
                 watcher,
-                if process_promotion {
+                if process_promotion || attachment_upgrade {
                     "watcher promoted"
                 } else {
                     "watcher resumed"
@@ -244,7 +246,7 @@ impl Registry {
             );
         }
 
-        if process_promotion || replay_revalidated {
+        if process_promotion || attachment_upgrade || replay_revalidated {
             Ok(RegistrationOutcome::Revalidated(existing_id.into()))
         } else {
             Ok(RegistrationOutcome::Existing(existing_id.into()))
@@ -758,6 +760,39 @@ mod tests {
         assert!(matches!(
             registry.get("process").unwrap().target,
             TargetIdentity::Process { .. }
+        ));
+    }
+
+    #[test]
+    fn stable_native_target_accepts_new_attachment_and_rejects_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry =
+            Registry::load(JsonStore::new(temp.path().join("watchers.json"))).unwrap();
+        registry
+            .register(native_herdr_watcher("native", 10, 20))
+            .unwrap();
+
+        let mut enriched = native_herdr_watcher("native", 10, 20);
+        enriched.codex_session = Some(codex_reference("thread-one", 20));
+        assert_eq!(
+            registry.register(enriched).unwrap(),
+            RegistrationOutcome::Revalidated("native".into())
+        );
+        let watcher = registry.get("native").unwrap();
+        assert_eq!(
+            watcher
+                .codex_session
+                .as_ref()
+                .map(|reference| reference.thread_id.as_str()),
+            Some("thread-one")
+        );
+        assert!(watcher.observation_schedule.event_wake_pending);
+
+        let mut conflicting = native_herdr_watcher("native", 10, 20);
+        conflicting.codex_session = Some(codex_reference("thread-two", 20));
+        assert!(matches!(
+            registry.register(conflicting),
+            Err(RegistryError::IdCollision(_))
         ));
     }
 
