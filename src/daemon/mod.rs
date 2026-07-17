@@ -142,7 +142,8 @@ pub async fn run_with_components_and_clock(
     let listener = tokio::net::UnixListener::from_std(listener)?;
     let _cleanup = SocketCleanup(socket_path);
     let state_path = paths.state_file("watchers.json")?;
-    let registry = Registry::load(JsonStore::new(state_path)).map_err(io::Error::other)?;
+    let registry = Registry::load_with_audit(JsonStore::new(state_path), paths.clone())
+        .map_err(io::Error::other)?;
     let (mut scheduler, runner) = scheduler_from_registry(&registry, idle_grace, stay_resident)?;
     let registry = std::sync::Arc::new(tokio::sync::Mutex::new(registry));
     let peer_credentials = std::sync::Arc::new(peer_credentials);

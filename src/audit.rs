@@ -298,6 +298,40 @@ pub fn record_recovery_decision(
     Ok(())
 }
 
+pub fn record_lifecycle(
+    paths: &WatchmePaths,
+    watcher: &WatcherState,
+    message: &str,
+) -> io::Result<()> {
+    let message = match message {
+        "watcher registered"
+        | "watcher already registered"
+        | "watcher promoted"
+        | "watcher resumed"
+        | "watcher paused"
+        | "capacity wait scheduled"
+        | "human handoff"
+        | "watcher stopped"
+        | "target terminated" => message,
+        _ => "watcher lifecycle changed",
+    };
+    let _ = paths.create_owner_only();
+    let mut log = AuditLog::open(paths.state_file("audit.jsonl")?)?;
+    log.append(&AuditEvent {
+        schema_version: AUDIT_SCHEMA_VERSION.into(),
+        recorded_at: now_rfc3339(),
+        watcher_id: Some(watcher.watcher_id.clone()),
+        kind: "lifecycle".into(),
+        detector: None,
+        evidence: None,
+        state: Some(lifecycle_label(&watcher.lifecycle).to_ascii_lowercase()),
+        policy_decision: None,
+        attempted_action: None,
+        verification: None,
+        message: message.into(),
+    })
+}
+
 /// Build the decision-chain record daemon recovery emits for operability CLI.
 pub fn decision_chain_from_watcher(
     watcher: &WatcherState,

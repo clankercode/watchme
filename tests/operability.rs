@@ -11,7 +11,7 @@ use std::time::Duration;
 use tempfile::tempdir;
 use watchme::audit::{
     AuditEvent, AuditLog, DecisionChain, DecisionPhase, RetentionPolicy, append_decision,
-    record_recovery_decision,
+    record_lifecycle, record_recovery_decision,
 };
 use watchme::config::{Config, NotificationsConfig, PlanningConfig};
 use watchme::doctor::{CheckStatus, DoctorOptions, run_doctor};
@@ -68,6 +68,40 @@ fn sample_decision(watcher_id: &str) -> DecisionChain {
         attempted_action: "WAIT_DURATION".into(),
         verification: "progress_observed".into(),
     }
+}
+
+#[test]
+fn lifecycle_transitions_are_tailable_and_redacted() {
+    let temp = tempdir().unwrap();
+    let paths =
+        WatchmePaths::resolve(temp.path(), None, None, Some(&temp.path().join("run"))).unwrap();
+    let mut watcher = WatcherState::new(
+        "watcher-1".into(),
+        TargetIdentity::process(ProcessIdentity::new(42, 77)),
+        WatcherLifecycle::Registered,
+        0,
+        0,
+    );
+    record_lifecycle(&paths, &watcher, "watcher registered").unwrap();
+    watcher.lifecycle = WatcherLifecycle::Waiting {
+        until_unix_ms: 100,
+        reason: "prompt text HERDR_SOCKET_PATH=/secret".into(),
+    };
+    record_lifecycle(&paths, &watcher, "capacity wait scheduled").unwrap();
+
+    let mut log = AuditLog::open(paths.state_file("audit.jsonl").unwrap()).unwrap();
+    let events = log.read_lines(Some("watcher-1"), 50).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "lifecycle" && event.state.as_deref() == Some("registered")
+    }));
+    assert!(
+        events.iter().any(|event| {
+            event.kind == "lifecycle" && event.state.as_deref() == Some("waiting")
+        })
+    );
+    assert!(events.iter().all(|event| {
+        !event.message.contains("prompt text") && !event.message.contains("HERDR_SOCKET_PATH")
+    }));
 }
 
 #[test]

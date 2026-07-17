@@ -55,12 +55,27 @@ struct PersistedRegistry {
 pub struct Registry {
     store: JsonStore,
     watchers: BTreeMap<String, WatcherState>,
+    audit_paths: Option<crate::paths::WatchmePaths>,
     #[cfg(test)]
     fail_next_persist: bool,
 }
 
 impl Registry {
     pub fn load(store: JsonStore) -> Result<Self, RegistryError> {
+        Self::load_inner(store, None)
+    }
+
+    pub fn load_with_audit(
+        store: JsonStore,
+        paths: crate::paths::WatchmePaths,
+    ) -> Result<Self, RegistryError> {
+        Self::load_inner(store, Some(paths))
+    }
+
+    fn load_inner(
+        store: JsonStore,
+        audit_paths: Option<crate::paths::WatchmePaths>,
+    ) -> Result<Self, RegistryError> {
         let mut watchers = match store.load::<PersistedRegistry>()? {
             LoadOutcome::Missing => BTreeMap::new(),
             LoadOutcome::Corrupt { quarantine } => {
@@ -118,6 +133,7 @@ impl Registry {
         Ok(Self {
             store,
             watchers,
+            audit_paths,
             #[cfg(test)]
             fail_next_persist: false,
         })
@@ -160,6 +176,9 @@ impl Registry {
         updated.insert(id.clone(), watcher);
         self.persist_watchers(&updated)?;
         self.watchers = updated;
+        if let Some(watcher) = self.watchers.get(&id) {
+            self.audit_lifecycle(watcher, "watcher registered");
+        }
         Ok(RegistrationOutcome::Added(id))
     }
 
@@ -214,6 +233,17 @@ impl Registry {
         self.persist_watchers(&updated)?;
         self.watchers = updated;
 
+        if let Some(watcher) = self.watchers.get(existing_id) {
+            self.audit_lifecycle(
+                watcher,
+                if process_promotion {
+                    "watcher promoted"
+                } else {
+                    "watcher resumed"
+                },
+            );
+        }
+
         if process_promotion || replay_revalidated {
             Ok(RegistrationOutcome::Revalidated(existing_id.into()))
         } else {
@@ -236,6 +266,9 @@ impl Registry {
         watcher.updated_at_unix_ms = now;
         self.persist_watchers(&updated)?;
         self.watchers = updated;
+        if let Some(watcher) = self.watchers.get(id) {
+            self.audit_lifecycle(watcher, lifecycle_message(&watcher.lifecycle));
+        }
         Ok(())
     }
 
@@ -504,6 +537,27 @@ impl Registry {
         })?;
         Ok(())
     }
+
+    fn audit_lifecycle(&self, watcher: &WatcherState, message: &str) {
+        let Some(paths) = self.audit_paths.as_ref() else {
+            return;
+        };
+        if let Err(error) = crate::audit::record_lifecycle(paths, watcher, message) {
+            eprintln!("watchme daemon: lifecycle audit failed: {error}");
+        }
+    }
+}
+
+fn lifecycle_message(lifecycle: &WatcherLifecycle) -> &'static str {
+    match lifecycle {
+        WatcherLifecycle::Registered | WatcherLifecycle::Observing => "watcher resumed",
+        WatcherLifecycle::Paused => "watcher paused",
+        WatcherLifecycle::Waiting { .. } => "capacity wait scheduled",
+        WatcherLifecycle::HumanRequired { .. } => "human handoff",
+        WatcherLifecycle::TargetTerminated => "target terminated",
+        WatcherLifecycle::Stopped { .. } => "watcher stopped",
+        WatcherLifecycle::Recovering { .. } => "watcher lifecycle changed",
+    }
 }
 
 fn next_revision(watcher: &WatcherState) -> Result<u64, RegistryError> {
@@ -705,6 +759,45 @@ mod tests {
             registry.get("process").unwrap().target,
             TargetIdentity::Process { .. }
         ));
+    }
+
+    #[test]
+    fn audited_registry_records_fixed_lifecycle_transitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::WatchmePaths::resolve(
+            temp.path(),
+            None,
+            None,
+            Some(&temp.path().join("run")),
+        )
+        .unwrap();
+        paths.create_owner_only().unwrap();
+        let mut registry = Registry::load_with_audit(
+            JsonStore::new(paths.state_dir().join("watchers.json")),
+            paths.clone(),
+        )
+        .unwrap();
+        registry
+            .register(process_watcher("watcher", 10, 20))
+            .unwrap();
+        registry
+            .transition(
+                "watcher",
+                WatcherLifecycle::Waiting {
+                    until_unix_ms: 100,
+                    reason: "untrusted prompt text".into(),
+                },
+                2,
+            )
+            .unwrap();
+
+        let mut log =
+            crate::audit::AuditLog::open(paths.state_file("audit.jsonl").unwrap()).unwrap();
+        let events = log.read_lines(Some("watcher"), 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].message, "watcher registered");
+        assert_eq!(events[1].message, "capacity wait scheduled");
+        assert!(events.iter().all(|event| !event.message.contains("prompt")));
     }
 
     #[test]
