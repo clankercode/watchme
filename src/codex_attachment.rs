@@ -212,15 +212,15 @@ fn discover_exact_open_state(
         };
         let name = path.file_name()?.to_str()?;
         if name.contains("rollout") && rollout_matches_thread(&path, name, thread_id) {
-            rollouts.push(bound);
+            push_unique(&mut rollouts, bound);
         } else if name.starts_with("state_")
             && name.ends_with(".sqlite")
             && thread_db_matches(&path, thread_id)
         {
-            thread_dbs.push(bound);
+            push_unique(&mut thread_dbs, bound);
         } else if name.starts_with("goals_") && name.ends_with(".sqlite") && goals_db_matches(&path)
         {
-            goals_dbs.push(bound);
+            push_unique(&mut goals_dbs, bound);
         }
     }
     if rollouts.len() != 1 || thread_dbs.len() != 1 || goals_dbs.len() != 1 {
@@ -231,6 +231,15 @@ fn discover_exact_open_state(
         thread_db: thread_dbs.pop()?,
         goals_db: goals_dbs.pop()?,
     })
+}
+
+fn push_unique(files: &mut Vec<CodexBoundFile>, candidate: CodexBoundFile) {
+    if !files
+        .iter()
+        .any(|file| file.device == candidate.device && file.inode == candidate.inode)
+    {
+        files.push(candidate);
+    }
 }
 
 #[cfg(unix)]
@@ -304,7 +313,7 @@ fn goals_db_matches(path: &Path) -> bool {
         .flatten()
         .filter_map(Result::ok)
         .collect::<std::collections::BTreeSet<_>>();
-    ["thread_id", "status", "updated_at"]
+    ["thread_id", "status", "updated_at_ms"]
         .iter()
         .all(|column| columns.contains(*column))
 }

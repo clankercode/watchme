@@ -61,13 +61,13 @@ impl CodexProcessFixture {
         let connection = Connection::open(&goals_db).unwrap();
         connection
             .execute(
-                "CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY, status TEXT, updated_at INTEGER)",
+                "CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY, status TEXT, updated_at_ms INTEGER)",
                 [],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO thread_goals (thread_id, status, updated_at) VALUES (?1, 'active', 1)",
+                "INSERT INTO thread_goals (thread_id, status, updated_at_ms) VALUES (?1, 'active', 1)",
                 [thread_id],
             )
             .unwrap();
@@ -79,6 +79,8 @@ impl CodexProcessFixture {
         symlink(&rollout, fd_dir.join("3")).unwrap();
         symlink(&state_db, fd_dir.join("4")).unwrap();
         symlink(&goals_db, fd_dir.join("5")).unwrap();
+        symlink(&state_db, fd_dir.join("8")).unwrap();
+        symlink(&goals_db, fd_dir.join("9")).unwrap();
         Self {
             _root: root,
             proc_root,

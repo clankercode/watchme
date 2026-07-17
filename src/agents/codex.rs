@@ -67,6 +67,9 @@ pub struct CodexFixtureRecord {
 /// when locally bound; otherwise correlated rollout JSONL.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProbedCodexSource {
+    LocalState {
+        snapshot: CodexGoalSnapshot,
+    },
     AppServer {
         snapshot: CodexGoalSnapshot,
         path: PathBuf,
@@ -84,6 +87,10 @@ impl ProbedCodexSource {
 
     pub fn is_rollout(&self) -> bool {
         matches!(self, Self::Rollout { .. })
+    }
+
+    pub fn is_local_state(&self) -> bool {
+        matches!(self, Self::LocalState { .. })
     }
 }
 
@@ -377,6 +384,9 @@ pub fn correlated_rollout_event(
 /// correlated rollout JSONL under the process CWD. Missing, ambiguous, rotated,
 /// or world-readable paths fail closed.
 pub fn probe_structured_source(watcher: &WatcherState) -> Option<ProbedCodexSource> {
+    if let Some(snapshot) = crate::agents::codex_state::observe_bound_codex_state(watcher) {
+        return Some(ProbedCodexSource::LocalState { snapshot });
+    }
     let reference = watcher.codex_session.as_ref()?;
     let process = match &watcher.target {
         crate::model::TargetIdentity::Process { process }
@@ -427,6 +437,15 @@ pub fn observe_codex_event(
         // blocked before we re-emit a resume candidate; re-probe when possible.
         if let Some(source) = probe_structured_source(watcher) {
             match source {
+                ProbedCodexSource::LocalState { snapshot } => {
+                    if matches!(
+                        classify_goal_snapshot(&snapshot),
+                        CodexRecoveryPlan::WaitThenGoalResume
+                    ) {
+                        return resume_candidate_event(watcher, now);
+                    }
+                    return structured_goal_event(watcher, &snapshot, SourceKind::TypedApi);
+                }
                 ProbedCodexSource::AppServer { snapshot, .. } => {
                     if matches!(
                         classify_goal_snapshot(&snapshot),
@@ -450,6 +469,9 @@ pub fn observe_codex_event(
         }
     }
     match probe_structured_source(watcher)? {
+        ProbedCodexSource::LocalState { snapshot } => {
+            structured_goal_event(watcher, &snapshot, SourceKind::TypedApi)
+        }
         ProbedCodexSource::AppServer { snapshot, .. } => {
             structured_goal_event(watcher, &snapshot, SourceKind::TypedApi)
         }
@@ -809,7 +831,7 @@ fn resume_action(event: &Event, resume_command: &str) -> Option<Action> {
     if !matches!(goal_state, "blocked" | "paused") {
         return None;
     }
-    let mut action = Action::send_text(
+    let mut action = Action::submit_text(
         "codex.goal_resume_once",
         resume_command,
         "durable Codex goal blocked after capacity backoff; composer revalidated",
@@ -822,10 +844,6 @@ fn resume_action(event: &Event, resume_command: &str) -> Option<Action> {
         },
         Condition {
             kind: "NO_HUMAN_INTERVENTION".into(),
-            value: None,
-        },
-        Condition {
-            kind: "COMPOSER_EMPTY".into(),
             value: None,
         },
         Condition {

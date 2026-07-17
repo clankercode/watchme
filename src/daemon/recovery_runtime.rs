@@ -168,6 +168,9 @@ fn fresh_codex_progress(
     }
     let source = crate::agents::codex::probe_structured_source(watcher)?;
     let structured = match source {
+        crate::agents::codex::ProbedCodexSource::LocalState { snapshot } => {
+            crate::agents::codex::structured_value_from_snapshot(&snapshot)
+        }
         crate::agents::codex::ProbedCodexSource::AppServer { snapshot, .. } => {
             crate::agents::codex::structured_value_from_snapshot(&snapshot)
         }

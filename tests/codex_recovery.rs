@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -12,10 +13,12 @@ use watchme::agents::codex::{
     probe_structured_source, resume_candidate_event, structured_goal_event,
     structured_value_from_snapshot, trusted_goal_progress_event,
 };
+use watchme::agents::codex_state::observe_bound_codex_state;
 use watchme::daemon::{GenericObserver, Observer};
 use watchme::model::{
-    ActionKind, Condition, Event, EventCategory, EventSource, PolicyHint, ProcessIdentity,
-    SourceKind, TargetIdentity, WatcherLifecycle, WatcherState,
+    ActionKind, CodexBoundFile, CodexSessionReference as ModelCodexSessionReference,
+    CodexStructuredStateReference, Condition, Event, EventCategory, EventSource, PolicyHint,
+    ProcessIdentity, SourceKind, TargetIdentity, WatcherLifecycle, WatcherState,
 };
 use watchme::policy::{CompiledPolicy, PolicyContext};
 use watchme::recovery::engine::RecipeProvider;
@@ -31,6 +34,106 @@ fn load_fixture_lines() -> Vec<String> {
         .filter(|line| !line.trim().is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+#[cfg(unix)]
+fn bound_file(path: &Path) -> CodexBoundFile {
+    use std::os::unix::fs::MetadataExt;
+    let canonical = fs::canonicalize(path).unwrap();
+    let metadata = fs::metadata(&canonical).unwrap();
+    CodexBoundFile {
+        canonical_path: canonical.to_string_lossy().into_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner_uid: metadata.uid(),
+    }
+}
+
+#[test]
+fn real_codex_sqlite_and_rollout_report_capacity() {
+    use watchme::process::ProcessInspector;
+
+    let temp = tempdir().unwrap();
+    let rollout = temp.path().join("rollout-thr_demo.jsonl");
+    let mut rollout_file = fs::File::create(&rollout).unwrap();
+    rollout_file.seek(SeekFrom::Start(1_100_000)).unwrap();
+    rollout_file.write_all(b"\n").unwrap();
+    for record in [
+        serde_json::json!({"timestamp":"2026-07-17T00:00:00Z","type":"event_msg",
+            "payload":{"type":"task_started","turn_id":"turn-1"}}),
+        serde_json::json!({"timestamp":"2026-07-17T00:00:01Z","type":"response_item",
+            "payload":{"type":"message","role":"assistant","content":[{
+                "type":"output_text","text":"Selected model is at capacity. Please try a different model."}]}}),
+        serde_json::json!({"timestamp":"2026-07-17T00:00:01Z","type":"event_msg",
+            "payload":{"type":"task_complete","turn_id":"turn-1"}}),
+    ] {
+        writeln!(rollout_file, "{}", serde_json::to_string(&record).unwrap()).unwrap();
+    }
+    drop(rollout_file);
+
+    let thread_db = temp.path().join("state_5.sqlite");
+    let connection = rusqlite::Connection::open(&thread_db).unwrap();
+    connection
+        .execute("CREATE TABLE threads (id TEXT PRIMARY KEY)", [])
+        .unwrap();
+    connection
+        .execute("INSERT INTO threads (id) VALUES ('thr_demo')", [])
+        .unwrap();
+    drop(connection);
+    let goals_db = temp.path().join("goals_1.sqlite");
+    let connection = rusqlite::Connection::open(&goals_db).unwrap();
+    connection
+        .execute(
+            "CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY, status TEXT, updated_at_ms INTEGER)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO thread_goals VALUES ('thr_demo', 'blocked', 1789000001000)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    #[cfg(target_os = "linux")]
+    let inspector = watchme::process::linux::LinuxProcessInspector::default();
+    #[cfg(target_os = "macos")]
+    let inspector = watchme::process::macos::MacOsProcessInspector::default();
+    let process = inspector.inspect(std::process::id()).unwrap().identity();
+    let cwd = std::env::current_dir().unwrap();
+    let mut watcher = WatcherState::new(
+        "codex-real-state".into(),
+        TargetIdentity::process(process.clone()),
+        WatcherLifecycle::Observing,
+        0,
+        0,
+    );
+    watcher
+        .set_codex_session(ModelCodexSessionReference {
+            thread_id: "thr_demo".into(),
+            rollout_path: rollout.to_string_lossy().into_owned(),
+            process_start_time: process.start_time,
+            process_cwd: cwd.to_string_lossy().into_owned(),
+            target_session: None,
+            rollout_binding: None,
+            app_server_state_path: None,
+            structured_state: Some(CodexStructuredStateReference {
+                rollout: bound_file(&rollout),
+                thread_db: bound_file(&thread_db),
+                goals_db: bound_file(&goals_db),
+            }),
+        })
+        .unwrap();
+
+    let snapshot = observe_bound_codex_state(&watcher).expect("capacity snapshot");
+
+    assert_eq!(snapshot.thread_id, "thr_demo");
+    assert_eq!(snapshot.goal_status.as_deref(), Some("blocked"));
+    assert_eq!(
+        snapshot.last_error_category.as_deref(),
+        Some("capacity_block")
+    );
 }
 
 #[test]
@@ -287,7 +390,7 @@ fn resume_candidate_and_recipe_send_literal_goal_resume_exactly_once_per_fingerp
     assert_eq!(action.action_id, "codex.goal_resume_once");
     assert_eq!(
         action.kind,
-        ActionKind::SendText {
+        ActionKind::SubmitText {
             text: "/goal resume".into()
         }
     );
@@ -424,7 +527,7 @@ fn recipes_never_propose_privileged_shell_or_exec_actions() {
     let resume = CodexRecipes::default().action_for(&watcher).unwrap();
     assert!(matches!(
         resume.kind,
-        ActionKind::SendText { ref text } if text == "/goal resume"
+        ActionKind::SubmitText { ref text } if text == "/goal resume"
     ));
     assert!(
         !format!("{:?}", resume.kind)
@@ -647,7 +750,7 @@ fn observe_codex_emits_capacity_block_then_resume_candidate_and_progress() {
     let action = CodexRecipes::default().action_for(&watcher).unwrap();
     assert_eq!(
         action.kind,
-        ActionKind::SendText {
+        ActionKind::SubmitText {
             text: "/goal resume".into()
         }
     );
