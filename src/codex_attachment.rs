@@ -209,11 +209,18 @@ fn discover_exact_open_state(
     let mut thread_dbs = Vec::new();
     let mut goals_dbs = Vec::new();
     for entry in std::fs::read_dir(fd_dir).ok()?.take(4096) {
-        let path = std::fs::canonicalize(entry.ok()?.path()).ok()?;
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(path) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
         let Some(bound) = bind_safe_file(&path) else {
             continue;
         };
-        let name = path.file_name()?.to_str()?;
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
         if name.contains("rollout") && rollout_matches_thread(&path, name, thread_id) {
             push_unique(&mut rollouts, bound);
         } else if name.starts_with("state_")

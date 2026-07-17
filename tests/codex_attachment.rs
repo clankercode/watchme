@@ -219,6 +219,17 @@ fn attachment_rejects_ambiguous_matching_rollouts_but_ignores_unrelated_open_rol
 }
 
 #[test]
+fn attachment_ignores_proc_fds_without_filesystem_targets() {
+    let fixture = CodexProcessFixture::new("thr_demo");
+    symlink("socket:[12345]", fixture.fd_dir.join("10")).unwrap();
+
+    assert!(
+        attach(&fixture, None).codex_session.is_some(),
+        "sockets, pipes, and raced-away descriptors must not abort state discovery"
+    );
+}
+
+#[test]
 fn attachment_rejects_malformed_or_ambiguous_resume_arguments() {
     let fixture = CodexProcessFixture::new("thr_demo");
     std::fs::write(
