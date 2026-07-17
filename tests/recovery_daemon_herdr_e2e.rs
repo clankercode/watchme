@@ -200,6 +200,7 @@ fn watcher(socket: String, process: ProcessIdentity, id: &str) -> WatcherState {
         "pane-e2e".into(),
         "/dev/pts/e2e".into(),
         process,
+        watchme::model::HerdrWireProtocol::BridgeV1,
     );
     let mut watcher = WatcherState::new(id.into(), target, WatcherLifecycle::Registered, 0, 0);
     watcher.recovery = Some(RecoveryMachine::new(Budget {

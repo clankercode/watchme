@@ -414,6 +414,7 @@ fn capture_herdr_structured_state(
         workspace_id,
         tab_id,
         pane_id,
+        wire_protocol,
         ..
     }) = watcher.target.observation_context()
     else {
@@ -439,6 +440,7 @@ fn capture_herdr_structured_state(
             workspace_id: workspace_id.clone(),
             tab_id: tab_id.clone(),
             pane_id: pane_id.clone(),
+            wire_protocol: *wire_protocol,
         },
         std::time::Duration::from_secs(2),
     )
@@ -1142,6 +1144,7 @@ mod tests {
             "pane".into(),
             "/dev/pts/1".into(),
             ProcessIdentity::new(1, 2),
+            crate::model::HerdrWireProtocol::BridgeV1,
         );
         let mut watcher = WatcherState::new(
             "bound".into(),

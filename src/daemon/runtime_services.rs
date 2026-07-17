@@ -64,6 +64,7 @@ impl DaemonRuntimeServices {
             workspace_id,
             tab_id,
             pane_id,
+            wire_protocol,
             ..
         } = watcher.target.observation_context()?
         else {
@@ -74,6 +75,7 @@ impl DaemonRuntimeServices {
             workspace_id: workspace_id.clone(),
             tab_id: tab_id.clone(),
             pane_id: pane_id.clone(),
+            wire_protocol: *wire_protocol,
         };
         let identity_for_send = identity.clone();
         let backend = HerdrBackend::from_fn(move |title, body| {
@@ -397,6 +399,7 @@ notify_on_recovery = true
             "pane".into(),
             "/dev/pts/9".into(),
             ProcessIdentity::new(11, 22),
+            crate::model::HerdrWireProtocol::BridgeV1,
         );
         registry
             .register(WatcherState::new(

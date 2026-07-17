@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod bridge;
+mod native;
 
 use bridge::{Request, Response};
 
@@ -15,7 +16,7 @@ use super::{
     Capture, ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, PaneInfo,
     SymbolicKey,
 };
-use crate::model::ProcessIdentity;
+use crate::model::{HerdrWireProtocol, ProcessIdentity};
 
 pub const HERDR_PROTOCOL: &str = bridge::PROTOCOL;
 pub const HERDR_SCHEMA_VERSION: u16 = bridge::SCHEMA_VERSION;
@@ -37,6 +38,7 @@ pub struct HerdrContext {
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
+    pub wire_protocol: HerdrWireProtocol,
 }
 
 impl HerdrContext {
@@ -55,6 +57,7 @@ impl HerdrContext {
             workspace_id: required("HERDR_WORKSPACE_ID", value("HERDR_WORKSPACE_ID"))?,
             tab_id: required("HERDR_TAB_ID", value("HERDR_TAB_ID"))?,
             pane_id: required("HERDR_PANE_ID", value("HERDR_PANE_ID"))?,
+            wire_protocol: HerdrWireProtocol::Auto,
         })
     }
 }
@@ -428,17 +431,7 @@ impl Herdr {
         params: P,
     ) -> Result<T, MuxError> {
         let started = Instant::now();
-        let socket_identity = validate_socket(Path::new(&self.context.socket_path))?;
-        let sequence = NEXT_REQUEST_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| MuxError::Protocol("request ID space exhausted".into()))?;
-        let request_id = format!(
-            "watchme-{}-{}-{sequence}",
-            std::process::id(),
-            *REQUEST_NONCE
-        );
+        let request_id = next_request_id()?;
         let request = Request {
             schema_version: HERDR_SCHEMA_VERSION,
             protocol: HERDR_PROTOCOL,
@@ -452,43 +445,7 @@ impl Herdr {
             return Err(MuxError::Protocol("request exceeds byte limit".into()));
         }
         encoded.push(b'\n');
-        let deadline = started.checked_add(self.timeout).ok_or(MuxError::Timeout)?;
-        let socket_path = self.context.socket_path.clone();
-        let evidence_provider = std::sync::Arc::clone(&self.evidence_provider);
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(MuxError::Timeout)?;
-        let bytes = tokio::time::timeout(remaining, async move {
-            let mut stream = tokio::net::UnixStream::connect(&socket_path)
-                .await
-                .map_err(map_io)?;
-            verify_connected_socket(
-                &stream,
-                Path::new(&socket_path),
-                socket_identity,
-                evidence_provider.as_ref(),
-            )?;
-            stream.write_all(&encoded).await.map_err(map_io)?;
-            let mut bytes = Vec::new();
-            loop {
-                let byte = stream.read_u8().await.map_err(map_io)?;
-                bytes.push(byte);
-                if bytes.len() > MAX_RESPONSE_BYTES || byte == b'\n' {
-                    break;
-                }
-            }
-            Ok::<_, MuxError>(bytes)
-        })
-        .await
-        .map_err(|_| MuxError::Timeout)??;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(MuxError::Protocol("response exceeds byte limit".into()));
-        }
-        if !bytes.ends_with(b"\n") {
-            return Err(MuxError::Protocol(
-                "response is not newline terminated".into(),
-            ));
-        }
+        let bytes = self.exchange_async(encoded, started).await?;
         let response: Response<T> = match serde_json::from_slice(&bytes) {
             Ok(response) => response,
             Err(_) if is_native_response(&bytes) => {
@@ -532,6 +489,68 @@ impl Herdr {
         })?;
         Err(MuxError::Protocol(error))
     }
+
+    async fn exchange_async(
+        &self,
+        encoded: Vec<u8>,
+        started: Instant,
+    ) -> Result<Vec<u8>, MuxError> {
+        let socket_identity = validate_socket(Path::new(&self.context.socket_path))?;
+        let deadline = started.checked_add(self.timeout).ok_or(MuxError::Timeout)?;
+        let socket_path = self.context.socket_path.clone();
+        let evidence_provider = std::sync::Arc::clone(&self.evidence_provider);
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(MuxError::Timeout)?;
+        let bytes = tokio::time::timeout(remaining, async move {
+            let mut stream = tokio::net::UnixStream::connect(&socket_path)
+                .await
+                .map_err(map_io)?;
+            verify_connected_socket(
+                &stream,
+                Path::new(&socket_path),
+                socket_identity,
+                evidence_provider.as_ref(),
+            )?;
+            stream.write_all(&encoded).await.map_err(map_io)?;
+            let mut bytes = Vec::new();
+            loop {
+                let byte = stream.read_u8().await.map_err(map_io)?;
+                bytes.push(byte);
+                if bytes.len() > MAX_RESPONSE_BYTES || byte == b'\n' {
+                    break;
+                }
+            }
+            Ok::<_, MuxError>(bytes)
+        })
+        .await
+        .map_err(|_| MuxError::Timeout)??;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(MuxError::Protocol("response exceeds byte limit".into()));
+        }
+        if !bytes.ends_with(b"\n") {
+            return Err(MuxError::Protocol(
+                "response is not newline terminated".into(),
+            ));
+        }
+        if started.elapsed() >= self.timeout {
+            return Err(MuxError::Timeout);
+        }
+        Ok(bytes)
+    }
+}
+
+fn next_request_id() -> Result<String, MuxError> {
+    let sequence = NEXT_REQUEST_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| MuxError::Protocol("request ID space exhausted".into()))?;
+    Ok(format!(
+        "watchme-{}-{}-{sequence}",
+        std::process::id(),
+        *REQUEST_NONCE
+    ))
 }
 
 fn is_native_response(bytes: &[u8]) -> bool {

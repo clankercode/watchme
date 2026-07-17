@@ -6,12 +6,14 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use watchme::model::{HerdrWireProtocol, ProcessIdentity};
 use watchme::mux::herdr::{
     ConnectedSocketEvidence, ConnectedSocketEvidenceProvider, Herdr, HerdrContext, SocketMetadata,
 };
 use watchme::mux::{
     ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, SymbolicKey,
 };
+use watchme::process::ProcessInspector;
 
 const PROTOCOL: &str = "watchme.herdr";
 
@@ -141,7 +143,258 @@ fn context(socket_path: String) -> HerdrContext {
         workspace_id: "ws-1".into(),
         tab_id: "tab-2".into(),
         pane_id: "pane-3".into(),
+        wire_protocol: HerdrWireProtocol::Auto,
     }
+}
+
+fn native_response(request: &Value, result: Value) -> Value {
+    json!({"id": request["id"], "result": result})
+}
+
+#[derive(Clone, Copy)]
+struct NativeIdentityFixture {
+    protocol: u32,
+    workspace_id: &'static str,
+    tab_id: &'static str,
+    pane_id: &'static str,
+    process_pid: u32,
+    tty: &'static str,
+    response_id: Option<&'static str>,
+}
+
+impl NativeIdentityFixture {
+    fn valid(process_pid: u32) -> Self {
+        Self {
+            protocol: 16,
+            workspace_id: "ws-1",
+            tab_id: "tab-2",
+            pane_id: "pane-3",
+            process_pid,
+            tty: "/dev/pts/8",
+            response_id: None,
+        }
+    }
+}
+
+fn spawn_native_identity_fake(
+    fixture: NativeIdentityFixture,
+) -> (FakeServer, String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake(move |request, _| {
+        if request.get("protocol").is_some() {
+            return Some(json!({
+                "id": "",
+                "error": {
+                    "code": "invalid_request",
+                    "message": "missing field id"
+                }
+            }));
+        }
+        let result = match request["method"].as_str().unwrap() {
+            "ping" => json!({
+                "type": "pong",
+                "version": "0.7.4",
+                "protocol": fixture.protocol
+            }),
+            "pane.current" => json!({
+                "type": "pane_current",
+                "pane": {
+                    "pane_id": fixture.pane_id,
+                    "terminal_id": "term-1",
+                    "workspace_id": fixture.workspace_id,
+                    "tab_id": fixture.tab_id,
+                    "focused": true,
+                    "agent_status": "working",
+                    "revision": 7,
+                    "cwd": "/repo",
+                    "foreground_cwd": "/repo"
+                }
+            }),
+            "pane.process_info" => json!({
+                "type": "pane_process_info",
+                "process_info": {
+                    "pane_id": fixture.pane_id,
+                    "tty": fixture.tty,
+                    "foreground_processes": [{
+                        "pid": fixture.process_pid,
+                        "name": "codex",
+                        "argv": ["codex"]
+                    }]
+                }
+            }),
+            method => panic!("unexpected native request {method}"),
+        };
+        let mut response = native_response(&request, result);
+        if let Some(response_id) = fixture.response_id {
+            response["id"] = Value::String(response_id.into());
+        }
+        Some(response)
+    })
+}
+
+fn current_process_start_time() -> u64 {
+    #[cfg(target_os = "linux")]
+    let inspector = watchme::process::linux::LinuxProcessInspector::default();
+    #[cfg(target_os = "macos")]
+    let inspector = watchme::process::macos::MacOsProcessInspector::default();
+    inspector.inspect(std::process::id()).unwrap().start_time
+}
+
+#[test]
+fn native_protocol_16_correlates_exact_pane_and_process() {
+    let pid = std::process::id();
+    let (_server, socket, requests) = spawn_native_identity_fake(NativeIdentityFixture::valid(pid));
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let herdr = Herdr::new(context(socket), Duration::from_millis(300)).unwrap();
+
+    let identity = herdr.current_target_for_process(&process).unwrap();
+
+    assert_eq!(identity.provider, "herdr");
+    assert_eq!(identity.pane_id, "pane-3");
+    assert_eq!(identity.process, process);
+    assert!(identity.server_instance.contains("protocol-16"));
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "pane.current")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "pane.process_info")
+    );
+}
+
+#[test]
+fn native_protocol_other_than_16_is_incompatible() {
+    let pid = std::process::id();
+    let fixture = NativeIdentityFixture {
+        protocol: 17,
+        ..NativeIdentityFixture::valid(pid)
+    };
+    let (_server, socket, _) = spawn_native_identity_fake(fixture);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let herdr = Herdr::new(context(socket), Duration::from_millis(300)).unwrap();
+
+    let error = herdr.current_target_for_process(&process).unwrap_err();
+
+    assert!(matches!(error, MuxError::IncompatibleProtocol(_)));
+}
+
+#[test]
+fn native_response_id_must_match_request() {
+    let pid = std::process::id();
+    let fixture = NativeIdentityFixture {
+        response_id: Some("wrong-request"),
+        ..NativeIdentityFixture::valid(pid)
+    };
+    let (_server, socket, _) = spawn_native_identity_fake(fixture);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let herdr = Herdr::new(context(socket), Duration::from_millis(300)).unwrap();
+
+    let error = herdr.current_target_for_process(&process).unwrap_err();
+
+    assert!(matches!(error, MuxError::Protocol(message) if message.contains("ID mismatch")));
+}
+
+#[test]
+fn native_pane_must_match_registration_context() {
+    let pid = std::process::id();
+    let fixture = NativeIdentityFixture {
+        workspace_id: "other-workspace",
+        ..NativeIdentityFixture::valid(pid)
+    };
+    let (_server, socket, _) = spawn_native_identity_fake(fixture);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let herdr = Herdr::new(context(socket), Duration::from_millis(300)).unwrap();
+
+    let error = herdr.current_target_for_process(&process).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MuxError::IdentityChanged(message) if message.contains("pane context")
+    ));
+}
+
+#[test]
+fn native_pane_must_contain_registered_process() {
+    let pid = std::process::id();
+    let fixture = NativeIdentityFixture {
+        process_pid: pid.saturating_add(10_000),
+        ..NativeIdentityFixture::valid(pid)
+    };
+    let (_server, socket, _) = spawn_native_identity_fake(fixture);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let herdr = Herdr::new(context(socket), Duration::from_millis(300)).unwrap();
+
+    let error = herdr.current_target_for_process(&process).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MuxError::IdentityChanged(message) if message.contains("registered process")
+    ));
+}
+
+#[test]
+fn native_pane_tty_must_match_registered_process() {
+    let pid = std::process::id();
+    let fixture = NativeIdentityFixture {
+        tty: "/dev/pts/99",
+        ..NativeIdentityFixture::valid(pid)
+    };
+    let (_server, socket, _) = spawn_native_identity_fake(fixture);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let herdr = Herdr::new(context(socket), Duration::from_millis(300)).unwrap();
+
+    let error = herdr.current_target_for_process(&process).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MuxError::IdentityChanged(message) if message.contains("TTY")
+    ));
+}
+
+#[test]
+fn native_target_revalidates_process_start_time() {
+    let pid = std::process::id();
+    let (_server, socket, _) = spawn_native_identity_fake(NativeIdentityFixture::valid(pid));
+    let mut process = ProcessIdentity::new(pid, current_process_start_time().saturating_add(1));
+    process.tty = Some("/dev/pts/8".into());
+    let herdr = Herdr::new(context(socket), Duration::from_millis(300)).unwrap();
+
+    let error = herdr.current_target_for_process(&process).unwrap_err();
+
+    assert!(matches!(
+        error,
+        MuxError::IdentityChanged(message) if message.contains("process identity")
+    ));
+}
+
+#[test]
+fn persisted_native_dialect_skips_bridge_probe() {
+    let pid = std::process::id();
+    let (_server, socket, requests) = spawn_native_identity_fake(NativeIdentityFixture::valid(pid));
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let mut native_context = context(socket);
+    native_context.wire_protocol = HerdrWireProtocol::Native16;
+    let herdr = Herdr::new(native_context, Duration::from_millis(300)).unwrap();
+
+    herdr.current_target_for_process(&process).unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[0]["method"], "ping");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.get("protocol").is_none())
+    );
 }
 
 #[test]

@@ -4,6 +4,15 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub const PROCESS_IDENTITY_SCHEMA_VERSION: u16 = 1;
 pub const TARGET_IDENTITY_SCHEMA_VERSION: u16 = 2;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HerdrWireProtocol {
+    #[default]
+    Auto,
+    BridgeV1,
+    Native16,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MultiplexerContext {
@@ -22,6 +31,8 @@ pub enum MultiplexerContext {
         tab_id: String,
         pane_id: String,
         tty: String,
+        #[serde(default)]
+        wire_protocol: HerdrWireProtocol,
     },
 }
 
@@ -183,6 +194,7 @@ impl TargetIdentity {
         pane_id: String,
         tty: String,
         process: ProcessIdentity,
+        wire_protocol: HerdrWireProtocol,
     ) -> Self {
         Self::Multiplexer {
             provider: "herdr".into(),
@@ -197,6 +209,7 @@ impl TargetIdentity {
                 tab_id,
                 pane_id,
                 tty,
+                wire_protocol,
             })),
             chrome: None,
             needs_revalidation: false,

@@ -97,6 +97,11 @@ fn herdr_registration(resolved: ResolvedProcess) -> Result<ResolvedRegistration,
         "herdr-{}-{}-{}",
         pane.pane_id, resolved.identity.pid, resolved.identity.start_time
     );
+    let wire_protocol = if pane.server_instance.contains("-protocol-16-") {
+        watchme::model::HerdrWireProtocol::Native16
+    } else {
+        watchme::model::HerdrWireProtocol::BridgeV1
+    };
     let mut watcher = watchme::model::WatcherState::new(
         watcher_id,
         watchme::model::TargetIdentity::herdr(
@@ -107,6 +112,7 @@ fn herdr_registration(resolved: ResolvedProcess) -> Result<ResolvedRegistration,
             pane.pane_id,
             pane.tty,
             resolved.identity,
+            wire_protocol,
         ),
         watchme::model::WatcherLifecycle::Registered,
         0,

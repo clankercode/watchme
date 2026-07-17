@@ -117,6 +117,7 @@ impl Observer for GenericObserver {
                     workspace_id,
                     tab_id,
                     pane_id,
+                    wire_protocol,
                     ..
                 } = context.as_ref()
             {
@@ -127,6 +128,7 @@ impl Observer for GenericObserver {
                     workspace_id,
                     tab_id,
                     pane_id,
+                    *wire_protocol,
                 )
                 .await;
             }
@@ -144,12 +146,14 @@ async fn observe_herdr(
     workspace_id: &str,
     tab_id: &str,
     pane_id: &str,
+    wire_protocol: crate::model::HerdrWireProtocol,
 ) -> Result<ObservationResult, String> {
     let context = crate::mux::herdr::HerdrContext {
         socket_path: socket_path.to_owned(),
         workspace_id: workspace_id.to_owned(),
         tab_id: tab_id.to_owned(),
         pane_id: pane_id.to_owned(),
+        wire_protocol,
     };
     let herdr = crate::mux::herdr::Herdr::new(context, Duration::from_secs(2))
         .map_err(|error| error.to_string())?;

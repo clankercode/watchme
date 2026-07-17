@@ -354,6 +354,7 @@ pub(super) fn watcher_mux_identity(
             tab_id,
             pane_id,
             tty,
+            ..
         } if provider == "herdr" && server == socket_path && pane == pane_id => {
             crate::mux::MuxIdentity {
                 provider: provider.clone(),
@@ -390,6 +391,7 @@ pub(super) fn validate_mux_target(
             workspace_id,
             tab_id,
             pane_id,
+            wire_protocol,
             ..
         }) => crate::mux::herdr::Herdr::new(
             crate::mux::herdr::HerdrContext {
@@ -397,6 +399,7 @@ pub(super) fn validate_mux_target(
                 workspace_id: workspace_id.clone(),
                 tab_id: tab_id.clone(),
                 pane_id: pane_id.clone(),
+                wire_protocol: *wire_protocol,
             },
             Duration::from_secs(2),
         )?
@@ -424,6 +427,7 @@ pub(super) fn capture_mux_target(
             workspace_id,
             tab_id,
             pane_id,
+            wire_protocol,
             ..
         }) => crate::mux::herdr::Herdr::new(
             crate::mux::herdr::HerdrContext {
@@ -431,6 +435,7 @@ pub(super) fn capture_mux_target(
                 workspace_id: workspace_id.clone(),
                 tab_id: tab_id.clone(),
                 pane_id: pane_id.clone(),
+                wire_protocol: *wire_protocol,
             },
             Duration::from_secs(2),
         )?
@@ -477,6 +482,7 @@ pub(super) fn execute_mux_action(
             workspace_id,
             tab_id,
             pane_id,
+            wire_protocol,
             ..
         }) => {
             let herdr = crate::mux::herdr::Herdr::new(
@@ -485,6 +491,7 @@ pub(super) fn execute_mux_action(
                     workspace_id: workspace_id.clone(),
                     tab_id: tab_id.clone(),
                     pane_id: pane_id.clone(),
+                    wire_protocol: *wire_protocol,
                 },
                 Duration::from_secs(2),
             )

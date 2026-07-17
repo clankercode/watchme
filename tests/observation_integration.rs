@@ -9,7 +9,10 @@ use watchme::daemon::classify_herdr_state;
 use watchme::daemon::registry::Registry;
 use watchme::daemon::{GenericObserver, Observer};
 use watchme::model::{Event, EventCategory, EventSource, PolicyHint, SourceKind};
-use watchme::model::{ProcessIdentity, TARGET_IDENTITY_SCHEMA_VERSION, TargetIdentity};
+use watchme::model::{
+    HerdrWireProtocol, MultiplexerContext, ProcessIdentity, TARGET_IDENTITY_SCHEMA_VERSION,
+    TargetIdentity,
+};
 use watchme::model::{WatcherLifecycle, WatcherState};
 use watchme::observe::screen::{TmuxChrome, trusted_tmux_screen};
 use watchme::recovery::coordinator::RecoveryCoordinator;
@@ -38,6 +41,40 @@ fn identity_v2_round_trips_complete_tmux_context() {
         serde_json::from_value::<TargetIdentity>(json).unwrap(),
         identity
     );
+}
+
+#[test]
+fn herdr_wire_protocol_round_trips_and_legacy_context_defaults_to_auto() {
+    let identity = TargetIdentity::herdr(
+        "/tmp/herdr.sock".into(),
+        "native-0.7.4-protocol-16-1-2".into(),
+        "ws".into(),
+        "tab".into(),
+        "pane".into(),
+        "/dev/pts/8".into(),
+        ProcessIdentity::new(42, 99),
+        HerdrWireProtocol::Native16,
+    );
+    let json = serde_json::to_value(&identity).unwrap();
+    assert_eq!(json["context"]["wire_protocol"], "native16");
+    assert_eq!(
+        serde_json::from_value::<TargetIdentity>(json).unwrap(),
+        identity
+    );
+
+    let legacy_context = serde_json::json!({
+        "provider":"herdr", "socket_path":"/tmp/herdr.sock",
+        "server_instance":"legacy", "workspace_id":"ws", "tab_id":"tab",
+        "pane_id":"pane", "tty":"/dev/pts/8"
+    });
+    let context: MultiplexerContext = serde_json::from_value(legacy_context).unwrap();
+    assert!(matches!(
+        context,
+        MultiplexerContext::Herdr {
+            wire_protocol: HerdrWireProtocol::Auto,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -512,6 +549,7 @@ async fn generic_observer_herdr_socket_maps_typed_working_and_uses_persisted_cur
             "pane".into(),
             "/dev/pts/8".into(),
             herdr_process(),
+            HerdrWireProtocol::BridgeV1,
         ),
         WatcherLifecycle::Observing,
         0,
@@ -594,6 +632,7 @@ async fn generic_observer_herdr_empty_events_uses_bounded_sanitized_unknown_fall
             "pane".into(),
             "/dev/pts/8".into(),
             herdr_process(),
+            HerdrWireProtocol::BridgeV1,
         ),
         WatcherLifecycle::Observing,
         0,

@@ -331,6 +331,7 @@ fn watcher(socket: String, process: ProcessIdentity) -> WatcherState {
         "pane-claude".into(),
         "/dev/pts/claude".into(),
         process,
+        watchme::model::HerdrWireProtocol::BridgeV1,
     );
     let mut watcher = WatcherState::new(
         WATCHER_ID.into(),
