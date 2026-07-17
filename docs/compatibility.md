@@ -71,8 +71,14 @@ live protocol-16 server and the inherited workspace, tab, and pane context.
 Herdr's [socket API documentation](https://herdr.dev/docs/socket-api/) is the
 upstream reference for that native surface.
 
-WatchMe's existing Herdr adapter implements a separate, fixed local bridge
-contract. It does not claim native protocol-16 pane control. The bridge is
+WatchMe supports Herdr's native protocol 16 for exact pane/process identity,
+bounded recent-unwrapped reads, and atomic `pane.send_input`. Registration
+requires the inherited workspace, tab, and pane IDs, the exact resolved Codex
+PID in `pane.process_info`, and matching TTY and process start time. The
+persisted dialect prevents later requests from being misdecoded as the older
+bridge contract.
+
+The adapter also retains a separate, fixed local bridge contract. The bridge is
 newline-delimited JSON over the owner-owned Unix socket in
 `HERDR_SOCKET_PATH`, with `protocol = "watchme.herdr"`, `schema_version = 1`,
 unique request IDs, one request/response per connection, a 256 KiB response
@@ -81,12 +87,28 @@ ceiling, and bounded timeouts. Context also requires `HERDR_WORKSPACE_ID`,
 
 When those inherited variables point at a native Herdr server, WatchMe first
 performs its normal socket ownership, mode, peer-credential, size, newline,
-and deadline checks. A syntactically valid native `id` plus `result`/`error`
-envelope is then treated as an explicit protocol incompatibility. Bare
-registration falls back to the independently verified coding-agent process;
-it does not persist Herdr multiplexer capabilities or send pane input. Partial
-environment, unsafe sockets, timeouts, arbitrary malformed responses, and
-process/pane contradictions still fail closed.
+and deadline checks, then explicitly negotiates protocol 16. Protocol 17 or
+another unsupported version safely degrades to independently verified process
+supervision. Partial environment, unsafe sockets, timeouts, arbitrary malformed
+responses, and process/pane contradictions still fail closed.
+
+On Linux, bare registration can bind the exact `codex resume THREAD` process to
+the rollout, thread database, and goals database that process already has open.
+The daemon reads those files read-only, revalidates owner/device/inode and live
+PID/start-time/CWD on every observation, and accepts a capacity block only when
+the exact latest completed turn contains Codex's capacity result and the same
+thread's durable goal is blocked. On macOS, automatic `/proc/PID/fd`
+correlation is unavailable; all explicit thread/process/CWD/rollout/database
+values are required or the watcher remains non-recovering.
+
+Herdr's agent status is screen-derived and may be missing or marked skipped for
+a focused pane. WatchMe treats it as optional corroboration only: it cannot
+mask exact Codex state and cannot authorize input. A verified recovery sends
+the fixed `/goal resume` text and Enter in one `pane.send_input` request after
+two immediate identity/composer checks. A lost or malformed acknowledgement is
+recorded as a possible side effect and becomes human-required; it is never
+blindly retried. Unknown composer layouts, typed drafts, stale capacity text,
+and active/resumed goals remain observation-only.
 
 The schema-faithful fake covers `pane_info`, `process_info`, bounded recent unwrapped `pane_read`, separate control-safe `send_text` and allowlisted symbolic `send_keys`, `agent_session`, `agent_state_events`, and `notification`. The client rejects partial, malformed, oversized, wrong-version, wrong-protocol, wrong-method, and mismatched-request responses. Success and failure are an exact union: success requires a non-null result and no error, while failure requires a non-null error and no result. One monotonic deadline covers connection, peer verification, write, response read, and parse; held or byte-dripping peers cannot renew it. It requires an absolute, canonical Unix socket owned by the current UID and not writable by group or others, rechecks the pathname device/inode after connecting, and uses Tokio's portable Unix peer-credential API on both Linux and macOS; unavailable or mismatched credentials fail closed. Target process, pane, and composer safety are revalidated at action boundaries, and terminal reads receive a post-read identity check. Persisted Herdr server identity combines the canonical socket path and provider-returned server ID, so either replacement changes target identity.
 
@@ -102,8 +124,8 @@ Probe date: 2026-07-12. Host reports `tmux 3.6b`. Real integration tests use iso
 |---|---|---|
 | Claude Code 2.1.207 structured StopFailure hook | structured recovery (when correlated) | hook installer + fixture/e2e tests; live menu not established |
 | Claude Code terminal rate-limit menu | deterministic terminal recovery (fixture-only on this host) | fixtures; live probe blocked by first-run UI |
-| Codex blocked durable goal | structured / deterministic resume | fixture + recovery tests for `/goal resume` |
-| Herdr 0.7.4 native API | process-supervision fallback | installed schema + read-only live `x-left` protocol-16 probe |
+| Codex blocked durable goal | structured / deterministic resume on Linux; explicit correlation on macOS | exact SQLite/rollout binding + recovery tests for atomic `/goal resume` |
+| Herdr 0.7.4 native API | first-class protocol-16 identity/read/input adapter | schema-faithful contract tests + read-only live `x-left` probe |
 | `watchme.herdr` bridge | contract-tested adapter | schema-faithful fake; no upstream bridge claim |
 | tmux 3.6b | first-class multiplexer | real integration tests |
 | Bundled generic manifests (opencode, pi, hermes, …) | observation-only to planner-assisted per manifest | bundled manifests + loader tests |

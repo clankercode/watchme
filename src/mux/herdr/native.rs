@@ -135,6 +135,39 @@ impl Herdr {
         }
     }
 
+    pub async fn current_target_for_process_async(
+        &self,
+        expected: &ProcessIdentity,
+    ) -> Result<MuxIdentity, MuxError> {
+        if self.context.wire_protocol == HerdrWireProtocol::Native16 {
+            return self
+                .native_target_snapshot_async(expected)
+                .await
+                .map(|(identity, _)| identity);
+        }
+        match self.current_target_async().await {
+            Ok(identity) => {
+                if identity.process.pid == expected.pid
+                    && identity.process.start_time == expected.start_time
+                {
+                    Ok(identity)
+                } else {
+                    Err(MuxError::IdentityChanged(
+                        "bridge pane process differs from resolved process".into(),
+                    ))
+                }
+            }
+            Err(MuxError::IncompatibleProtocol(_))
+                if self.context.wire_protocol == HerdrWireProtocol::Auto =>
+            {
+                self.native_target_snapshot_async(expected)
+                    .await
+                    .map(|(identity, _)| identity)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn native_target(&self, expected: &ProcessIdentity) -> Result<MuxIdentity, MuxError> {
         self.native_target_snapshot(expected)
             .map(|(identity, _)| identity)
@@ -144,8 +177,29 @@ impl Herdr {
         &self,
         expected: &ProcessIdentity,
     ) -> Result<(MuxIdentity, u64), MuxError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(MuxError::Command(
+                "synchronous Herdr request cannot run inside a Tokio runtime; use the async API"
+                    .into(),
+            ));
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|error| MuxError::Command(error.to_string()))?
+            .block_on(self.native_target_snapshot_async(expected))
+    }
+
+    async fn native_target_snapshot_async(
+        &self,
+        expected: &ProcessIdentity,
+    ) -> Result<(MuxIdentity, u64), MuxError> {
         let socket = validate_socket(Path::new(&self.context.socket_path))?;
-        let (version, protocol) = match self.call_native("ping", serde_json::json!({}))? {
+        let (version, protocol) = match self
+            .call_native_async("ping", serde_json::json!({}))
+            .await?
+        {
             ResultValue::Pong { version, protocol } => (version, protocol),
             _ => {
                 return Err(MuxError::Protocol(
@@ -158,10 +212,13 @@ impl Herdr {
                 "native Herdr protocol {protocol} is unsupported"
             )));
         }
-        let pane = match self.call_native(
-            "pane.current",
-            serde_json::json!({"caller_pane_id": self.context.pane_id}),
-        )? {
+        let pane = match self
+            .call_native_async(
+                "pane.current",
+                serde_json::json!({"caller_pane_id": self.context.pane_id}),
+            )
+            .await?
+        {
             ResultValue::PaneCurrent { pane } => pane,
             _ => {
                 return Err(MuxError::Protocol(
@@ -177,10 +234,13 @@ impl Herdr {
                 "native Herdr pane context differs from registration context".into(),
             ));
         }
-        let process_info = match self.call_native(
-            "pane.process_info",
-            serde_json::json!({"pane_id": self.context.pane_id}),
-        )? {
+        let process_info = match self
+            .call_native_async(
+                "pane.process_info",
+                serde_json::json!({"pane_id": self.context.pane_id}),
+            )
+            .await?
+        {
             ResultValue::PaneProcessInfo { process_info } => process_info,
             _ => {
                 return Err(MuxError::Protocol(

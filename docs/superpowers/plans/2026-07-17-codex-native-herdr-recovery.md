@@ -6,7 +6,7 @@
 
 **Architecture:** Preserve the hardened Unix-socket transport while adding an explicit native Herdr wire dialect and exact pane/process correlation. Add a registration-time Codex attachment plus a read-only SQLite/bounded-rollout observer, promote existing process-only watchers in place, and authorize one atomic resume only from current structured evidence. Herdr focus/status remains optional corroboration and never overrides Codex state.
 
-**Tech Stack:** Rust 2024, Tokio Unix sockets, Serde/JSON, `rusqlite 0.40.1` with bundled SQLite, existing atomic JSON store, native Herdr protocol 16, Cargo/Just test gates.
+**Tech Stack:** Rust 2024, Tokio Unix sockets, Serde/JSON, `rusqlite 0.39.0` with bundled SQLite (compatible with the project's Rust 1.88 floor), existing atomic JSON store, native Herdr protocol 16, Cargo/Just test gates.
 
 ---
 

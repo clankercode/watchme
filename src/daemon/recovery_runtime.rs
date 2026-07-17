@@ -209,7 +209,23 @@ impl ComposerSafety for RuntimeComposerSafety {
         &self,
         identity: &crate::mux::MuxIdentity,
     ) -> Result<crate::mux::ComposerState, crate::mux::MuxError> {
-        let capture = capture_mux_target(&self.watcher, identity, 3, 1_024)?;
+        let native_codex = self.watcher.codex_session.is_some()
+            && matches!(
+                self.watcher.target.observation_context(),
+                Some(crate::model::MultiplexerContext::Herdr {
+                    wire_protocol: crate::model::HerdrWireProtocol::Native16,
+                    ..
+                })
+            );
+        let capture = capture_mux_target(
+            &self.watcher,
+            identity,
+            if native_codex { 12 } else { 3 },
+            if native_codex { 4_096 } else { 1_024 },
+        )?;
+        if native_codex {
+            return Ok(super::codex_composer::state_from_recent(&capture.text));
+        }
         Ok(
             if capture
                 .text

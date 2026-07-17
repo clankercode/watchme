@@ -1,3 +1,4 @@
+mod codex_composer;
 mod ipc_service;
 pub(crate) mod lifecycle;
 #[cfg(test)]

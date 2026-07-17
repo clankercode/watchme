@@ -25,7 +25,7 @@ Escalate to a human (never auto-act) for:
 
 ## Compatibility honesty
 
-See [compatibility.md](compatibility.md). Live Claude rate-limit menus were not established on the development host (first-run security screen). Herdr live smoke is skipped when Herdr is absent. Support tiers are evidence-backed only.
+See [compatibility.md](compatibility.md). Live Claude rate-limit menus were not established on the development host (first-run security screen). Native Herdr protocol 16 was probed read-only on `x-left`; no provider capacity failure was induced. Support tiers are evidence-backed only.
 
 ## Resource claims
 

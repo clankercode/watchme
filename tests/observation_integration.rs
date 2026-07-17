@@ -585,6 +585,87 @@ fn herdr_pane() -> Value {
             "parent_digest":null}})
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_herdr_observation_validates_identity_without_using_bridge_state_calls() {
+    use std::os::unix::fs::MetadataExt;
+    use watchme::process::ProcessInspector;
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("herdr-native.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pid = std::process::id();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let recorded = requests.clone();
+    let server = thread::spawn(move || {
+        for connection in listener.incoming().take(3) {
+            let mut connection = connection.unwrap();
+            let mut line = String::new();
+            BufReader::new(connection.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            recorded.lock().unwrap().push(request.clone());
+            let result = match request["method"].as_str().unwrap() {
+                "ping" => json!({"type":"pong", "version":"0.16.0", "protocol":16}),
+                "pane.current" => json!({"type":"pane_current", "pane":{
+                    "pane_id":"pane", "workspace_id":"ws", "tab_id":"tab", "revision":9
+                }}),
+                "pane.process_info" => json!({"type":"pane_process_info", "process_info":{
+                    "pane_id":"pane", "tty":"/dev/pts/8",
+                    "foreground_processes":[{"pid":pid}]
+                }}),
+                method => panic!("unexpected native observer method {method}"),
+            };
+            let response = json!({"id":request["id"], "result":result});
+            connection
+                .write_all(&serde_json::to_vec(&response).unwrap())
+                .unwrap();
+            connection.write_all(b"\n").unwrap();
+        }
+    });
+    let inspected = watchme::process::linux::LinuxProcessInspector::default()
+        .inspect(pid)
+        .unwrap();
+    let mut process = ProcessIdentity::new(pid, inspected.start_time);
+    process.tty = Some("/dev/pts/8".into());
+    let metadata = std::fs::metadata(&socket).unwrap();
+    let watcher = WatcherState::new(
+        "native-observer".into(),
+        TargetIdentity::herdr(
+            socket.to_string_lossy().into_owned(),
+            format!(
+                "native-0.16.0-protocol-16-{}-{}",
+                metadata.dev(),
+                metadata.ino()
+            ),
+            "ws".into(),
+            "tab".into(),
+            "pane".into(),
+            "/dev/pts/8".into(),
+            process,
+            HerdrWireProtocol::Native16,
+        ),
+        WatcherLifecycle::Observing,
+        0,
+        0,
+    );
+
+    let result = GenericObserver.observe(watcher).await.unwrap();
+    assert!(result.event.is_none());
+    server.join().unwrap();
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["ping", "pane.current", "pane.process_info"]
+    );
+}
+
 #[tokio::test]
 async fn generic_observer_herdr_empty_events_uses_bounded_sanitized_unknown_fallback() {
     let temp = tempfile::tempdir().unwrap();

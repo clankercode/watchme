@@ -22,11 +22,13 @@ cargo build --release -j1 --locked
 #   --with-systemd --with-completions --with-man --with-herdr-action
 
 watchme doctor
-# Optional explicit background start; bare registration also starts lazily:
+# From a supported coding-agent session / shell escape. This lazily starts
+# the daemon in the background, registers the exact session, and returns:
+watchme
+# Optional explicit/idempotent background start (normally unnecessary):
 watchme daemon start
-# From a supported coding-agent session / shell escape:
-WatchMe
 watchme status
+watchme logs --follow
 watchme stop --all
 ./scripts/uninstall.sh --prefix ~/.local
 ```

@@ -112,25 +112,12 @@ impl Observer for GenericObserver {
                 process,
                 ..
             } = &watcher.target
-                && let crate::model::MultiplexerContext::Herdr {
-                    socket_path,
-                    workspace_id,
-                    tab_id,
-                    pane_id,
-                    wire_protocol,
-                    ..
-                } = context.as_ref()
-            {
-                return observe_herdr(
-                    &watcher,
-                    process,
-                    socket_path,
-                    workspace_id,
-                    tab_id,
-                    pane_id,
-                    *wire_protocol,
+                && matches!(
+                    context.as_ref(),
+                    crate::model::MultiplexerContext::Herdr { .. }
                 )
-                .await;
+            {
+                return observe_herdr(&watcher, process, context).await;
             }
             tokio::task::spawn_blocking(move || generic_observe(&watcher))
                 .await
@@ -142,28 +129,45 @@ impl Observer for GenericObserver {
 async fn observe_herdr(
     watcher: &crate::model::WatcherState,
     process: &crate::model::ProcessIdentity,
-    socket_path: &str,
-    workspace_id: &str,
-    tab_id: &str,
-    pane_id: &str,
-    wire_protocol: crate::model::HerdrWireProtocol,
+    persisted_context: &crate::model::MultiplexerContext,
 ) -> Result<ObservationResult, String> {
+    let crate::model::MultiplexerContext::Herdr {
+        socket_path,
+        workspace_id,
+        tab_id,
+        pane_id,
+        wire_protocol,
+        ..
+    } = persisted_context
+    else {
+        return Err("missing Herdr observation context".into());
+    };
     let context = crate::mux::herdr::HerdrContext {
         socket_path: socket_path.to_owned(),
         workspace_id: workspace_id.to_owned(),
         tab_id: tab_id.to_owned(),
         pane_id: pane_id.to_owned(),
-        wire_protocol,
+        wire_protocol: *wire_protocol,
     };
     let herdr = crate::mux::herdr::Herdr::new(context, Duration::from_secs(2))
         .map_err(|error| error.to_string())?;
+    if *wire_protocol == crate::model::HerdrWireProtocol::Native16 {
+        let actual = herdr
+            .current_target_for_process_async(process)
+            .await
+            .map_err(|error| error.to_string())?;
+        validate_observed_herdr_identity(&actual, process, persisted_context)?;
+        // Protocol 16's screen-derived agent status may be deliberately
+        // skipped for a focused pane. Codex's exact SQLite/rollout state was
+        // already preferred above; native pane metadata is identity evidence
+        // only and cannot synthesize a blocked/working event.
+        return Ok(ObservationResult::default());
+    }
     let actual = herdr
         .current_target_async()
         .await
         .map_err(|error| error.to_string())?;
-    if actual.process.pid != process.pid || actual.process.start_time != process.start_time {
-        return Err("target identity changed".into());
-    }
+    validate_observed_herdr_identity(&actual, process, persisted_context)?;
     let state = herdr
         .agent_state_events_async(
             &actual,
@@ -208,6 +212,36 @@ async fn observe_herdr(
         event: Some(event),
         herdr_after_sequence: cursor,
     })
+}
+
+fn validate_observed_herdr_identity(
+    actual: &crate::mux::MuxIdentity,
+    process: &crate::model::ProcessIdentity,
+    persisted_context: &crate::model::MultiplexerContext,
+) -> Result<(), String> {
+    let crate::model::MultiplexerContext::Herdr {
+        socket_path,
+        server_instance,
+        workspace_id,
+        tab_id,
+        pane_id,
+        ..
+    } = persisted_context
+    else {
+        return Err("missing Herdr observation context".into());
+    };
+    if actual.process.pid != process.pid
+        || actual.process.start_time != process.start_time
+        || actual.server.as_str() != socket_path.as_str()
+        || actual.server_instance.as_str() != server_instance.as_str()
+        || actual.session_id.as_str() != workspace_id.as_str()
+        || actual.window_id.as_str() != tab_id.as_str()
+        || actual.pane_id.as_str() != pane_id.as_str()
+        || actual.tty != process.tty.as_deref().unwrap_or_default()
+    {
+        return Err("target multiplexer identity changed".into());
+    }
+    Ok(())
 }
 
 fn generic_observe(watcher: &crate::model::WatcherState) -> Result<ObservationResult, String> {
