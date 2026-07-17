@@ -158,7 +158,7 @@ struct NativeIdentityFixture {
     tab_id: &'static str,
     pane_id: &'static str,
     process_pid: u32,
-    tty: &'static str,
+    tty: Option<&'static str>,
     response_id: Option<&'static str>,
 }
 
@@ -170,7 +170,7 @@ impl NativeIdentityFixture {
             tab_id: "tab-2",
             pane_id: "pane-3",
             process_pid,
-            tty: "/dev/pts/8",
+            tty: Some("/dev/pts/8"),
             response_id: None,
         }
     }
@@ -413,7 +413,7 @@ fn native_pane_must_contain_registered_process() {
 fn native_pane_tty_must_match_registered_process() {
     let pid = std::process::id();
     let fixture = NativeIdentityFixture {
-        tty: "/dev/pts/99",
+        tty: Some("/dev/pts/99"),
         ..NativeIdentityFixture::valid(pid)
     };
     let (_server, socket, _) = spawn_native_identity_fake(fixture);
@@ -427,6 +427,24 @@ fn native_pane_tty_must_match_registered_process() {
         error,
         MuxError::IdentityChanged(message) if message.contains("TTY")
     ));
+}
+
+#[test]
+fn native_optional_tty_may_be_absent_when_exact_pane_pid_matches() {
+    let pid = std::process::id();
+    let fixture = NativeIdentityFixture {
+        tty: None,
+        ..NativeIdentityFixture::valid(pid)
+    };
+    let (_server, socket, _) = spawn_native_identity_fake(fixture);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("dev:136:1".into());
+    let herdr = Herdr::new(context(socket), Duration::from_millis(300)).unwrap();
+
+    let identity = herdr.current_target_for_process(&process).unwrap();
+
+    assert_eq!(identity.process, process);
+    assert_eq!(identity.tty, "dev:136:1");
 }
 
 #[test]

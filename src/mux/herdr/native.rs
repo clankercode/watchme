@@ -261,10 +261,11 @@ impl Herdr {
         let expected_tty = expected.tty.as_deref().ok_or_else(|| {
             MuxError::IdentityChanged("resolved process has no controlling TTY".into())
         })?;
-        let observed_tty = process_info.tty.as_deref().ok_or_else(|| {
-            MuxError::IdentityChanged("native Herdr pane has no controlling TTY".into())
-        })?;
-        if !native_tty_matches(expected_tty, observed_tty) {
+        if process_info
+            .tty
+            .as_deref()
+            .is_some_and(|observed_tty| !native_tty_matches(expected_tty, observed_tty))
+        {
             return Err(MuxError::IdentityChanged(
                 "native Herdr pane TTY differs from the registered process".into(),
             ));
