@@ -2,6 +2,7 @@ pub mod agents;
 pub mod audit;
 pub mod claude_attachment;
 pub mod client;
+pub mod codex_attachment;
 pub mod config;
 pub mod daemon;
 pub mod doctor;

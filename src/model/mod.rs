@@ -11,6 +11,7 @@ pub use identity::{
     TARGET_IDENTITY_SCHEMA_VERSION, TargetIdentity,
 };
 pub use state::{
-    ClaudeSessionReference, CodexRolloutBinding, CodexSessionReference, ObservationSchedule,
-    TranscriptBinding, WATCHER_STATE_SCHEMA_VERSION, WatcherLifecycle, WatcherState,
+    ClaudeSessionReference, CodexBoundFile, CodexRolloutBinding, CodexSessionReference,
+    CodexStructuredStateReference, ObservationSchedule, TranscriptBinding,
+    WATCHER_STATE_SCHEMA_VERSION, WatcherLifecycle, WatcherState,
 };

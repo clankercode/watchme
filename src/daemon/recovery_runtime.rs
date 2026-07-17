@@ -1223,6 +1223,7 @@ mod tests {
                 target_session: None,
                 rollout_binding: Some(binding),
                 app_server_state_path: Some(snapshot_path.to_string_lossy().into()),
+                structured_state: None,
             })
             .unwrap();
 

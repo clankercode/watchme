@@ -68,6 +68,7 @@ fn process_registration(resolved: ResolvedProcess) -> ResolvedRegistration {
         unix_time_ms(),
     );
     watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
+    watchme::codex_attachment::attach_process_correlated_codex_session(&mut watcher, None);
     ResolvedRegistration { watcher }
 }
 
@@ -119,6 +120,7 @@ fn herdr_registration(resolved: ResolvedProcess) -> Result<ResolvedRegistration,
         unix_time_ms(),
     );
     watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
+    watchme::codex_attachment::attach_process_correlated_codex_session(&mut watcher, None);
     Ok(ResolvedRegistration { watcher })
 }
 
@@ -160,6 +162,7 @@ fn tmux_registration(
         unix_time_ms(),
     );
     watchme::claude_attachment::attach_process_correlated_claude_session(&mut watcher);
+    watchme::codex_attachment::attach_process_correlated_codex_session(&mut watcher, None);
     Ok(ResolvedRegistration { watcher })
 }
 

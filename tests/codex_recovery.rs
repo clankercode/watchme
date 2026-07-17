@@ -727,6 +727,7 @@ fn bound_codex_watcher(bound_cwd: &Path, rollout: &Path, thread_id: &str) -> Wat
             target_session: None,
             rollout_binding: Some(binding),
             app_server_state_path: None,
+            structured_state: None,
         })
         .unwrap();
     watcher

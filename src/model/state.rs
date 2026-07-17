@@ -60,6 +60,25 @@ pub struct CodexSessionReference {
     /// rollout when present, owner-only, and under the bound CWD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_server_state_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_state: Option<CodexStructuredStateReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexBoundFile {
+    pub canonical_path: String,
+    pub device: u64,
+    pub inode: u64,
+    pub owner_uid: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexStructuredStateReference {
+    pub rollout: CodexBoundFile,
+    pub thread_db: CodexBoundFile,
+    pub goals_db: CodexBoundFile,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
