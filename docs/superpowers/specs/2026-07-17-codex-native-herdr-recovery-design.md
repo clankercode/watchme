@@ -1,7 +1,7 @@
 # Real Codex Recovery Through Native Herdr
 
 Date: 2026-07-17
-Status: approved design, awaiting written-spec review
+Status: approved 2026-07-17
 
 ## Goal
 
