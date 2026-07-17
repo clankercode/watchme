@@ -85,7 +85,7 @@ fn has_herdr_environment() -> bool {
 
 fn herdr_registration(resolved: ResolvedProcess) -> Result<ResolvedRegistration, MuxError> {
     let herdr = Herdr::new(HerdrContext::from_environment()?, Duration::from_secs(2))?;
-    let pane = herdr.current_target()?;
+    let pane = herdr.current_target_for_process(&resolved.identity)?;
     if pane.process != resolved.identity
         || normalize_tty(pane.tty.as_str())
             != normalize_tty(resolved.identity.tty.as_deref().unwrap_or_default())

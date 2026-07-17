@@ -114,7 +114,7 @@ fn bare_watchme_registers_from_ttyless_codex_ancestor() {
 }
 
 #[test]
-fn bare_watchme_ignores_native_herdr_api_and_registers_codex_process() {
+fn bare_watchme_falls_back_for_unsupported_native_herdr_protocol() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::sync::{Arc, Mutex};
@@ -126,21 +126,26 @@ fn bare_watchme_ignores_native_herdr_api_and_registers_codex_process() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&requests);
     let server = std::thread::spawn(move || {
-        let (mut connection, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(connection.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        recorded
-            .lock()
-            .unwrap()
-            .push(serde_json::from_str::<Value>(&line).unwrap());
-        connection
-            .write_all(
-                br#"{"id":"","error":{"code":"invalid_request","message":"invalid request: missing field `id`"}}
-"#,
-            )
-            .unwrap();
+        for index in 0..2 {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(connection.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request = serde_json::from_str::<Value>(&line).unwrap();
+            recorded.lock().unwrap().push(request.clone());
+            let response = if index == 0 {
+                serde_json::json!({"id":"", "error":{"code":"invalid_request",
+                    "message":"invalid request: missing field id"}})
+            } else {
+                serde_json::json!({"id":request["id"], "result":{"type":"pong",
+                    "version":"0.8.0", "protocol":17}})
+            };
+            connection
+                .write_all(&serde_json::to_vec(&response).unwrap())
+                .unwrap();
+            connection.write_all(b"\n").unwrap();
+        }
     });
 
     let persisted = bare_codex_registration(Some(&socket));
@@ -148,8 +153,9 @@ fn bare_watchme_ignores_native_herdr_api_and_registers_codex_process() {
 
     assert_eq!(persisted["watchers"][0]["target"]["kind"], "process");
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["protocol"], "watchme.herdr");
+    assert_eq!(requests[1]["method"], "ping");
 }
 
 #[test]
