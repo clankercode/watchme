@@ -7,14 +7,18 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod bridge;
+
+use bridge::{Request, Response};
+
 use super::{
     Capture, ComposerSafety, ComposerState, Multiplexer, MuxError, MuxIdentity, PaneInfo,
     SymbolicKey,
 };
 use crate::model::ProcessIdentity;
 
-pub const HERDR_PROTOCOL: &str = "watchme.herdr";
-pub const HERDR_SCHEMA_VERSION: u16 = 1;
+pub const HERDR_PROTOCOL: &str = bridge::PROTOCOL;
+pub const HERDR_SCHEMA_VERSION: u16 = bridge::SCHEMA_VERSION;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_CAPTURE_LINES: usize = 10_000;
@@ -108,27 +112,6 @@ pub struct AgentEvent {
 pub struct AgentStateEvents {
     pub state: String,
     pub events: Vec<AgentEvent>,
-}
-
-#[derive(Serialize)]
-struct Request<'a, P> {
-    schema_version: u16,
-    protocol: &'static str,
-    request_id: &'a str,
-    method: &'a str,
-    params: P,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Response<T> {
-    schema_version: u16,
-    protocol: String,
-    request_id: String,
-    method: String,
-    ok: bool,
-    result: Option<T>,
-    error: Option<String>,
 }
 
 #[derive(Serialize)]
