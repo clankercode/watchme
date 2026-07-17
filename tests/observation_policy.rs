@@ -285,6 +285,31 @@ fn action_constructors_bind_and_enforce_the_supplied_evidence_fingerprint() {
 }
 
 #[test]
+fn submit_text_requires_safe_fixed_text_and_empty_composer() {
+    let action = Action::submit_text("resume", "/goal resume", "capacity cleared", "fp");
+    assert!(matches!(
+        action.kind,
+        ActionKind::SubmitText { ref text } if text == "/goal resume"
+    ));
+    assert!(
+        action
+            .preconditions
+            .iter()
+            .any(|condition| { condition.kind == "TARGET_IDENTITY_MATCHES" })
+    );
+
+    let mut context = PolicyContext::safe();
+    context.evidence_fingerprint = Some("fp".into());
+    assert!(CompiledPolicy.authorize(&action, &context).is_ok());
+    context.composer_empty = false;
+    assert!(CompiledPolicy.authorize(&action, &context).is_err());
+
+    let unsafe_action = Action::submit_text("unsafe", "sudo reboot", "unsafe", "fp");
+    context.composer_empty = true;
+    assert!(CompiledPolicy.authorize(&unsafe_action, &context).is_err());
+}
+
+#[test]
 fn policy_bounds_wait_until_against_parsed_wall_time_and_wait_budget() {
     let action = Action::new(
         "wait",

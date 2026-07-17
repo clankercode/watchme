@@ -370,9 +370,11 @@ pub fn validate_recovery_plan(
                 "action type not allowlisted: {type_name}"
             )));
         }
-        if let ActionKind::SendText { text } = &action.kind
-            && prohibited_text(text)
-        {
+        if matches!(
+            &action.kind,
+            ActionKind::SendText { text } | ActionKind::SubmitText { text }
+                if prohibited_text(text)
+        ) {
             return Err(SchemaError::new("prohibited send text"));
         }
         policy
@@ -390,6 +392,7 @@ fn action_type_name(kind: &ActionKind) -> &'static str {
         ActionKind::Capture { .. } => "CAPTURE",
         ActionKind::CheckStatus { .. } => "CHECK_STATUS",
         ActionKind::SendText { .. } => "SEND_TEXT",
+        ActionKind::SubmitText { .. } => "SUBMIT_TEXT",
         ActionKind::SendKeys { .. } => "SEND_KEYS",
         ActionKind::Notify { .. } => "NOTIFY",
         ActionKind::Escalate { .. } => "ESCALATE",

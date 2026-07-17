@@ -143,7 +143,7 @@
       "uniqueItems": true,
       "items": {
         "enum": [
-          "WAIT_UNTIL", "WAIT_DURATION", "CAPTURE", "CHECK_STATUS", "SEND_TEXT",
+          "WAIT_UNTIL", "WAIT_DURATION", "CAPTURE", "CHECK_STATUS", "SEND_TEXT", "SUBMIT_TEXT",
           "SEND_KEYS", "NOTIFY", "ESCALATE", "STOP_WATCHING", "NOOP"
         ]
       }

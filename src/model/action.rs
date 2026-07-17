@@ -24,6 +24,7 @@ pub enum ActionKind {
     Capture { source: String, max_lines: u16 },
     CheckStatus { check: StatusCheck },
     SendText { text: String },
+    SubmitText { text: String },
     SendKeys { keys: Vec<String> },
     Notify { severity: String, message: String },
     Escalate { level: String },
@@ -117,6 +118,32 @@ impl Action {
         action
     }
 
+    pub fn submit_text(
+        id: impl Into<String>,
+        text: impl Into<String>,
+        reason: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        let mut action = Self::new(
+            id,
+            ActionKind::SubmitText { text: text.into() },
+            reason,
+            fingerprint.into(),
+            30,
+        );
+        action.preconditions.extend([
+            Condition {
+                kind: "TARGET_IDENTITY_MATCHES".into(),
+                value: None,
+            },
+            Condition {
+                kind: "COMPOSER_EMPTY".into(),
+                value: None,
+            },
+        ]);
+        action
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if !valid_id(&self.action_id)
             || self.action_id.len() > 96
@@ -154,7 +181,7 @@ impl Action {
                 Ok(())
             }
             ActionKind::CheckStatus { check } if valid_check(check) => Ok(()),
-            ActionKind::SendText { text }
+            ActionKind::SendText { text } | ActionKind::SubmitText { text }
                 if !self.preconditions.is_empty() && !text.is_empty() && text.len() <= 512 =>
             {
                 Ok(())

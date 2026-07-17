@@ -91,9 +91,11 @@ impl ActionExecutor for RuntimeActuator<'_> {
                 Ok(ExecutionOutput::Committed)
             }
             ActionKind::Noop => Ok(ExecutionOutput::Committed),
-            ActionKind::SendText { .. } | ActionKind::SendKeys { .. } => Err(
-                ExecutionError::Unsafe("input action requires multiplexer actuator"),
-            ),
+            ActionKind::SendText { .. }
+            | ActionKind::SubmitText { .. }
+            | ActionKind::SendKeys { .. } => Err(ExecutionError::Unsafe(
+                "input action requires multiplexer actuator",
+            )),
         }
     }
 }
@@ -105,9 +107,13 @@ fn runtime<T>(result: Result<T, String>) -> Result<T, ExecutionError> {
 pub fn validate_action(action: &Action) -> Result<(), ExecutionError> {
     action.validate().map_err(ExecutionError::Unsafe)?;
     match &action.kind {
-        ActionKind::SendText { text } if text.chars().any(forbidden_literal_character) => Err(
-            ExecutionError::Unsafe("literal text contains C0/C1 control"),
-        ),
+        ActionKind::SendText { text } | ActionKind::SubmitText { text }
+            if text.chars().any(forbidden_literal_character) =>
+        {
+            Err(ExecutionError::Unsafe(
+                "literal text contains C0/C1 control",
+            ))
+        }
         ActionKind::SendKeys { keys } if !keys.iter().all(|key| symbolic_key(key).is_some()) => {
             Err(ExecutionError::Unsafe("symbolic key is not allowlisted"))
         }
@@ -170,6 +176,12 @@ impl<M: Multiplexer> ActionExecutor for MuxActuator<'_, M> {
             ActionKind::SendText { text } => {
                 self.mux
                     .send_literal(self.identity, text, self.composer)
+                    .map_err(possible_side_effect)?;
+                Ok(ExecutionOutput::Committed)
+            }
+            ActionKind::SubmitText { text } => {
+                self.mux
+                    .submit_literal(self.identity, text, self.composer)
                     .map_err(possible_side_effect)?;
                 Ok(ExecutionOutput::Committed)
             }

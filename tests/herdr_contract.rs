@@ -231,6 +231,75 @@ fn spawn_native_identity_fake(
     })
 }
 
+fn spawn_native_io_fake(process_pid: u32) -> (FakeServer, String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake(move |request, _| {
+        let result = match request["method"].as_str().unwrap() {
+            "ping" => json!({"type":"pong", "version":"0.7.4", "protocol":16}),
+            "pane.current" => json!({
+                "type":"pane_current",
+                "pane": {"pane_id":"pane-3", "workspace_id":"ws-1", "tab_id":"tab-2",
+                    "revision":7}
+            }),
+            "pane.process_info" => json!({
+                "type":"pane_process_info",
+                "process_info": {"pane_id":"pane-3", "tty":"/dev/pts/8",
+                    "foreground_processes":[{"pid":process_pid}]}
+            }),
+            "pane.read" => json!({
+                "type":"pane_read",
+                "read": {"pane_id":"pane-3", "workspace_id":"ws-1", "tab_id":"tab-2",
+                    "source":"recent_unwrapped", "format":"plain",
+                    "text":"Selected model is at capacity. Please try a different model.",
+                    "revision":7, "truncated":false}
+            }),
+            "pane.send_input" => json!({"type":"ok"}),
+            method => panic!("unexpected native request {method}"),
+        };
+        Some(native_response(&request, result))
+    })
+}
+
+fn spawn_native_revision_change_fake(
+    process_pid: u32,
+) -> (FakeServer, String, Arc<Mutex<Vec<Value>>>) {
+    let pane_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    spawn_fake(move |request, _| {
+        let result = match request["method"].as_str().unwrap() {
+            "ping" => json!({"type":"pong", "version":"0.7.4", "protocol":16}),
+            "pane.current" => {
+                let read = pane_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"type":"pane_current", "pane": {"pane_id":"pane-3",
+                    "workspace_id":"ws-1", "tab_id":"tab-2",
+                    "revision": if read < 2 { 7 } else { 8 }}})
+            }
+            "pane.process_info" => json!({"type":"pane_process_info", "process_info": {
+                "pane_id":"pane-3", "tty":"/dev/pts/8",
+                "foreground_processes":[{"pid":process_pid}]}}),
+            "pane.send_input" => json!({"type":"ok"}),
+            method => panic!("unexpected native request {method}"),
+        };
+        Some(native_response(&request, result))
+    })
+}
+
+fn spawn_native_send_without_ack_fake(
+    process_pid: u32,
+) -> (FakeServer, String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake(move |request, _| {
+        let result = match request["method"].as_str().unwrap() {
+            "ping" => json!({"type":"pong", "version":"0.7.4", "protocol":16}),
+            "pane.current" => json!({"type":"pane_current", "pane": {"pane_id":"pane-3",
+                "workspace_id":"ws-1", "tab_id":"tab-2", "revision":7}}),
+            "pane.process_info" => json!({"type":"pane_process_info", "process_info": {
+                "pane_id":"pane-3", "tty":"/dev/pts/8",
+                "foreground_processes":[{"pid":process_pid}]}}),
+            "pane.send_input" => return None,
+            method => panic!("unexpected native request {method}"),
+        };
+        Some(native_response(&request, result))
+    })
+}
+
 fn current_process_start_time() -> u64 {
     #[cfg(target_os = "linux")]
     let inspector = watchme::process::linux::LinuxProcessInspector::default();
@@ -394,6 +463,135 @@ fn persisted_native_dialect_skips_bridge_probe() {
         requests
             .iter()
             .all(|request| request.get("protocol").is_none())
+    );
+}
+
+#[test]
+fn native_capture_and_submit_are_bounded_and_atomic() {
+    let pid = std::process::id();
+    let (_server, socket, requests) = spawn_native_io_fake(pid);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let mut native_context = context(socket);
+    native_context.wire_protocol = HerdrWireProtocol::Native16;
+    let herdr = Herdr::new(native_context, Duration::from_millis(300)).unwrap();
+    let identity = herdr.current_target_for_process(&process).unwrap();
+
+    let capture = herdr.capture_tail(&identity, 20, 4096).unwrap();
+    assert_eq!(
+        capture.text,
+        "Selected model is at capacity. Please try a different model."
+    );
+    herdr
+        .submit_literal(&identity, "/goal resume", &Safe)
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "pane.read"
+                && request["params"]["source"] == "recent_unwrapped"
+                && request["params"]["lines"] == 20
+                && request["params"]["strip_ansi"] == true)
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "pane.send_input")
+            .count(),
+        1
+    );
+    let send = requests
+        .iter()
+        .find(|request| request["method"] == "pane.send_input")
+        .unwrap();
+    assert_eq!(
+        send["params"],
+        json!({"pane_id":"pane-3", "text":"/goal resume", "keys":["Enter"]})
+    );
+}
+
+#[test]
+fn native_submit_refuses_revision_change_before_dispatch() {
+    let pid = std::process::id();
+    let (_server, socket, requests) = spawn_native_revision_change_fake(pid);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let mut native_context = context(socket);
+    native_context.wire_protocol = HerdrWireProtocol::Native16;
+    let herdr = Herdr::new(native_context, Duration::from_millis(300)).unwrap();
+    let identity = herdr.current_target_for_process(&process).unwrap();
+
+    let error = herdr
+        .submit_literal(&identity, "/goal resume", &Safe)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MuxError::IdentityChanged(message) if message.contains("revision")
+    ));
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["method"] != "pane.send_input")
+    );
+}
+
+#[test]
+fn native_submit_without_ack_has_unknown_outcome() {
+    let pid = std::process::id();
+    let (_server, socket, requests) = spawn_native_send_without_ack_fake(pid);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let mut native_context = context(socket);
+    native_context.wire_protocol = HerdrWireProtocol::Native16;
+    let herdr = Herdr::new(native_context, Duration::from_millis(100)).unwrap();
+    let identity = herdr.current_target_for_process(&process).unwrap();
+
+    let error = herdr
+        .submit_literal(&identity, "/goal resume", &Safe)
+        .unwrap_err();
+
+    assert!(matches!(error, MuxError::CommandOutcomeUnknown(_)));
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "pane.send_input")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn native_input_safety_and_read_bounds_fail_before_dispatch() {
+    let pid = std::process::id();
+    let (_server, socket, requests) = spawn_native_io_fake(pid);
+    let mut process = ProcessIdentity::new(pid, current_process_start_time());
+    process.tty = Some("/dev/pts/8".into());
+    let mut native_context = context(socket);
+    native_context.wire_protocol = HerdrWireProtocol::Native16;
+    let herdr = Herdr::new(native_context, Duration::from_millis(300)).unwrap();
+    let identity = herdr.current_target_for_process(&process).unwrap();
+
+    assert!(
+        herdr
+            .submit_literal(&identity, "/goal resume", &Unsafe)
+            .is_err()
+    );
+    let requests_after_unsafe = requests.lock().unwrap().len();
+    assert!(herdr.capture_tail(&identity, 10_001, 4096).is_err());
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), requests_after_unsafe);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["method"] != "pane.send_input")
     );
 }
 

@@ -149,6 +149,7 @@ impl CompiledPolicy {
                 Ok(())
             }
             ActionKind::SendText { text } if context.composer_empty && safe_text(text) => Ok(()),
+            ActionKind::SubmitText { text } if context.composer_empty && safe_text(text) => Ok(()),
             _ => Err("action denied by compiled policy"),
         }
     }

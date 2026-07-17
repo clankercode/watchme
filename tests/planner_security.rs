@@ -490,6 +490,7 @@ fn hostile_actions_and_prompt_injection_reject_entire_plan() {
         allowed_actions: BTreeSet::from([
             "WAIT_DURATION".into(),
             "SEND_TEXT".into(),
+            "SUBMIT_TEXT".into(),
             "SEND_KEYS".into(),
             "CHECK_STATUS".into(),
             "CAPTURE".into(),
@@ -497,6 +498,14 @@ fn hostile_actions_and_prompt_injection_reject_entire_plan() {
         ]),
     };
     assert!(validate_recovery_plan(&plan, &context).is_ok());
+
+    let atomic_submit = decode_recovery_plan(&VALID_PLAN.replace("SEND_TEXT", "SUBMIT_TEXT"))
+        .expect("SUBMIT_TEXT wire action");
+    let actions = validate_recovery_plan(&atomic_submit, &context).unwrap();
+    assert!(actions.iter().any(|action| matches!(
+        action.kind,
+        watchme::model::ActionKind::SubmitText { ref text } if text == "/goal resume"
+    )));
 
     for hostile in [
         INVALID_PLAN,

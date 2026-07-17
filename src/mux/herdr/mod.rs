@@ -495,6 +495,25 @@ impl Herdr {
         encoded: Vec<u8>,
         started: Instant,
     ) -> Result<Vec<u8>, MuxError> {
+        self.exchange_with_commit_state(encoded, started, false)
+            .await
+    }
+
+    pub(super) async fn exchange_committing_async(
+        &self,
+        encoded: Vec<u8>,
+        started: Instant,
+    ) -> Result<Vec<u8>, MuxError> {
+        self.exchange_with_commit_state(encoded, started, true)
+            .await
+    }
+
+    async fn exchange_with_commit_state(
+        &self,
+        encoded: Vec<u8>,
+        started: Instant,
+        outcome_unknown_after_write: bool,
+    ) -> Result<Vec<u8>, MuxError> {
         let socket_identity = validate_socket(Path::new(&self.context.socket_path))?;
         let deadline = started.checked_add(self.timeout).ok_or(MuxError::Timeout)?;
         let socket_path = self.context.socket_path.clone();
@@ -502,6 +521,8 @@ impl Herdr {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(MuxError::Timeout)?;
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committed_in_exchange = std::sync::Arc::clone(&committed);
         let bytes = tokio::time::timeout(remaining, async move {
             let mut stream = tokio::net::UnixStream::connect(&socket_path)
                 .await
@@ -513,9 +534,16 @@ impl Herdr {
                 evidence_provider.as_ref(),
             )?;
             stream.write_all(&encoded).await.map_err(map_io)?;
+            committed_in_exchange.store(true, Ordering::Release);
             let mut bytes = Vec::new();
             loop {
-                let byte = stream.read_u8().await.map_err(map_io)?;
+                let byte = stream.read_u8().await.map_err(|error| {
+                    if outcome_unknown_after_write {
+                        MuxError::CommandOutcomeUnknown(error.to_string())
+                    } else {
+                        map_io(error)
+                    }
+                })?;
                 bytes.push(byte);
                 if bytes.len() > MAX_RESPONSE_BYTES || byte == b'\n' {
                     break;
@@ -524,19 +552,41 @@ impl Herdr {
             Ok::<_, MuxError>(bytes)
         })
         .await
-        .map_err(|_| MuxError::Timeout)??;
+        .map_err(|_| {
+            if outcome_unknown_after_write && committed.load(Ordering::Acquire) {
+                MuxError::CommandOutcomeUnknown("timed out awaiting acknowledgement".into())
+            } else {
+                MuxError::Timeout
+            }
+        })??;
         if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(MuxError::Protocol("response exceeds byte limit".into()));
+            return Err(committed_response_error(
+                outcome_unknown_after_write,
+                "response exceeds byte limit",
+            ));
         }
         if !bytes.ends_with(b"\n") {
-            return Err(MuxError::Protocol(
-                "response is not newline terminated".into(),
+            return Err(committed_response_error(
+                outcome_unknown_after_write,
+                "response is not newline terminated",
             ));
         }
         if started.elapsed() >= self.timeout {
-            return Err(MuxError::Timeout);
+            return Err(if outcome_unknown_after_write {
+                MuxError::CommandOutcomeUnknown("acknowledgement exceeded deadline".into())
+            } else {
+                MuxError::Timeout
+            });
         }
         Ok(bytes)
+    }
+}
+
+fn committed_response_error(outcome_unknown_after_write: bool, message: &str) -> MuxError {
+    if outcome_unknown_after_write {
+        MuxError::CommandOutcomeUnknown(message.into())
+    } else {
+        MuxError::Protocol(message.into())
     }
 }
 
@@ -588,6 +638,9 @@ impl Multiplexer for Herdr {
         self.pane("process_info")
     }
     fn validate_identity(&self, expected: &MuxIdentity) -> Result<(), MuxError> {
+        if self.context.wire_protocol == HerdrWireProtocol::Native16 {
+            return self.validate_native_identity(expected);
+        }
         let actual = self.pane("pane_info")?.identity;
         if &actual == expected {
             Ok(())
@@ -613,6 +666,9 @@ impl Multiplexer for Herdr {
         }
         if lines > MAX_CAPTURE_LINES || max_bytes > MAX_CAPTURE_BYTES {
             return Err(MuxError::Protocol("pane read bounds exceeded".into()));
+        }
+        if self.context.wire_protocol == HerdrWireProtocol::Native16 {
+            return self.capture_native(identity, lines, max_bytes);
         }
         self.validate_identity(identity)?;
         #[derive(Serialize)]
@@ -695,6 +751,19 @@ impl Multiplexer for Herdr {
         }
         self.validate_identity(identity)?;
         require_safe(safety, identity)
+    }
+    fn submit_literal(
+        &self,
+        identity: &MuxIdentity,
+        text: &str,
+        safety: &dyn ComposerSafety,
+    ) -> Result<(), MuxError> {
+        if self.context.wire_protocol != HerdrWireProtocol::Native16 {
+            return Err(MuxError::Command(
+                "atomic text submission requires native Herdr".into(),
+            ));
+        }
+        self.submit_native(identity, text, safety)
     }
     fn send_key(
         &self,

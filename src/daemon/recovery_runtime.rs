@@ -322,7 +322,9 @@ impl ActionExecutor for DaemonActionExecutor {
         use crate::model::ActionKind;
         self.reject_if_cancelled()?;
         match &action.kind {
-            ActionKind::SendText { .. } | ActionKind::SendKeys { .. } => {
+            ActionKind::SendText { .. }
+            | ActionKind::SubmitText { .. }
+            | ActionKind::SendKeys { .. } => {
                 self.confirm_live_evidence()?;
                 self.before_mux_dispatch();
                 // Keep the registry lock through the mux command.  Retarget,
@@ -670,6 +672,7 @@ fn action_type_label(kind: &ActionKind) -> &'static str {
         ActionKind::Capture { .. } => "CAPTURE",
         ActionKind::CheckStatus { .. } => "CHECK_STATUS",
         ActionKind::SendText { .. } => "SEND_TEXT",
+        ActionKind::SubmitText { .. } => "SUBMIT_TEXT",
         ActionKind::SendKeys { .. } => "SEND_KEYS",
         ActionKind::Notify { .. } => "NOTIFY",
         ActionKind::Escalate { .. } => "ESCALATE",

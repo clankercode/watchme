@@ -105,6 +105,8 @@ pub enum MuxError {
     IncompatibleProtocol(String),
     #[error("unsafe Herdr socket: {0}")]
     UnsafeSocket(String),
+    #[error("multiplexer command outcome is unknown: {0}")]
+    CommandOutcomeUnknown(String),
 }
 
 pub trait Multiplexer {
@@ -125,6 +127,17 @@ pub trait Multiplexer {
         text: &str,
         safety: &dyn ComposerSafety,
     ) -> Result<(), MuxError>;
+    fn submit_literal(
+        &self,
+        identity: &MuxIdentity,
+        text: &str,
+        safety: &dyn ComposerSafety,
+    ) -> Result<(), MuxError> {
+        let _ = (identity, text, safety);
+        Err(MuxError::Command(
+            "atomic text submission is unsupported".into(),
+        ))
+    }
     fn send_key(
         &self,
         identity: &MuxIdentity,

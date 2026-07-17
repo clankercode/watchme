@@ -549,7 +549,7 @@ impl<'a, S: ActionStore, E: EvidenceReader, X: ActionExecutor, C: Clock>
 fn requires_composer(kind: &ActionKind) -> bool {
     matches!(
         kind,
-        ActionKind::SendText { .. } | ActionKind::SendKeys { .. }
+        ActionKind::SendText { .. } | ActionKind::SubmitText { .. } | ActionKind::SendKeys { .. }
     )
 }
 fn needs_progress_verification(kind: &ActionKind, outcomes: &[Condition]) -> bool {
